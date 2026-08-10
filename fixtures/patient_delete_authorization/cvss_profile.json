@@ -1,0 +1,111 @@
+{
+  "profile_id": "patient-delete-authz-cvss-001",
+  "cvss_version": "4.0",
+  "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N",
+  "metrics": [
+    {
+      "metric": "AV",
+      "value": "N",
+      "rationale": "The target OpenMRS REST API is remotely reachable in the intended deployment. The local loopback fixture does not prove this value.",
+      "source_category": "deployment_assumption",
+      "source_references": [
+        "deployment_assumption.openmrs_rest_remote_reachability"
+      ]
+    },
+    {
+      "metric": "AC",
+      "value": "L",
+      "rationale": "Exploitation uses one ordinary authenticated deletion request with no evasion condition.",
+      "source_category": "runtime_design",
+      "source_references": [
+        "test_operation.delete_request"
+      ]
+    },
+    {
+      "metric": "AT",
+      "value": "N",
+      "rationale": "No specific deployment or execution precondition is assumed beyond the vulnerable authorization behavior.",
+      "source_category": "deployment_assumption",
+      "source_references": [
+        "deployment_assumption.no_additional_attack_requirements"
+      ]
+    },
+    {
+      "metric": "PR",
+      "value": "L",
+      "rationale": "The actor is an authenticated clerk with limited View Patients capability and without Delete Patients.",
+      "source_category": "contract",
+      "source_references": [
+        "risk_contract.actor",
+        "risk_contract.actor_privileges",
+        "risk_contract.missing_privileges"
+      ]
+    },
+    {
+      "metric": "UI",
+      "value": "N",
+      "rationale": "No person other than the attacking clerk participates in the tested action.",
+      "source_category": "runtime_design",
+      "source_references": [
+        "test_operation.delete_request"
+      ]
+    },
+    {
+      "metric": "VC",
+      "value": "N",
+      "rationale": "The scoped deletion behavior demonstrates no additional disclosure.",
+      "source_category": "standard_interpretation",
+      "source_references": [
+        "risk_contract.observable_evidence"
+      ]
+    },
+    {
+      "metric": "VI",
+      "value": "H",
+      "rationale": "Unauthorized deletion of a patient record is an integrity violation with a potentially direct serious healthcare consequence.",
+      "source_category": "expert_judgment",
+      "source_references": [
+        "risk_contract.action",
+        "expert_judgment.patient_record_integrity_impact"
+      ]
+    },
+    {
+      "metric": "VA",
+      "value": "N",
+      "rationale": "CVSS Availability concerns loss of service or resource availability at the system level; this scoped data deletion is assessed as integrity impact.",
+      "source_category": "standard_interpretation",
+      "source_references": [
+        "risk_contract.action",
+        "cvss4.standard.availability_definition"
+      ]
+    },
+    {
+      "metric": "SC",
+      "value": "N",
+      "rationale": "No confidentiality impact to a subsequent system is demonstrated.",
+      "source_category": "runtime_design",
+      "source_references": [
+        "risk_contract.observable_evidence"
+      ]
+    },
+    {
+      "metric": "SI",
+      "value": "N",
+      "rationale": "No integrity impact to a subsequent system is demonstrated.",
+      "source_category": "runtime_design",
+      "source_references": [
+        "risk_contract.observable_evidence"
+      ]
+    },
+    {
+      "metric": "SA",
+      "value": "N",
+      "rationale": "No availability impact to a subsequent system is demonstrated.",
+      "source_category": "runtime_design",
+      "source_references": [
+        "risk_contract.observable_evidence"
+      ]
+    }
+  ],
+  "assessment_label": "expert_authored_provisional"
+}

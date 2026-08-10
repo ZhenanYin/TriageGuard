@@ -1,0 +1,8 @@
+{
+  "report_id": "patient-delete-authz-controlled-fixture-001",
+  "classification": "controlled_development_mutation",
+  "purpose": "Validate deterministic authorization-contract rendering in a local development fixture.",
+  "affected_workflow": "synthetic patient deletion authorization",
+  "publication_status": "not a production security finding",
+  "evidence_scope": "fixture-only development validation"
+}

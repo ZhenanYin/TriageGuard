@@ -1,0 +1,16 @@
+{
+  "contract_id": "patient-delete-authz-001",
+  "actor": "clerk",
+  "actor_privileges": ["View Patients"],
+  "missing_privileges": ["Delete Patients"],
+  "preconditions": ["a test patient exists", "the clerk is authenticated"],
+  "action": "the clerk attempts to delete the patient",
+  "secure_expectation": "the deletion request is denied and the patient remains",
+  "observable_evidence": [
+    "HTTP deletion status",
+    "patient existence after deletion attempt"
+  ],
+  "base_expectation": "secure",
+  "candidate_expectation": "vulnerable",
+  "cleanup": ["remove the test patient with an authorized fixture operation"]
+}

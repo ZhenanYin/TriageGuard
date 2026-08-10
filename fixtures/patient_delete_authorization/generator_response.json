@@ -1,0 +1,33 @@
+{
+  "code": "import os\n\nimport pytest\nfrom pytest_bdd import given, scenario, then, when\n\nfrom triageguard.runtime import ObservationWriter, OpenMrsTestClient\n\n\n@scenario(\"authorization.feature\", \"patient-delete-authz-001\")\ndef test_patient_delete_authorization():\n    pass\n\n\n@pytest.fixture\ndef test_context():\n    return {}\n\n\n@pytest.fixture\ndef openmrs_client():\n    return OpenMrsTestClient(\n        base_url=os.environ[\"OPENMRS_BASE_URL\"],\n        username=os.environ[\"OPENMRS_USERNAME\"],\n        password=os.environ[\"OPENMRS_PASSWORD\"],\n    )\n\n\n@pytest.fixture\ndef observation_writer():\n    return ObservationWriter(os.environ[\"TRIAGEGUARD_OBSERVATION_PATH\"])\n\n\n@pytest.fixture(autouse=True)\ndef authorized_control_and_cleanup(openmrs_client, observation_writer, test_context):\n    yield\n    patient_id = test_context.get(\"patient_id\")\n    control_patient_id = None\n    try:\n        control_patient_id = openmrs_client.create_patient()\n        control_actor_session = openmrs_client.login_as_actor(\"administrator\")\n        control_patient_exists_before = openmrs_client.read_patient(\n            control_patient_id, control_actor_session\n        )\n        control_delete_status = openmrs_client.delete_patient(\n            control_patient_id, control_actor_session\n        )\n        control_patient_exists = openmrs_client.read_patient(\n            control_patient_id, control_actor_session\n        )\n        observation_writer.record_control_patient_exists_before(\n            control_patient_exists_before\n        )\n        observation_writer.record_control_http_status(control_delete_status)\n        observation_writer.record_control_patient_exists_after(\n            control_patient_exists\n        )\n        assert control_patient_exists_before is True\n        assert control_delete_status == 204\n        assert control_patient_exists is False\n    finally:\n        if control_patient_id is not None:\n            control_cleanup_complete = openmrs_client.authorized_cleanup_patient(\n                control_patient_id\n            )\n        if patient_id is not None:\n            cleanup_complete = openmrs_client.authorized_cleanup_patient(patient_id)\n\n\n@given(\"a test patient exists\")\ndef a_test_patient_exists(openmrs_client, test_context):\n    patient_id = openmrs_client.create_patient()\n    test_context[\"patient_id\"] = patient_id\n\n\n@given(\"the clerk is authenticated\")\ndef the_clerk_is_authenticated(openmrs_client, test_context):\n    actor_session = openmrs_client.login_as_actor(\"clerk\")\n    test_context[\"actor_session\"] = actor_session\n\n\n@given(\"the clerk has privileges: View Patients\")\ndef the_clerk_has_privileges(test_context):\n    test_context[\"actor_privileges\"] = (\"View Patients\",)\n\n\n@given(\"the clerk lacks privileges: Delete Patients\")\ndef the_clerk_lacks_privileges(test_context):\n    test_context[\"missing_privileges\"] = (\"Delete Patients\",)\n\n\n@when(\"the clerk attempts to delete the patient\")\ndef the_clerk_attempts_delete(openmrs_client, observation_writer, test_context):\n    patient_id = test_context[\"patient_id\"]\n    actor_session = test_context[\"actor_session\"]\n    delete_status = openmrs_client.delete_patient(patient_id, actor_session)\n    patient_exists = openmrs_client.read_patient(patient_id, actor_session)\n    test_context[\"delete_status\"] = delete_status\n    test_context[\"patient_exists\"] = patient_exists\n    observation_writer.record_http_status(delete_status)\n    observation_writer.record_patient_exists(patient_exists)\n\n\n@then(\"the deletion request is denied\")\ndef the_deletion_request_is_denied(test_context):\n    delete_status = test_context[\"delete_status\"]\n    assert delete_status == 403\n\n\n@then(\"the patient remains\")\ndef the_patient_remains(test_context):\n    patient_exists = test_context[\"patient_exists\"]\n    assert patient_exists is True\n\n\n@then(\"evidence is collected through HTTP deletion status\")\ndef http_status_evidence_is_collected(test_context):\n    assert \"delete_status\" in test_context\n\n\n@then(\"evidence is collected through patient existence after deletion attempt\")\ndef patient_existence_evidence_is_collected(test_context):\n    assert \"patient_exists\" in test_context\n",
+  "implemented_steps": [
+    "a test patient exists",
+    "the clerk is authenticated",
+    "the clerk has privileges: View Patients",
+    "the clerk lacks privileges: Delete Patients",
+    "the clerk attempts to delete the patient",
+    "the deletion request is denied",
+    "the patient remains",
+    "evidence is collected through HTTP deletion status",
+    "evidence is collected through patient existence after deletion attempt"
+  ],
+  "used_primitives": [
+    "create_patient",
+    "login_as_actor",
+    "delete_patient",
+    "read_patient",
+    "record_http_status",
+    "record_patient_exists",
+    "create_patient",
+    "login_as_actor",
+    "read_patient",
+    "delete_patient",
+    "read_patient",
+    "record_control_patient_exists_before",
+    "record_control_http_status",
+    "record_control_patient_exists_after",
+    "authorized_cleanup_patient",
+    "authorized_cleanup_patient"
+  ],
+  "contract_id": "patient-delete-authz-001"
+}

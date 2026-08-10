@@ -1,0 +1,101 @@
+{
+  "plan_id": "patient-delete-authz-plan-001",
+  "contract_id": "patient-delete-authz-001",
+  "givens": [
+    {
+      "primitive": "create_patient",
+      "inputs": {},
+      "captures": ["$patient_id"]
+    },
+    {
+      "primitive": "login_as_actor",
+      "inputs": {"actor": "clerk"},
+      "captures": ["$actor_session"]
+    }
+  ],
+  "action": {
+    "primitive": "delete_patient",
+    "inputs": {"patient_id": "$patient_id", "actor_session": "$actor_session"},
+    "captures": ["$delete_status"]
+  },
+  "post_action": [
+    {
+      "primitive": "read_patient",
+      "inputs": {"patient_id": "$patient_id", "actor_session": "$actor_session"},
+      "captures": ["$patient_exists"]
+    }
+  ],
+  "assertions": [
+    {
+      "primitive": "record_http_status",
+      "observed_field": "$delete_status",
+      "expected_value": 403
+    },
+    {
+      "primitive": "record_patient_exists",
+      "observed_field": "$patient_exists",
+      "expected_value": true
+    }
+  ],
+  "controls": [
+    {
+      "name": "authorized administrator deletion control",
+      "operations": [
+        {
+          "primitive": "create_patient",
+          "inputs": {},
+          "captures": ["$control_patient_id"]
+        },
+        {
+          "primitive": "login_as_actor",
+          "inputs": {"actor": "administrator"},
+          "captures": ["$control_actor_session"]
+        },
+        {
+          "primitive": "read_patient",
+          "inputs": {"patient_id": "$control_patient_id", "actor_session": "$control_actor_session"},
+          "captures": ["$control_patient_exists_before"]
+        },
+        {
+          "primitive": "delete_patient",
+          "inputs": {"patient_id": "$control_patient_id", "actor_session": "$control_actor_session"},
+          "captures": ["$control_delete_status"]
+        },
+        {
+          "primitive": "read_patient",
+          "inputs": {"patient_id": "$control_patient_id", "actor_session": "$control_actor_session"},
+          "captures": ["$control_patient_exists"]
+        }
+      ],
+      "assertions": [
+        {
+          "primitive": "record_control_patient_exists_before",
+          "observed_field": "$control_patient_exists_before",
+          "expected_value": true
+        },
+        {
+          "primitive": "record_control_http_status",
+          "observed_field": "$control_delete_status",
+          "expected_value": 204
+        },
+        {
+          "primitive": "record_control_patient_exists_after",
+          "observed_field": "$control_patient_exists",
+          "expected_value": false
+        }
+      ]
+    }
+  ],
+  "cleanup": [
+    {
+      "primitive": "authorized_cleanup_patient",
+      "inputs": {"patient_id": "$patient_id"},
+      "captures": ["$cleanup_complete"]
+    },
+    {
+      "primitive": "authorized_cleanup_patient",
+      "inputs": {"patient_id": "$control_patient_id"},
+      "captures": ["$control_cleanup_complete"]
+    }
+  ]
+}

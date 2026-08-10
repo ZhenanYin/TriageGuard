@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.24,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "triageguard"
+version = "2.0.0"
+description = "Locally inspectable authorization-security research prototype"
+requires-python = ">=3.11"
+dependencies = [
+    "cvss>=3.6,<4",
+    "pydantic>=2,<3",
+    "requests>=2.31,<3",
+    "groq>=0.9,<1",
+    "jsonschema>=4.23,<5",
+    "pytest-bdd>=7,<9",
+    "streamlit>=1.35,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.5,<1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"

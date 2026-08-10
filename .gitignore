@@ -1,0 +1,47 @@
+# Old scanning repo — kept locally for reference, not part of this monorepo
+openmrs-contrib-cvss-scanning/
+
+# Secrets — NEVER commit
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local agent collaboration records — never publish
+/HANDOVER.md
+/docs/superpowers/
+
+# Local research artifacts
+/artifacts/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+*.code-workspace
+
+# Local isolated implementation worktrees
+.worktrees/
