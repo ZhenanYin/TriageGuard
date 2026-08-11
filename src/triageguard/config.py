@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from typing import Literal
+from weakref import WeakKeyDictionary
 
 from triageguard.domain.statuses import EnvironmentKind
 
 MIN_REPEAT_COUNT = 1
 MAX_REPEAT_COUNT = 20
+_PROCESS_SECRETS: WeakKeyDictionary[object, tuple[str | None, str | None]] = (
+    WeakKeyDictionary()
+)
 
 
 @dataclass(frozen=True)
@@ -20,8 +24,8 @@ class Settings:
     llm_mode: Literal["live", "replay"] = "replay"
     llm_provider: Literal["groq"] = "groq"
     llm_model: str = "openai/gpt-oss-120b"
-    groq_api_key: str | None = field(default=None, repr=False)
-    github_token: str | None = field(default=None, repr=False)
+    groq_api_key: InitVar[str | None] = None
+    github_token: InitVar[str | None] = None
     artifacts_dir: Path = Path("artifacts")
     github_api_version: str = "2026-03-10"
     analysis_cache_dir: Path = Path("analysis-cache")
@@ -35,13 +39,12 @@ class Settings:
     repeat_count: int = 3
     environment_kind: EnvironmentKind = EnvironmentKind.CONTROLLED_FIXTURE
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, groq_api_key: str | None, github_token: str | None) -> None:
         if self.llm_mode not in {"live", "replay"}:
             raise ValueError("TRIAGEGUARD_LLM_MODE must be 'live' or 'replay'")
-        if self.llm_mode == "replay" and self.groq_api_key is not None:
-            object.__setattr__(self, "groq_api_key", None)
-        if self.llm_mode == "replay" and self.github_token is not None:
-            object.__setattr__(self, "github_token", None)
+        if self.llm_mode == "replay":
+            groq_api_key = None
+            github_token = None
         if (
             type(self.repeat_count) is not int
             or not MIN_REPEAT_COUNT <= self.repeat_count <= MAX_REPEAT_COUNT
@@ -52,7 +55,7 @@ class Settings:
             )
         if self.llm_provider != "groq":
             raise ValueError("TRIAGEGUARD_LLM_PROVIDER must be 'groq'")
-        if self.llm_mode == "live" and not self.groq_api_key:
+        if self.llm_mode == "live" and not groq_api_key:
             raise ValueError("GROQ_API_KEY is required when TRIAGEGUARD_LLM_MODE=live")
         if not isinstance(self.github_api_version, str) or not self.github_api_version:
             raise ValueError("github_api_version must be a non-empty string")
@@ -68,6 +71,7 @@ class Settings:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        _PROCESS_SECRETS[self] = (groq_api_key, github_token)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -182,3 +186,15 @@ class PublicSettings:
     environment_kind: EnvironmentKind
     groq_api_key: None = field(default=None, init=False, repr=False)
     github_token: None = field(default=None, init=False, repr=False)
+
+
+def _groq_api_key(settings: Settings) -> str | None:
+    return _PROCESS_SECRETS.get(settings, (None, None))[0]
+
+
+def _github_token(settings: Settings) -> str | None:
+    return _PROCESS_SECRETS.get(settings, (None, None))[1]
+
+
+Settings.groq_api_key = property(_groq_api_key)  # type: ignore[attr-defined]
+Settings.github_token = property(_github_token)  # type: ignore[attr-defined]

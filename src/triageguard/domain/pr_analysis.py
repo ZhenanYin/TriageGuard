@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -17,10 +18,49 @@ from pydantic import (
 
 from triageguard.domain.models import ResearchArtifact
 from triageguard.domain.statuses import MilestoneTwoStatus
+from triageguard.provenance import canonical_sha256
 
 FullCommitSha = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
 ReasonCode = Annotated[StrictStr, Field(pattern=r"^[a-z][a-z0-9_]*$")]
+InsufficientContextReason = Literal[
+    "mergeability_unknown",
+    "merge_conflict",
+    "candidate_ref_missing",
+    "candidate_parent_mismatch",
+    "snapshot_changed_during_acquisition",
+    "github_recheck_unavailable",
+    "analysis_limit_exceeded",
+    "primary_change_not_represented",
+    "insufficient_context_to_assess",
+]
+_PROHIBITED_MODEL_CLAIM_PATTERNS = (
+    r"\bcvss(?:\s*[:v]?\s*\d)?\b",
+    r"\bconfirmed\s+(?:vulnerability|vulnerable|security\s+issue)\b",
+    r"\b(?:vulnerability|security\s+issue)\s+(?:is|was)\s+confirmed\b",
+    r"\bconfirmed\s+(?:safe|safety|secure)\b",
+    r"\b(?:safe|secure)\s+(?:is|was)\s+confirmed\b",
+)
+_FAILED_REASON_CODES = {
+    "unsupported_pr_url",
+    "unsupported_repository",
+    "pr_not_open",
+    "non_default_base_branch",
+    "mergeability_unknown",
+    "merge_conflict",
+    "candidate_ref_missing",
+    "candidate_parent_mismatch",
+    "snapshot_changed_during_acquisition",
+    "github_recheck_unavailable",
+    "analysis_limit_exceeded",
+    "primary_change_not_represented",
+    "model_generation_failed",
+    "model_output_invalid",
+    "risk_grounding_failed",
+    "risk_not_approved",
+    "gherkin_alignment_failed",
+    "gherkin_not_approved",
+}
 
 
 def _is_utc(value: datetime) -> bool:
@@ -49,6 +89,7 @@ class PullRequestSnapshot(ResearchArtifact):
     acquired_at: datetime
     github_api_version: StrictStr = Field(min_length=1)
     git_version: StrictStr = Field(min_length=1)
+    acquisition_tool_version: StrictStr = Field(min_length=1)
     analysis_config_sha256: Sha256
 
     @field_validator(
@@ -131,7 +172,7 @@ class DiffFile(ResearchArtifact):
     binary: StrictBool
     additions: StrictInt = Field(ge=0)
     deletions: StrictInt = Field(ge=0)
-    hunks: list[DiffHunk] = Field(default_factory=list)
+    hunks: tuple[DiffHunk, ...] = Field(default_factory=tuple)
     content_sha256: Sha256 | None
 
     @model_validator(mode="after")
@@ -155,9 +196,9 @@ class DiffArtifact(ResearchArtifact):
     kind: Literal["author_diff", "integration_diff", "base_drift_diff"]
     old_revision: FullCommitSha
     new_revision: FullCommitSha
-    git_arguments: list[StrictStr] = Field(min_length=1)
+    git_arguments: tuple[StrictStr, ...] = Field(min_length=1)
     git_version: StrictStr = Field(min_length=1)
-    files: list[DiffFile]
+    files: tuple[DiffFile, ...]
     patch_sha256: Sha256
     artifact_sha256: Sha256
 
@@ -187,7 +228,7 @@ class ContextAnchor(ResearchArtifact):
     end_line: StrictInt = Field(gt=0)
     text_sha256: Sha256
     selection_reason: StrictStr = Field(min_length=1)
-    score_components: list[ContextScoreComponent]
+    score_components: tuple[ContextScoreComponent, ...]
     change_relation: Literal[
         "author_change", "integration_change", "base_drift_change", "repository_context"
     ]
@@ -207,16 +248,20 @@ class ContextBundle(ResearchArtifact):
     """The bounded evidence catalog supplied to a single model request."""
 
     snapshot_key: Sha256
-    anchors: list[ContextAnchor]
+    anchors: tuple[ContextAnchor, ...]
     selected_file_count: StrictInt = Field(ge=0)
     selected_anchor_count: StrictInt = Field(ge=0)
     selected_bytes: StrictInt = Field(ge=0)
     max_files: StrictInt = Field(gt=0)
     max_anchors: StrictInt = Field(gt=0)
     max_bytes: StrictInt = Field(gt=0)
-    excluded_paths: list[StrictStr] = Field(default_factory=list)
-    binary_paths: list[StrictStr] = Field(default_factory=list)
-    truncated_anchor_ids: list[StrictStr] = Field(default_factory=list)
+    max_anchor_lines: StrictInt = Field(gt=0)
+    max_blob_bytes: StrictInt = Field(gt=0)
+    max_search_identifiers: StrictInt = Field(gt=0)
+    max_hits_per_identifier: StrictInt = Field(gt=0)
+    excluded_paths: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    binary_paths: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    truncated_anchor_ids: tuple[StrictStr, ...] = Field(default_factory=tuple)
     primary_change_represented: StrictBool
     context_sha256: Sha256
 
@@ -245,7 +290,7 @@ class ClaimEvidenceBinding(ResearchArtifact):
         "actor", "action", "expected_secure_behavior", "possible_failure", "observable"
     ]
     observable_index: StrictInt | None
-    anchor_ids: list[StrictStr] = Field(min_length=1)
+    anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_claim_binding(self) -> ClaimEvidenceBinding:
@@ -267,18 +312,45 @@ class RiskHypothesisDraft(ResearchArtifact):
     title: StrictStr = Field(min_length=1)
     explanation: StrictStr = Field(min_length=1)
     actor: StrictStr = Field(min_length=1)
-    preconditions: list[StrictStr]
+    preconditions: tuple[StrictStr, ...]
     action: StrictStr = Field(min_length=1)
     protected_asset: StrictStr = Field(min_length=1)
     security_property: StrictStr = Field(min_length=1)
     expected_secure_behavior: StrictStr = Field(min_length=1)
     possible_failure: StrictStr = Field(min_length=1)
-    observables: list[StrictStr] = Field(min_length=1)
-    code_identifiers: list[StrictStr]
-    evidence_bindings: list[ClaimEvidenceBinding]
-    limitations: list[StrictStr] = Field(min_length=1)
-    missing_evidence: list[StrictStr]
+    observables: tuple[StrictStr, ...] = Field(min_length=1)
+    code_identifiers: tuple[StrictStr, ...]
+    evidence_bindings: tuple[ClaimEvidenceBinding, ...]
+    limitations: tuple[StrictStr, ...] = Field(min_length=1)
+    missing_evidence: tuple[StrictStr, ...]
     priority_rationale: StrictStr = Field(min_length=1)
+
+    @field_validator(
+        "title",
+        "explanation",
+        "actor",
+        "preconditions",
+        "action",
+        "protected_asset",
+        "security_property",
+        "expected_secure_behavior",
+        "possible_failure",
+        "observables",
+        "code_identifiers",
+        "limitations",
+        "missing_evidence",
+        "priority_rationale",
+    )
+    @classmethod
+    def reject_prohibited_model_claims(cls, value: object) -> object:
+        texts = value if isinstance(value, tuple) else (value,)
+        if any(
+            isinstance(text, str)
+            and any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _PROHIBITED_MODEL_CLAIM_PATTERNS)
+            for text in texts
+        ):
+            raise ValueError("model-originated text contains a prohibited claim")
+        return value
 
     @model_validator(mode="after")
     def validate_evidence_bindings(self) -> RiskHypothesisDraft:
@@ -303,7 +375,29 @@ class RiskHypothesisDraft(ResearchArtifact):
 class RiskHypothesis(RiskHypothesisDraft):
     """A validated hypothesis with a deterministic workflow-assigned identity."""
 
-    hypothesis_id: StrictStr = Field(min_length=1)
+    hypothesis_id: StrictStr = Field(default="", min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_model_supplied_id(cls, value: object) -> object:
+        if isinstance(value, dict) and "hypothesis_id" in value:
+            supplied_id = value["hypothesis_id"]
+            content = {key: item for key, item in value.items() if key != "hypothesis_id"}
+            expected_id = f"risk-{canonical_sha256(content)}"
+            if supplied_id != expected_id:
+                raise ValueError("hypothesis_id is locally derived and cannot be model supplied")
+        return value
+
+    @model_validator(mode="after")
+    def derive_hypothesis_id(self) -> RiskHypothesis:
+        content = self.model_dump(mode="json", exclude={"hypothesis_id"})
+        object.__setattr__(self, "hypothesis_id", f"risk-{canonical_sha256(content)}")
+        return self
+
+    @classmethod
+    def from_draft(cls, draft: RiskHypothesisDraft) -> RiskHypothesis:
+        """Assign a stable local identity only after validating provider content."""
+        return cls.model_validate(draft.model_dump(mode="json"))
 
     @property
     def citation_anchor_ids(self) -> list[str]:
@@ -328,15 +422,33 @@ class RiskAssessmentDraft(ResearchArtifact):
     snapshot_key: Sha256
     context_sha256: Sha256
     outcome: RiskAssessmentOutcome
-    hypotheses: list[RiskHypothesisDraft] = Field(default_factory=list)
+    hypotheses: tuple[RiskHypothesisDraft, ...] = Field(default_factory=tuple)
     rationale: StrictStr | None = None
-    security_relevant_areas: list[StrictStr] = Field(default_factory=list)
-    supporting_anchor_ids: list[StrictStr] = Field(default_factory=list)
-    coverage_limitations: list[StrictStr] = Field(default_factory=list)
-    reason_code: ReasonCode | None = None
-    missing_evidence: list[StrictStr] = Field(default_factory=list)
-    needed_evidence: list[StrictStr] = Field(default_factory=list)
+    security_relevant_areas: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    supporting_anchor_ids: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    coverage_limitations: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    reason_code: InsufficientContextReason | None = None
+    missing_evidence: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    needed_evidence: tuple[StrictStr, ...] = Field(default_factory=tuple)
     generated_at: datetime
+
+    @field_validator(
+        "rationale",
+        "security_relevant_areas",
+        "coverage_limitations",
+        "missing_evidence",
+        "needed_evidence",
+    )
+    @classmethod
+    def reject_prohibited_assessment_claims(cls, value: object) -> object:
+        texts = value if isinstance(value, tuple) else (value,)
+        if any(
+            isinstance(text, str)
+            and any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _PROHIBITED_MODEL_CLAIM_PATTERNS)
+            for text in texts
+        ):
+            raise ValueError("model-originated text contains a prohibited claim")
+        return value
 
     @model_validator(mode="after")
     def validate_outcome_coherence(self) -> RiskAssessmentDraft:
@@ -355,6 +467,11 @@ class RiskAssessmentDraft(ResearchArtifact):
             or not self.coverage_limitations
         ):
             raise ValueError("a no-risk outcome requires rationale, areas, and limitations")
+        if self.outcome == "no_meaningful_security_risk_found" and not any(
+            "not proof" in limitation.lower() and "safety" in limitation.lower()
+            for limitation in self.coverage_limitations
+        ):
+            raise ValueError("a no-risk outcome must state that it is not proof of safety")
         if self.outcome == "insufficient_context_to_assess" and (
             not self.reason_code or not self.missing_evidence or not self.needed_evidence
         ):
@@ -365,7 +482,7 @@ class RiskAssessmentDraft(ResearchArtifact):
 class RiskAssessment(RiskAssessmentDraft):
     """A locally validated risk assessment whose risks have stable IDs."""
 
-    hypotheses: list[RiskHypothesis] = Field(default_factory=list)
+    hypotheses: tuple[RiskHypothesis, ...] = Field(default_factory=tuple)
     assessment_sha256: Sha256
     validated_at: datetime
 
@@ -394,9 +511,9 @@ class HumanReviewedRisk(ResearchArtifact):
     original_hypothesis_sha256: Sha256
     selected_hypothesis_id: StrictStr = Field(min_length=1)
     reviewed_risk: RiskHypothesis
-    added_citation_anchor_ids: list[StrictStr] = Field(default_factory=list)
-    removed_citation_anchor_ids: list[StrictStr] = Field(default_factory=list)
-    field_changes: list[ReviewedFieldChange] = Field(default_factory=list)
+    added_citation_anchor_ids: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    removed_citation_anchor_ids: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    field_changes: tuple[ReviewedFieldChange, ...] = Field(default_factory=tuple)
     approved_at: datetime
 
     @model_validator(mode="after")
@@ -432,7 +549,7 @@ class GherkinStepBinding(ResearchArtifact):
         "actor", "precondition", "action", "expected_secure_behavior", "possible_failure", "observable"
     ]
     source_index: StrictInt | None
-    step_numbers: list[StrictInt] = Field(min_length=1)
+    step_numbers: tuple[StrictInt, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_binding_index(self) -> GherkinStepBinding:
@@ -452,14 +569,27 @@ class GherkinCandidate(ResearchArtifact):
     candidate_id: StrictStr = Field(min_length=1)
     snapshot_key: Sha256
     reviewed_risk_sha256: Sha256
+    approved_risk: RiskHypothesis
     feature_title: StrictStr = Field(min_length=1)
     scenario_title: StrictStr = Field(min_length=1)
-    steps: list[GherkinStep] = Field(min_length=1)
+    steps: tuple[GherkinStep, ...] = Field(min_length=1)
     gherkin_text: StrictStr = Field(min_length=1)
-    bindings: list[GherkinStepBinding]
-    testability_notes: list[StrictStr]
-    setup_gaps: list[StrictStr]
+    bindings: tuple[GherkinStepBinding, ...]
+    testability_notes: tuple[StrictStr, ...]
+    setup_gaps: tuple[StrictStr, ...]
     generated_at: datetime
+
+    @field_validator("feature_title", "scenario_title", "gherkin_text", "testability_notes", "setup_gaps")
+    @classmethod
+    def reject_prohibited_gherkin_claims(cls, value: object) -> object:
+        texts = value if isinstance(value, tuple) else (value,)
+        if any(
+            isinstance(text, str)
+            and any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _PROHIBITED_MODEL_CLAIM_PATTERNS)
+            for text in texts
+        ):
+            raise ValueError("model-originated text contains a prohibited claim")
+        return value
 
     @model_validator(mode="after")
     def validate_candidate_coherence(self) -> GherkinCandidate:
@@ -467,13 +597,88 @@ class GherkinCandidate(ResearchArtifact):
             raise ValueError("generated_at must be timezone-aware UTC")
         if [step.number for step in self.steps] != list(range(1, len(self.steps) + 1)):
             raise ValueError("Gherkin steps must have consecutive numbers starting at one")
+        if self.reviewed_risk_sha256 != canonical_sha256(
+            self.approved_risk.model_dump(mode="json")
+        ):
+            raise ValueError("reviewed risk hash must match the approved risk")
+        parsed_steps = _parse_gherkin(
+            self.gherkin_text, self.feature_title, self.scenario_title
+        )
+        if re.search(r"```|\b(?:def|class|import)\b", self.gherkin_text):
+            raise ValueError("Gherkin text cannot contain implementation code")
+        if any(
+            identifier not in self.gherkin_text
+            for identifier in self.approved_risk.code_identifiers
+        ):
+            raise ValueError("Gherkin text must retain approved code identifiers")
+        structured_steps = tuple((step.keyword, step.text) for step in self.steps)
+        if parsed_steps != structured_steps:
+            raise ValueError("Gherkin text steps must exactly match structured steps")
+        phases = _gherkin_phases(self.steps)
         step_numbers = {step.number for step in self.steps}
         if any(number not in step_numbers for binding in self.bindings for number in binding.step_numbers):
             raise ValueError("a Gherkin binding must reference an existing step")
         keys = [(binding.claim_field, binding.source_index) for binding in self.bindings]
         if len(keys) != len(set(keys)):
             raise ValueError("Gherkin bindings must not duplicate a source claim")
+        required = {("actor", None), ("action", None), ("expected_secure_behavior", None), ("possible_failure", None)}
+        required.update(("precondition", index) for index in range(len(self.approved_risk.preconditions)))
+        required.update(("observable", index) for index in range(len(self.approved_risk.observables)))
+        if set(keys) != required:
+            raise ValueError("Gherkin bindings must cover every approved-risk claim")
+        allowed_phases = {
+            "actor": {"Given"},
+            "precondition": {"Given"},
+            "action": {"When"},
+            "expected_secure_behavior": {"Then"},
+            "possible_failure": {"Then"},
+            "observable": {"Then"},
+        }
+        for binding in self.bindings:
+            if any(phases[number] not in allowed_phases[binding.claim_field] for number in binding.step_numbers):
+                raise ValueError("Gherkin binding references a step in an invalid phase")
         return self
+
+
+def _parse_gherkin(
+    text: str, feature_title: str, scenario_title: str
+) -> tuple[tuple[str, str], ...]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if sum(line.startswith("Feature:") for line in lines) != 1:
+        raise ValueError("Gherkin text must contain exactly one Feature")
+    if sum(line.startswith("Scenario:") for line in lines) != 1:
+        raise ValueError("Gherkin text must contain exactly one Scenario")
+    if lines[0] != f"Feature: {feature_title}" or lines[1] != f"Scenario: {scenario_title}":
+        raise ValueError("Gherkin Feature and Scenario titles must match structured titles")
+    parsed: list[tuple[str, str]] = []
+    for line in lines[2:]:
+        match = re.fullmatch(r"(Given|When|Then|And)\s+(.+)", line)
+        if match is None:
+            raise ValueError("Gherkin text contains non-step executable or free text")
+        parsed.append((match.group(1), match.group(2)))
+    if not parsed:
+        raise ValueError("Gherkin text must contain steps")
+    return tuple(parsed)
+
+
+def _gherkin_phases(steps: tuple[GherkinStep, ...]) -> dict[int, str]:
+    order = {"Given": 0, "When": 1, "Then": 2}
+    current: str | None = None
+    previous_order = -1
+    phases: dict[int, str] = {}
+    for step in steps:
+        if step.keyword == "And":
+            if current is None:
+                raise ValueError("Gherkin cannot begin with And")
+        else:
+            if order[step.keyword] < previous_order:
+                raise ValueError("Gherkin steps must follow Given/When/Then phase order")
+            current = step.keyword
+            previous_order = order[current]
+        phases[step.number] = current
+    if "Given" not in phases.values() or "When" not in phases.values() or "Then" not in phases.values():
+        raise ValueError("Gherkin scenario requires Given, When, and Then phases")
+    return phases
 
 
 class GherkinApproval(ResearchArtifact):
@@ -514,10 +719,49 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             raise ValueError("run timestamps must be timezone-aware UTC")
         if self.finished_at < self.started_at:
             raise ValueError("finished_at must not precede started_at")
+        assessment = self.risk_assessment
+        review = self.human_reviewed_risk
+        candidate = self.gherkin_candidate
+        approval = self.gherkin_approval
+        if assessment is not None and assessment.snapshot_key != self.snapshot.snapshot_key:
+            raise ValueError("risk assessment snapshot key must match the terminal snapshot")
+        if review is not None:
+            if assessment is None:
+                raise ValueError("a human-reviewed risk requires its risk assessment")
+            if review.snapshot_key != self.snapshot.snapshot_key:
+                raise ValueError("reviewed risk snapshot key must match the terminal snapshot")
+            if review.assessment_sha256 != assessment.assessment_sha256:
+                raise ValueError("reviewed risk assessment hash must match the assessment")
+            selected = next(
+                (risk for risk in assessment.hypotheses if risk.hypothesis_id == review.selected_hypothesis_id),
+                None,
+            )
+            if selected is None:
+                raise ValueError("reviewed risk must select a hypothesis from the assessment")
+            if review.original_hypothesis_sha256 != canonical_sha256(selected.model_dump(mode="json")):
+                raise ValueError("reviewed risk original hypothesis hash must match the assessment")
+        if candidate is not None:
+            if review is None:
+                raise ValueError("a Gherkin candidate requires a human-reviewed risk")
+            if candidate.snapshot_key != self.snapshot.snapshot_key:
+                raise ValueError("Gherkin candidate snapshot key must match the terminal snapshot")
+            if candidate.reviewed_risk_sha256 != canonical_sha256(review.reviewed_risk.model_dump(mode="json")):
+                raise ValueError("Gherkin candidate risk hash must match the reviewed risk")
+            if candidate.approved_risk != review.reviewed_risk:
+                raise ValueError("Gherkin candidate approved risk must match the reviewed risk")
+        if approval is not None:
+            if candidate is None:
+                raise ValueError("a Gherkin approval requires its candidate")
+            if approval.snapshot_key != self.snapshot.snapshot_key:
+                raise ValueError("Gherkin approval snapshot key must match the terminal snapshot")
+            if approval.candidate_id != candidate.candidate_id:
+                raise ValueError("Gherkin approval candidate ID must match the candidate")
+            if approval.candidate_sha256 != canonical_sha256(candidate.model_dump(mode="json")):
+                raise ValueError("Gherkin approval candidate hash must match the candidate")
+            if approval.reviewed_risk_sha256 != candidate.reviewed_risk_sha256:
+                raise ValueError("Gherkin approval risk hash must match the candidate")
         if self.status is MilestoneTwoStatus.APPROVED_GHERKIN and (
-            self.gherkin_approval is None
-            or self.gherkin_candidate is None
-            or self.human_reviewed_risk is None
+            approval is None or candidate is None or review is None
         ):
             raise ValueError("approved Gherkin requires a candidate, reviewed risk, and approval")
         if self.status is MilestoneTwoStatus.NO_MEANINGFUL_SECURITY_RISK_FOUND and (
@@ -525,13 +769,31 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             or self.risk_assessment.outcome != "no_meaningful_security_risk_found"
         ):
             raise ValueError("no-risk terminal status requires a matching assessment")
+        if self.status is MilestoneTwoStatus.NO_MEANINGFUL_SECURITY_RISK_FOUND and (
+            self.reason_code != "no_meaningful_security_risk_found"
+        ):
+            raise ValueError("no-risk terminal status requires its supported reason code")
         if self.status is MilestoneTwoStatus.INSUFFICIENT_CONTEXT_TO_ASSESS and (
             self.risk_assessment is None
             or self.risk_assessment.outcome != "insufficient_context_to_assess"
         ):
             raise ValueError("insufficient-context status requires a matching assessment")
+        if self.status is MilestoneTwoStatus.INSUFFICIENT_CONTEXT_TO_ASSESS and (
+            self.reason_code not in _insufficient_context_reason_codes()
+        ):
+            raise ValueError("insufficient-context terminal status requires a supported reason code")
         if self.status is MilestoneTwoStatus.STALE and (
             self.freshness is None or self.freshness.status != "stale"
         ):
             raise ValueError("stale terminal status requires a stale freshness check")
+        if self.status is MilestoneTwoStatus.STALE and self.reason_code != "snapshot_stale":
+            raise ValueError("stale terminal status requires the snapshot_stale reason code")
+        if self.status is MilestoneTwoStatus.APPROVED_GHERKIN and self.reason_code != "gherkin_approved":
+            raise ValueError("approved Gherkin requires the gherkin_approved reason code")
+        if self.status is MilestoneTwoStatus.FAILED and self.reason_code not in _FAILED_REASON_CODES:
+            raise ValueError("failed terminal status requires a supported reason code")
         return self
+
+
+def _insufficient_context_reason_codes() -> set[str]:
+    return set(InsufficientContextReason.__args__)

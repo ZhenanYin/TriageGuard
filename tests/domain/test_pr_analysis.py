@@ -7,9 +7,21 @@ from pydantic import ValidationError
 
 from triageguard.domain.pr_analysis import (
     ClaimEvidenceBinding,
+    ContextAnchor,
+    ContextBundle,
+    GherkinApproval,
+    GherkinCandidate,
+    GherkinStep,
+    GherkinStepBinding,
+    HumanReviewedRisk,
+    MilestoneTwoRunRecord,
     PullRequestSnapshot,
+    RiskAssessment,
+    RiskAssessmentDraft,
     RiskHypothesis,
+    RiskHypothesisDraft,
 )
+from triageguard.provenance import canonical_sha256
 
 
 def test_pr_analysis_contracts_are_available_from_the_domain_package() -> None:
@@ -54,6 +66,7 @@ def snapshot_payload(**changes: object) -> dict[str, object]:
         "acquired_at": datetime(2026, 8, 11, tzinfo=UTC),
         "github_api_version": "2026-03-10",
         "git_version": "2.47.1",
+        "acquisition_tool_version": "triageguard/2.0.0",
         "analysis_config_sha256": "9" * 64,
     }
     payload.update(changes)
@@ -79,20 +92,29 @@ def test_snapshot_rejects_non_utc_acquisition_time() -> None:
 
 def test_risk_hypothesis_derives_stable_unique_citation_ids() -> None:
     """A duplicate citation list must not be persisted separately from bindings."""
-    hypothesis = RiskHypothesis(
-        claim_status="unconfirmed_risk_hypothesis",
-        title="Authorization check may be bypassed",
-        explanation="The integration change changes a privilege boundary.",
-        actor="authenticated clerk",
-        preconditions=["A protected record exists."],
-        action="Submit the changed endpoint request.",
-        protected_asset="Protected patient record",
-        security_property="Authorization is enforced.",
-        expected_secure_behavior="The request is denied.",
-        possible_failure="The request succeeds without the privilege.",
-        observables=["HTTP response", "Persistent record state"],
-        code_identifiers=["requirePrivilege"],
-        evidence_bindings=[
+    hypothesis = RiskHypothesis.from_draft(_risk_draft())
+
+    assert hypothesis.citation_anchor_ids == ["anchor-b", "anchor-a", "anchor-c"]
+    assert hypothesis.hypothesis_id == RiskHypothesis.from_draft(
+        _risk_draft()
+    ).hypothesis_id
+
+
+def _risk_draft(**changes: object) -> RiskHypothesisDraft:
+    payload: dict[str, object] = {
+        "claim_status": "unconfirmed_risk_hypothesis",
+        "title": "Authorization check may be bypassed",
+        "explanation": "The integration change changes a privilege boundary.",
+        "actor": "authenticated clerk",
+        "preconditions": ["A protected record exists."],
+        "action": "Submit the changed endpoint request.",
+        "protected_asset": "Protected patient record",
+        "security_property": "Authorization is enforced.",
+        "expected_secure_behavior": "The request is denied.",
+        "possible_failure": "The request succeeds without the privilege.",
+        "observables": ["HTTP response", "Persistent record state"],
+        "code_identifiers": ["requirePrivilege"],
+        "evidence_bindings": [
             ClaimEvidenceBinding(
                 claim_field="actor", observable_index=None, anchor_ids=["anchor-b"]
             ),
@@ -116,10 +138,237 @@ def test_risk_hypothesis_derives_stable_unique_citation_ids() -> None:
                 claim_field="observable", observable_index=1, anchor_ids=["anchor-c"]
             ),
         ],
-        limitations=["Only bounded context was reviewed."],
-        missing_evidence=[],
-        priority_rationale="The changed check protects patient data.",
-        hypothesis_id="risk-1",
+        "limitations": ["Only bounded context was reviewed."],
+        "missing_evidence": [],
+        "priority_rationale": "The changed check protects patient data.",
+    }
+    payload.update(changes)
+    return RiskHypothesisDraft.model_validate(payload)
+
+
+def test_model_cannot_supply_hypothesis_id_or_prohibited_claims() -> None:
+    """Provider output must remain an unconfirmed hypothesis with a local identity."""
+    with pytest.raises(ValidationError, match="locally derived"):
+        RiskHypothesis.model_validate({**_risk_draft().model_dump(), "hypothesis_id": "provider-id"})
+
+    for forbidden in (
+        "CVSS:4.0/AV:N",
+        "This is a confirmed vulnerability.",
+        "This change is confirmed safe.",
+    ):
+        with pytest.raises(ValidationError, match="prohibited"):
+            _risk_draft(explanation=forbidden)
+
+
+def test_artifact_collections_are_deeply_immutable() -> None:
+    """Recorded evidence cannot be changed through a mutable nested collection."""
+    binding = ClaimEvidenceBinding(
+        claim_field="actor", observable_index=None, anchor_ids=["anchor-a"]
     )
 
-    assert hypothesis.citation_anchor_ids == ["anchor-b", "anchor-a", "anchor-c"]
+    assert binding.anchor_ids == ("anchor-a",)
+    with pytest.raises(AttributeError):
+        binding.anchor_ids.append("anchor-b")  # type: ignore[attr-defined]
+
+
+def test_context_bundle_requires_all_reproducibility_limits() -> None:
+    """Context artifacts must retain every configured selection limit."""
+    anchor = ContextAnchor(
+        anchor_id="anchor-a",
+        revision_role="candidate",
+        commit_sha="4" * 40,
+        path="api/Patient.java",
+        java_symbol="Patient.delete",
+        start_line=10,
+        end_line=11,
+        text_sha256="a" * 64,
+        selection_reason="integration change",
+        score_components=[],
+        change_relation="integration_change",
+        truncated=False,
+    )
+    payload = {
+        "snapshot_key": "0" * 64,
+        "anchors": [anchor],
+        "selected_file_count": 1,
+        "selected_anchor_count": 1,
+        "selected_bytes": 20,
+        "max_files": 40,
+        "max_anchors": 80,
+        "max_bytes": 160_000,
+        "primary_change_represented": True,
+        "context_sha256": "b" * 64,
+    }
+
+    with pytest.raises(ValidationError, match="max_anchor_lines"):
+        ContextBundle.model_validate(payload)
+
+
+def test_candidate_rejects_non_gherkin_or_incomplete_traceability() -> None:
+    """An approval candidate needs parsed Gherkin and every approved-risk binding."""
+    approved_risk = RiskHypothesis.from_draft(_risk_draft())
+    with pytest.raises(ValidationError, match="Feature"):
+        GherkinCandidate(
+            candidate_id="candidate-1",
+            snapshot_key="0" * 64,
+            reviewed_risk_sha256=canonical_sha256(approved_risk.model_dump(mode="json")),
+            approved_risk=approved_risk,
+            feature_title="Privilege enforcement",
+            scenario_title="Unauthorized request is denied",
+            steps=[GherkinStep(number=1, keyword="Given", text="a clerk")],
+            gherkin_text="not gherkin",
+            bindings=[],
+            testability_notes=[],
+            setup_gaps=[],
+            generated_at=datetime(2026, 8, 11, tzinfo=UTC),
+        )
+
+
+def _candidate(snapshot_key: str = "0" * 64) -> GherkinCandidate:
+    risk = RiskHypothesis.from_draft(_risk_draft())
+    steps = (
+        GherkinStep(number=1, keyword="Given", text="an authenticated clerk"),
+        GherkinStep(number=2, keyword="And", text="a protected record exists"),
+        GherkinStep(number=3, keyword="When", text="the changed request is sent"),
+        GherkinStep(number=4, keyword="Then", text="the request is denied"),
+        GherkinStep(number=5, keyword="And", text="a failed request is observable"),
+        GherkinStep(number=6, keyword="And", text="the HTTP response is recorded"),
+        GherkinStep(
+            number=7,
+            keyword="And",
+            text="the requirePrivilege record state is recorded",
+        ),
+    )
+    return GherkinCandidate(
+        candidate_id="candidate-1",
+        snapshot_key=snapshot_key,
+        reviewed_risk_sha256=canonical_sha256(risk.model_dump(mode="json")),
+        approved_risk=risk,
+        feature_title="Privilege enforcement",
+        scenario_title="Unauthorized request is denied",
+        steps=steps,
+        gherkin_text="\n".join(
+            (
+                "Feature: Privilege enforcement",
+                "Scenario: Unauthorized request is denied",
+                *(f"{step.keyword} {step.text}" for step in steps),
+            )
+        ),
+        bindings=(
+            GherkinStepBinding(claim_field="actor", source_index=None, step_numbers=[1]),
+            GherkinStepBinding(claim_field="precondition", source_index=0, step_numbers=[2]),
+            GherkinStepBinding(claim_field="action", source_index=None, step_numbers=[3]),
+            GherkinStepBinding(claim_field="expected_secure_behavior", source_index=None, step_numbers=[4]),
+            GherkinStepBinding(claim_field="possible_failure", source_index=None, step_numbers=[5]),
+            GherkinStepBinding(claim_field="observable", source_index=0, step_numbers=[6]),
+            GherkinStepBinding(claim_field="observable", source_index=1, step_numbers=[7]),
+        ),
+        testability_notes=[],
+        setup_gaps=[],
+        generated_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+
+def test_candidate_requires_complete_bindings_and_phase_order() -> None:
+    """A scenario may reach approval only when every approved claim has a legal phase."""
+    candidate = _candidate()
+    with pytest.raises(ValidationError, match="cover every"):
+        GherkinCandidate.model_validate(
+            candidate.model_dump(mode="json", exclude={"bindings"})
+            | {"bindings": candidate.bindings[:-1]}
+        )
+
+
+def test_candidate_steps_are_immutable_after_validation() -> None:
+    """A validated scenario cannot be altered after its candidate hash is computed."""
+    candidate = _candidate()
+
+    assert isinstance(candidate.steps, tuple)
+    with pytest.raises(AttributeError):
+        candidate.steps.append(candidate.steps[0])  # type: ignore[attr-defined]
+
+    bad_steps = list(candidate.steps)
+    bad_steps[2] = GherkinStep(number=3, keyword="Then", text="the changed request is sent")
+    with pytest.raises(ValidationError, match="phase"):
+        GherkinCandidate.model_validate(
+            candidate.model_dump(mode="json")
+            | {
+                "steps": bad_steps,
+                "gherkin_text": candidate.gherkin_text.replace(
+                    "When the changed request is sent", "Then the changed request is sent"
+                ),
+            }
+        )
+
+
+def test_terminal_record_rejects_mixed_snapshot_artifacts() -> None:
+    """An approved record cannot join a candidate from another frozen PR snapshot."""
+    risk = RiskHypothesis.from_draft(_risk_draft())
+    assessment = RiskAssessment(
+        snapshot_key="0" * 64,
+        context_sha256="a" * 64,
+        outcome="risks_proposed",
+        hypotheses=[risk],
+        generated_at=datetime(2026, 8, 11, tzinfo=UTC),
+        assessment_sha256="b" * 64,
+        validated_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+    review = HumanReviewedRisk(
+        snapshot_key="0" * 64,
+        assessment_sha256=assessment.assessment_sha256,
+        original_hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
+        selected_hypothesis_id=risk.hypothesis_id,
+        reviewed_risk=risk,
+        approved_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+    candidate = _candidate(snapshot_key="e" * 64)
+    approval = GherkinApproval(
+        snapshot_key="e" * 64,
+        candidate_id=candidate.candidate_id,
+        candidate_sha256=canonical_sha256(candidate.model_dump(mode="json")),
+        reviewed_risk_sha256=candidate.reviewed_risk_sha256,
+        approved_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValidationError, match="candidate snapshot key"):
+        MilestoneTwoRunRecord(
+            run_id="run-1",
+            snapshot=PullRequestSnapshot.model_validate(snapshot_payload()),
+            status="approved_gherkin",
+            reason_code="gherkin_approved",
+            explanation="A human approved the scenario.",
+            started_at=datetime(2026, 8, 11, tzinfo=UTC),
+            finished_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
+            risk_assessment=assessment,
+            human_reviewed_risk=review,
+            gherkin_candidate=candidate,
+            gherkin_approval=approval,
+        )
+
+
+def test_insufficient_context_requires_an_allowlisted_reason_code() -> None:
+    """An abstention reason must be from the documented operational vocabulary."""
+    with pytest.raises(ValidationError, match="reason_code"):
+        RiskAssessmentDraft(
+            snapshot_key="0" * 64,
+            context_sha256="a" * 64,
+            outcome="insufficient_context_to_assess",
+            reason_code="made_up_reason",
+            missing_evidence=["integration diff"],
+            needed_evidence=["current merge commit"],
+            generated_at=datetime(2026, 8, 11, tzinfo=UTC),
+        )
+
+
+def test_failed_terminal_record_requires_an_allowlisted_reason_code() -> None:
+    """Terminal failures may not invent a reason outside the approved vocabulary."""
+    with pytest.raises(ValidationError, match="supported reason"):
+        MilestoneTwoRunRecord(
+            run_id="run-failure",
+            snapshot=PullRequestSnapshot.model_validate(snapshot_payload()),
+            status="failed",
+            reason_code="made_up_reason",
+            explanation="An unsupported failure occurred.",
+            started_at=datetime(2026, 8, 11, tzinfo=UTC),
+            finished_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
+        )

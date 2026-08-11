@@ -1,3 +1,5 @@
+from dataclasses import asdict
+
 import pytest
 
 from triageguard import config as config_module
@@ -91,6 +93,19 @@ def test_live_secret_is_non_printable() -> None:
 
     assert settings.groq_api_key == secret
     assert secret not in repr(settings)
+
+
+def test_live_secrets_are_absent_from_dataclass_serialization() -> None:
+    """A generic dataclass serializer must not expose process-only credentials."""
+    settings = Settings(
+        llm_mode="live", groq_api_key="groq-live-secret", github_token="github-live-secret"
+    )
+
+    serialized = asdict(settings)
+
+    assert "groq_api_key" not in serialized
+    assert "github_token" not in serialized
+    assert "secret" not in repr(serialized)
 
 
 def test_repeat_count_must_be_at_least_one(monkeypatch):
