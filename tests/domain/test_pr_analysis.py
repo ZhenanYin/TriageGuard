@@ -358,21 +358,26 @@ def _context_bundle() -> ContextBundle:
         )
         for index, anchor_id in enumerate(("anchor-a", "anchor-b", "anchor-c"), start=1)
     )
+    payload = {
+        "snapshot_key": "0" * 64,
+        "anchors": [anchor.model_dump(mode="json") for anchor in anchors],
+        "selected_file_count": 1,
+        "selected_anchor_count": 3,
+        "selected_bytes": sum(len(anchor.text.encode("utf-8")) for anchor in anchors),
+        "max_files": 40,
+        "max_anchors": 80,
+        "max_bytes": 160_000,
+        "max_anchor_lines": 120,
+        "max_blob_bytes": 1_000_000,
+        "max_search_identifiers": 100,
+        "max_hits_per_identifier": 20,
+        "primary_change_represented": True,
+    }
+    payload["context_sha256"] = canonical_sha256(
+        {key: value for key, value in payload.items()}
+    )
     return ContextBundle(
-        snapshot_key="0" * 64,
-        anchors=anchors,
-        selected_file_count=1,
-        selected_anchor_count=3,
-        selected_bytes=100,
-        max_files=40,
-        max_anchors=80,
-        max_bytes=160_000,
-        max_anchor_lines=120,
-        max_blob_bytes=1_000_000,
-        max_search_identifiers=100,
-        max_hits_per_identifier=20,
-        primary_change_represented=True,
-        context_sha256="a" * 64,
+        **payload,
     )
 
 
@@ -399,6 +404,20 @@ def _assessment(risk: RiskHypothesis) -> RiskAssessment:
         validated_at=datetime(2026, 8, 11, tzinfo=UTC),
         context_bundle=context,
         grounding_reports=[report],
+    )
+
+
+def _reviewed_grounding(reviewed: RiskHypothesisDraft) -> GroundingReport:
+    return GroundingReport(
+        producer="local_grounding_validator",
+        snapshot_key="0" * 64,
+        context_sha256=_context_bundle().context_sha256,
+        hypothesis_id="reviewed-risk",
+        hypothesis_sha256=canonical_sha256(reviewed.model_dump(mode="json")),
+        cited_anchor_ids=reviewed.citation_anchor_ids,
+        identifier_evidence=[
+            IdentifierEvidence(identifier="requirePrivilege", anchor_ids=["anchor-a"])
+        ],
     )
 
 
@@ -438,13 +457,15 @@ def test_terminal_record_rejects_mixed_snapshot_artifacts() -> None:
     """An approved record cannot join a candidate from another frozen PR snapshot."""
     risk = RiskHypothesis.from_draft(_risk_draft())
     assessment = _assessment(risk)
+    reviewed = _risk_draft()
     review = HumanReviewedRisk(
         snapshot_key="0" * 64,
         assessment_sha256=assessment.assessment_sha256,
         selected_hypothesis_id=risk.hypothesis_id,
         selected_hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
-        reviewed_risk=_risk_draft(),
-        reviewed_content_sha256=canonical_sha256(_risk_draft().model_dump(mode="json")),
+        reviewed_risk=reviewed,
+        reviewed_content_sha256=canonical_sha256(reviewed.model_dump(mode="json")),
+        reviewed_grounding=_reviewed_grounding(reviewed),
         approved_at=datetime(2026, 8, 11, tzinfo=UTC),
     )
     candidate = _candidate(snapshot_key="e" * 64)
@@ -476,13 +497,15 @@ def test_approved_terminal_requires_current_matching_final_freshness() -> None:
     """Gherkin approval must be preceded by a current check of this exact snapshot."""
     risk = RiskHypothesis.from_draft(_risk_draft())
     assessment = _assessment(risk)
+    reviewed = _risk_draft()
     review = HumanReviewedRisk(
         snapshot_key="0" * 64,
         assessment_sha256=assessment.assessment_sha256,
         selected_hypothesis_id=risk.hypothesis_id,
         selected_hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
-        reviewed_risk=_risk_draft(),
-        reviewed_content_sha256=canonical_sha256(_risk_draft().model_dump(mode="json")),
+        reviewed_risk=reviewed,
+        reviewed_content_sha256=canonical_sha256(reviewed.model_dump(mode="json")),
+        reviewed_grounding=_reviewed_grounding(reviewed),
         approved_at=datetime(2026, 8, 11, tzinfo=UTC),
     )
     candidate = _candidate()

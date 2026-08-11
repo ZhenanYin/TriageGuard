@@ -295,6 +295,9 @@ class ContextBundle(ResearchArtifact):
             raise ValueError("context selection exceeds its configured limits")
         if self.selected_bytes > self.max_bytes:
             raise ValueError("context selection exceeds its byte limit")
+        exact_bytes = sum(len(anchor.text.encode("utf-8")) for anchor in self.anchors)
+        if self.selected_bytes != exact_bytes:
+            raise ValueError("selected bytes must equal exact UTF-8 anchor text bytes")
         if any(
             anchor.end_line - anchor.start_line + 1 > self.max_anchor_lines
             for anchor in self.anchors
@@ -582,6 +585,19 @@ class RiskAssessment(RiskAssessmentDraft):
                         identifier in anchors[anchor_id].text for anchor_id in evidence.anchor_ids
                     ):
                         raise ValueError("identifier evidence must occur in a bound context anchor")
+        elif self.outcome == "no_meaningful_security_risk_found":
+            anchors = {anchor.anchor_id: anchor for anchor in self.context_bundle.anchors}
+            if not self.supporting_anchor_ids or any(
+                anchor_id not in anchors for anchor_id in self.supporting_anchor_ids
+            ):
+                raise ValueError("no-risk assessment requires resolvable supporting anchors")
+            if not any(
+                anchors[anchor_id].change_relation == "integration_change"
+                for anchor_id in self.supporting_anchor_ids
+            ):
+                raise ValueError("no-risk assessment requires integration-change support")
+            if self.grounding_reports:
+                raise ValueError("no-risk assessment cannot contain risk grounding reports")
         elif self.grounding_reports:
             raise ValueError("abstention assessments cannot contain grounding reports")
         return self
@@ -613,6 +629,7 @@ class HumanReviewedRisk(ResearchArtifact):
     selected_hypothesis_sha256: Sha256
     reviewed_risk: RiskHypothesisDraft
     reviewed_content_sha256: Sha256
+    reviewed_grounding: GroundingReport | None = None
     added_citation_anchor_ids: tuple[StrictStr, ...] = Field(default_factory=tuple)
     removed_citation_anchor_ids: tuple[StrictStr, ...] = Field(default_factory=tuple)
     field_changes: tuple[ReviewedFieldChange, ...] = Field(default_factory=tuple)
@@ -708,7 +725,7 @@ class GherkinCandidateDraft(ResearchArtifact):
             self.gherkin_text, self.feature_title, self.scenario_title
         )
         if re.search(
-            r"```|#|[(){}\[\];]|\b(?:def|class|import|os|sys|subprocess|python|bash|sh|curl|wget|rm|chmod|sudo|eval|exec)\b|/bin/",
+            r"```|#|[(){}\[\];|><$`]|\b(?:def|class|import|os|sys|subprocess|python|bash|sh|curl|wget|rm|chmod|sudo|eval|exec|cat|echo)\b|(?:^|\s)/(?:\S+)",
             self.gherkin_text,
             flags=re.IGNORECASE,
         ):
@@ -883,6 +900,14 @@ class MilestoneTwoRunRecord(ResearchArtifact):
                 raise ValueError("reviewed risk must select a hypothesis from the assessment")
             if review.selected_hypothesis_sha256 != canonical_sha256(selected.model_dump(mode="json")):
                 raise ValueError("reviewed risk original hypothesis hash must match the assessment")
+            immutable_fields = (
+                set(RiskHypothesis.model_fields) - _EDITABLE_RISK_FIELDS - {"hypothesis_id"}
+            )
+            if any(
+                getattr(selected, field_name) != getattr(review.reviewed_risk, field_name)
+                for field_name in immutable_fields
+            ):
+                raise ValueError("reviewed risk cannot change a non-editable field")
             expected_changes = {
                 field_name: (canonical_json(getattr(selected, field_name)), canonical_json(getattr(review.reviewed_risk, field_name)))
                 for field_name in _EDITABLE_RISK_FIELDS
@@ -907,6 +932,24 @@ class MilestoneTwoRunRecord(ResearchArtifact):
                 or review.removed_citation_anchor_ids != expected_removed
             ):
                 raise ValueError("review citation deltas must match the reviewed evidence bindings")
+            report = review.reviewed_grounding
+            anchors = {anchor.anchor_id: anchor for anchor in assessment.context_bundle.anchors}
+            if report is None or (
+                report.snapshot_key != self.snapshot.snapshot_key
+                or report.context_sha256 != assessment.context_sha256
+                or report.hypothesis_sha256 != review.reviewed_content_sha256
+                or report.cited_anchor_ids != tuple(reviewed_citations)
+                or any(anchor_id not in anchors for anchor_id in reviewed_citations)
+                or not any(anchors[anchor_id].change_relation == "integration_change" for anchor_id in reviewed_citations)
+            ):
+                raise ValueError("reviewed risk requires matching local grounding")
+            evidence = {item.identifier: item for item in report.identifier_evidence}
+            if set(evidence) != set(review.reviewed_risk.code_identifiers) or any(
+                any(anchor_id not in reviewed_citations for anchor_id in item.anchor_ids)
+                or not any(item.identifier in anchors[anchor_id].text for anchor_id in item.anchor_ids)
+                for item in evidence.values()
+            ):
+                raise ValueError("reviewed grounding must resolve every identifier in bound context")
         if candidate is not None:
             if review is None:
                 raise ValueError("a Gherkin candidate requires a human-reviewed risk")
@@ -942,6 +985,8 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             != (self.snapshot.base_sha, self.snapshot.head_sha, self.snapshot.candidate_sha)
             or approval is None
             or self.freshness.checked_at > approval.approved_at
+            or self.freshness.checked_at < candidate.generated_at
+            or self.freshness.checked_at < review.approved_at
         ):
             raise ValueError("approved Gherkin requires a current final matching freshness check")
         if self.status is MilestoneTwoStatus.NO_MEANINGFUL_SECURITY_RISK_FOUND and (
