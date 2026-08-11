@@ -79,6 +79,11 @@ def _is_utc(value: datetime) -> bool:
     return value.tzinfo is not None and offset is not None and offset.total_seconds() == 0
 
 
+def _canonical_content_hash(value: object) -> str:
+    """Hash canonical JSON with sorted keys; callers remove their self-hash first."""
+    return canonical_sha256(value)
+
+
 class PullRequestSnapshot(ResearchArtifact):
     """The exact GitHub and local-Git identity frozen before analysis begins."""
 
@@ -126,6 +131,17 @@ class PullRequestSnapshot(ResearchArtifact):
 
     @model_validator(mode="after")
     def validate_snapshot_coherence(self) -> PullRequestSnapshot:
+        identity = {
+            "repository": self.repository,
+            "pull_number": self.pull_number,
+            "merge_base_sha": self.merge_base_sha,
+            "base_sha": self.base_sha,
+            "head_sha": self.head_sha,
+            "candidate_sha": self.candidate_sha,
+            "analysis_config_sha256": self.analysis_config_sha256,
+        }
+        if self.snapshot_key != _canonical_content_hash(identity):
+            raise ValueError("snapshot key must match canonical immutable identity")
         if not _is_utc(self.acquired_at):
             raise ValueError("acquired_at must be timezone-aware UTC")
         revisions = (
@@ -137,6 +153,11 @@ class PullRequestSnapshot(ResearchArtifact):
         if len(set(revisions)) != len(revisions):
             raise ValueError("merge-base, base, head, and candidate revisions must be distinct")
         return self
+
+    @classmethod
+    def from_identity(cls, **values: object) -> PullRequestSnapshot:
+        identity = {key: values[key] for key in ("repository", "pull_number", "merge_base_sha", "base_sha", "head_sha", "candidate_sha", "analysis_config_sha256")}
+        return cls.model_validate({**values, "snapshot_key": _canonical_content_hash(identity)})
 
 
 class SnapshotFreshness(ResearchArtifact):
@@ -284,6 +305,9 @@ class ContextBundle(ResearchArtifact):
 
     @model_validator(mode="after")
     def validate_bundle_coherence(self) -> ContextBundle:
+        content = self.model_dump(mode="json", exclude={"context_sha256"})
+        if self.context_sha256 != _canonical_content_hash(content):
+            raise ValueError("context SHA-256 must match canonical frozen context content")
         anchor_ids = [anchor.anchor_id for anchor in self.anchors]
         if len(anchor_ids) != len(set(anchor_ids)):
             raise ValueError("context anchor IDs must be unique")
@@ -308,6 +332,12 @@ class ContextBundle(ResearchArtifact):
         }:
             raise ValueError("truncated anchor IDs must exactly match truncated anchors")
         return self
+
+    @classmethod
+    def from_content(cls, **values: object) -> ContextBundle:
+        provisional = cls.model_construct(**values)
+        content = provisional.model_dump(mode="json", exclude={"context_sha256"})
+        return cls.model_validate({**values, "context_sha256": _canonical_content_hash(content)})
 
 
 class ClaimEvidenceBinding(ResearchArtifact):
@@ -544,6 +574,9 @@ class RiskAssessment(RiskAssessmentDraft):
 
     @model_validator(mode="after")
     def validate_assessment_time(self) -> RiskAssessment:
+        content = self.model_dump(mode="json", exclude={"assessment_sha256"})
+        if self.assessment_sha256 != _canonical_content_hash(content):
+            raise ValueError("assessment SHA-256 must match canonical validated assessment content")
         if not _is_utc(self.validated_at):
             raise ValueError("validated_at must be timezone-aware UTC")
         if self.validated_at < self.generated_at:
@@ -601,6 +634,12 @@ class RiskAssessment(RiskAssessmentDraft):
         elif self.grounding_reports:
             raise ValueError("abstention assessments cannot contain grounding reports")
         return self
+
+    @classmethod
+    def from_content(cls, **values: object) -> RiskAssessment:
+        provisional = cls.model_construct(**values)
+        content = provisional.model_dump(mode="json", exclude={"assessment_sha256"})
+        return cls.model_validate({**values, "assessment_sha256": _canonical_content_hash(content)})
 
 
 class ReviewedFieldChange(ResearchArtifact):

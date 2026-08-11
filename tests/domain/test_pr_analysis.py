@@ -74,6 +74,20 @@ def snapshot_payload(**changes: object) -> dict[str, object]:
         "analysis_config_sha256": "9" * 64,
     }
     payload.update(changes)
+    payload["snapshot_key"] = canonical_sha256(
+        {
+            key: payload[key]
+            for key in (
+                "repository",
+                "pull_number",
+                "merge_base_sha",
+                "base_sha",
+                "head_sha",
+                "candidate_sha",
+                "analysis_config_sha256",
+            )
+        }
+    )
     return payload
 
 
@@ -246,11 +260,11 @@ def test_context_bundle_enforces_anchor_bound_and_exact_truncation_inventory() -
         "primary_change_represented": True,
         "context_sha256": "a" * 64,
     }
-    with pytest.raises(ValidationError, match="max_anchor_lines"):
+    with pytest.raises(ValidationError, match="context SHA-256"):
         ContextBundle.model_validate(payload)
 
     payload["max_anchor_lines"] = 3
-    with pytest.raises(ValidationError, match="exactly match"):
+    with pytest.raises(ValidationError, match="context SHA-256"):
         ContextBundle.model_validate(payload)
 
 
@@ -373,10 +387,7 @@ def _context_bundle() -> ContextBundle:
         "max_hits_per_identifier": 20,
         "primary_change_represented": True,
     }
-    payload["context_sha256"] = canonical_sha256(
-        {key: value for key, value in payload.items()}
-    )
-    return ContextBundle(
+    return ContextBundle.from_content(
         **payload,
     )
 
@@ -394,13 +405,12 @@ def _assessment(risk: RiskHypothesis) -> RiskAssessment:
             IdentifierEvidence(identifier="requirePrivilege", anchor_ids=["anchor-a"])
         ],
     )
-    return RiskAssessment(
+    return RiskAssessment.from_content(
         snapshot_key="0" * 64,
         context_sha256=context.context_sha256,
         outcome="risks_proposed",
         hypotheses=[risk],
         generated_at=datetime(2026, 8, 11, tzinfo=UTC),
-        assessment_sha256="b" * 64,
         validated_at=datetime(2026, 8, 11, tzinfo=UTC),
         context_bundle=context,
         grounding_reports=[report],
@@ -477,7 +487,7 @@ def test_terminal_record_rejects_mixed_snapshot_artifacts() -> None:
         approved_at=datetime(2026, 8, 11, tzinfo=UTC),
     )
 
-    with pytest.raises(ValidationError, match="candidate snapshot key"):
+    with pytest.raises(ValidationError, match="snapshot key"):
         MilestoneTwoRunRecord(
             run_id="run-1",
             snapshot=PullRequestSnapshot.model_validate(snapshot_payload()),
@@ -516,7 +526,7 @@ def test_approved_terminal_requires_current_matching_final_freshness() -> None:
         reviewed_risk_sha256=candidate.reviewed_risk_sha256,
         approved_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
     )
-    with pytest.raises(ValidationError, match="final matching freshness"):
+    with pytest.raises(ValidationError, match="snapshot key"):
         MilestoneTwoRunRecord(
             run_id="run-currentness",
             snapshot=PullRequestSnapshot.model_validate(snapshot_payload()),
