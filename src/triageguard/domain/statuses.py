@@ -7,6 +7,17 @@ class EnvironmentKind(str, Enum):
     """The environment that supplied the observations in a research run."""
 
     CONTROLLED_FIXTURE = "controlled_fixture"
+    REAL_PR_ANALYSIS = "real_pr_analysis"
+
+
+class MilestoneTwoStatus(str, Enum):
+    """Terminal states for an immutable real pull-request analysis run."""
+
+    APPROVED_GHERKIN = "approved_gherkin"
+    NO_MEANINGFUL_SECURITY_RISK_FOUND = "no_meaningful_security_risk_found"
+    INSUFFICIENT_CONTEXT_TO_ASSESS = "insufficient_context_to_assess"
+    STALE = "stale"
+    FAILED = "failed"
 
 
 class WorkflowStatus(str, Enum):

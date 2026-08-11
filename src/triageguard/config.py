@@ -21,7 +21,17 @@ class Settings:
     llm_provider: Literal["groq"] = "groq"
     llm_model: str = "openai/gpt-oss-120b"
     groq_api_key: str | None = field(default=None, repr=False)
+    github_token: str | None = field(default=None, repr=False)
     artifacts_dir: Path = Path("artifacts")
+    github_api_version: str = "2026-03-10"
+    analysis_cache_dir: Path = Path("analysis-cache")
+    max_context_files: int = 40
+    max_context_anchors: int = 80
+    max_context_bytes: int = 160_000
+    max_context_anchor_lines: int = 120
+    max_context_blob_bytes: int = 1_000_000
+    max_context_search_identifiers: int = 100
+    max_context_hits_per_identifier: int = 20
     repeat_count: int = 3
     environment_kind: EnvironmentKind = EnvironmentKind.CONTROLLED_FIXTURE
 
@@ -30,6 +40,8 @@ class Settings:
             raise ValueError("TRIAGEGUARD_LLM_MODE must be 'live' or 'replay'")
         if self.llm_mode == "replay" and self.groq_api_key is not None:
             object.__setattr__(self, "groq_api_key", None)
+        if self.llm_mode == "replay" and self.github_token is not None:
+            object.__setattr__(self, "github_token", None)
         if (
             type(self.repeat_count) is not int
             or not MIN_REPEAT_COUNT <= self.repeat_count <= MAX_REPEAT_COUNT
@@ -42,6 +54,20 @@ class Settings:
             raise ValueError("TRIAGEGUARD_LLM_PROVIDER must be 'groq'")
         if self.llm_mode == "live" and not self.groq_api_key:
             raise ValueError("GROQ_API_KEY is required when TRIAGEGUARD_LLM_MODE=live")
+        if not isinstance(self.github_api_version, str) or not self.github_api_version:
+            raise ValueError("github_api_version must be a non-empty string")
+        for name in (
+            "max_context_files",
+            "max_context_anchors",
+            "max_context_bytes",
+            "max_context_anchor_lines",
+            "max_context_blob_bytes",
+            "max_context_search_identifiers",
+            "max_context_hits_per_identifier",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -53,6 +79,7 @@ class Settings:
         if llm_provider != "groq":
             raise ValueError("TRIAGEGUARD_LLM_PROVIDER must be 'groq'")
         groq_api_key = os.getenv("GROQ_API_KEY") if llm_mode == "live" else None
+        github_token = os.getenv("GITHUB_TOKEN") if llm_mode == "live" else None
 
         try:
             environment_kind = EnvironmentKind(
@@ -70,12 +97,45 @@ class Settings:
         except ValueError as error:
             raise ValueError("TRIAGEGUARD_REPEAT_COUNT must be an integer") from error
 
+        context_environment_names = {
+            "max_context_files": "TRIAGEGUARD_MAX_CONTEXT_FILES",
+            "max_context_anchors": "TRIAGEGUARD_MAX_CONTEXT_ANCHORS",
+            "max_context_bytes": "TRIAGEGUARD_MAX_CONTEXT_BYTES",
+            "max_context_anchor_lines": "TRIAGEGUARD_MAX_CONTEXT_ANCHOR_LINES",
+            "max_context_blob_bytes": "TRIAGEGUARD_MAX_CONTEXT_BLOB_BYTES",
+            "max_context_search_identifiers": "TRIAGEGUARD_MAX_CONTEXT_SEARCH_IDENTIFIERS",
+            "max_context_hits_per_identifier": "TRIAGEGUARD_MAX_CONTEXT_HITS_PER_IDENTIFIER",
+        }
+        context_defaults = {
+            "max_context_files": 40,
+            "max_context_anchors": 80,
+            "max_context_bytes": 160_000,
+            "max_context_anchor_lines": 120,
+            "max_context_blob_bytes": 1_000_000,
+            "max_context_search_identifiers": 100,
+            "max_context_hits_per_identifier": 20,
+        }
+        context_limits: dict[str, int] = {}
+        for field_name, environment_name in context_environment_names.items():
+            try:
+                context_limits[field_name] = int(
+                    os.getenv(environment_name, str(context_defaults[field_name]))
+                )
+            except ValueError as error:
+                raise ValueError(f"{environment_name} must be an integer") from error
+
         return cls(
             llm_mode=llm_mode,
             llm_provider=llm_provider,
             llm_model=os.getenv("TRIAGEGUARD_LLM_MODEL", "openai/gpt-oss-120b"),
             groq_api_key=groq_api_key,
+            github_token=github_token,
             artifacts_dir=Path(os.getenv("TRIAGEGUARD_ARTIFACTS_DIR", "artifacts")),
+            github_api_version=os.getenv("TRIAGEGUARD_GITHUB_API_VERSION", "2026-03-10"),
+            analysis_cache_dir=Path(
+                os.getenv("TRIAGEGUARD_ANALYSIS_CACHE_DIR", "analysis-cache")
+            ),
+            **context_limits,
             repeat_count=repeat_count,
             environment_kind=environment_kind,
         )
@@ -87,6 +147,15 @@ class Settings:
             llm_provider=self.llm_provider,
             llm_model=self.llm_model,
             artifacts_dir=self.artifacts_dir,
+            github_api_version=self.github_api_version,
+            analysis_cache_dir=self.analysis_cache_dir,
+            max_context_files=self.max_context_files,
+            max_context_anchors=self.max_context_anchors,
+            max_context_bytes=self.max_context_bytes,
+            max_context_anchor_lines=self.max_context_anchor_lines,
+            max_context_blob_bytes=self.max_context_blob_bytes,
+            max_context_search_identifiers=self.max_context_search_identifiers,
+            max_context_hits_per_identifier=self.max_context_hits_per_identifier,
             repeat_count=self.repeat_count,
             environment_kind=self.environment_kind,
         )
@@ -100,6 +169,16 @@ class PublicSettings:
     llm_provider: Literal["groq"]
     llm_model: str
     artifacts_dir: Path
+    github_api_version: str
+    analysis_cache_dir: Path
+    max_context_files: int
+    max_context_anchors: int
+    max_context_bytes: int
+    max_context_anchor_lines: int
+    max_context_blob_bytes: int
+    max_context_search_identifiers: int
+    max_context_hits_per_identifier: int
     repeat_count: int
     environment_kind: EnvironmentKind
     groq_api_key: None = field(default=None, init=False, repr=False)
+    github_token: None = field(default=None, init=False, repr=False)

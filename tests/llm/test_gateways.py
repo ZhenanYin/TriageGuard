@@ -45,6 +45,24 @@ def test_replay_gateway_returns_named_fixture_and_records_model_identity():
     assert response.attempts[0].outcome == "succeeded"
 
 
+def test_model_request_accepts_gherkin_generation() -> None:
+    """The second structured Milestone 2 call needs its own auditable purpose."""
+    request = ModelRequest(
+        purpose="gherkin_generation",
+        system_prompt="Return one structured security scenario.",
+        payload={"risk_sha256": "a" * 64},
+        output_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        max_output_tokens=2048,
+    )
+
+    assert request.purpose == "gherkin_generation"
+
+
 def test_replay_gateway_refuses_to_synthesize_a_missing_fixture():
     """Returning a guessed response would conceal an unrecorded replay dependency."""
     gateway = ReplayGateway(responses={})

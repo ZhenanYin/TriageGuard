@@ -24,6 +24,7 @@ class ModelRequest(BaseModel):
         "pytest_generation",
         "mechanical_repair",
         "plain_explanation",
+        "gherkin_generation",
     ]
     system_prompt: str = Field(min_length=1)
     payload: dict[str, Any]

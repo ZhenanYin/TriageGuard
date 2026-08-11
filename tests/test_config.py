@@ -35,6 +35,33 @@ def test_replay_mode_discards_an_inherited_groq_key(monkeypatch) -> None:
     assert secret not in repr(settings)
 
 
+def test_replay_discards_both_provider_secrets(monkeypatch) -> None:
+    """Replay configuration must not retain either process-only provider secret."""
+    monkeypatch.setenv("TRIAGEGUARD_LLM_MODE", "replay")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+
+    settings = Settings.from_env()
+
+    assert settings.groq_api_key is None
+    assert settings.github_token is None
+    assert "secret" not in repr(settings)
+
+
+def test_context_settings_have_documented_bounded_defaults() -> None:
+    """Unconfigured context collection must remain reproducibly bounded."""
+    settings = Settings()
+
+    assert settings.github_api_version == "2026-03-10"
+    assert settings.max_context_files == 40
+    assert settings.max_context_anchors == 80
+    assert settings.max_context_bytes == 160_000
+    assert settings.max_context_anchor_lines == 120
+    assert settings.max_context_blob_bytes == 1_000_000
+    assert settings.max_context_search_identifiers == 100
+    assert settings.max_context_hits_per_identifier == 20
+
+
 def test_invalid_mode_is_rejected_before_secret_lookup(monkeypatch) -> None:
     """Mode validation must precede any attempt to read credential material."""
     real_getenv = config_module.os.getenv
