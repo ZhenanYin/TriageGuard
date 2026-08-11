@@ -1,5 +1,6 @@
 """Contracts for immutable Milestone 2 PR-analysis artifacts."""
 
+import hashlib
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -11,9 +12,12 @@ from triageguard.domain.pr_analysis import (
     ContextBundle,
     GherkinApproval,
     GherkinCandidate,
+    GherkinCandidateDraft,
     GherkinStep,
     GherkinStepBinding,
+    GroundingReport,
     HumanReviewedRisk,
+    IdentifierEvidence,
     MilestoneTwoRunRecord,
     PullRequestSnapshot,
     RiskAssessment,
@@ -159,6 +163,10 @@ def test_model_cannot_supply_hypothesis_id_or_prohibited_claims() -> None:
         with pytest.raises(ValidationError, match="prohibited"):
             _risk_draft(explanation=forbidden)
 
+    derived = RiskHypothesis.from_draft(_risk_draft())
+    with pytest.raises(ValidationError, match="locally derived"):
+        RiskHypothesis.model_validate(derived.model_dump(mode="json"))
+
 
 def test_artifact_collections_are_deeply_immutable() -> None:
     """Recorded evidence cannot be changed through a mutable nested collection."""
@@ -181,7 +189,8 @@ def test_context_bundle_requires_all_reproducibility_limits() -> None:
         java_symbol="Patient.delete",
         start_line=10,
         end_line=11,
-        text_sha256="a" * 64,
+        text="requirePrivilege();\nreturn denied;",
+        text_sha256=hashlib.sha256(b"requirePrivilege();\nreturn denied;").hexdigest(),
         selection_reason="integration change",
         score_components=[],
         change_relation="integration_change",
@@ -204,12 +213,52 @@ def test_context_bundle_requires_all_reproducibility_limits() -> None:
         ContextBundle.model_validate(payload)
 
 
+def test_context_bundle_enforces_anchor_bound_and_exact_truncation_inventory() -> None:
+    """A context record cannot contradict line or truncation limits it claims to use."""
+    anchor = ContextAnchor(
+        anchor_id="anchor-a",
+        revision_role="candidate",
+        commit_sha="4" * 40,
+        path="api/Patient.java",
+        java_symbol=None,
+        start_line=1,
+        end_line=3,
+        text="abc",
+        text_sha256=hashlib.sha256(b"abc").hexdigest(),
+        selection_reason="integration change",
+        score_components=[],
+        change_relation="integration_change",
+        truncated=True,
+    )
+    payload = {
+        "snapshot_key": "0" * 64,
+        "anchors": [anchor],
+        "selected_file_count": 1,
+        "selected_anchor_count": 1,
+        "selected_bytes": 3,
+        "max_files": 1,
+        "max_anchors": 1,
+        "max_bytes": 3,
+        "max_anchor_lines": 2,
+        "max_blob_bytes": 10,
+        "max_search_identifiers": 1,
+        "max_hits_per_identifier": 1,
+        "primary_change_represented": True,
+        "context_sha256": "a" * 64,
+    }
+    with pytest.raises(ValidationError, match="max_anchor_lines"):
+        ContextBundle.model_validate(payload)
+
+    payload["max_anchor_lines"] = 3
+    with pytest.raises(ValidationError, match="exactly match"):
+        ContextBundle.model_validate(payload)
+
+
 def test_candidate_rejects_non_gherkin_or_incomplete_traceability() -> None:
     """An approval candidate needs parsed Gherkin and every approved-risk binding."""
     approved_risk = RiskHypothesis.from_draft(_risk_draft())
     with pytest.raises(ValidationError, match="Feature"):
-        GherkinCandidate(
-            candidate_id="candidate-1",
+        GherkinCandidateDraft(
             snapshot_key="0" * 64,
             reviewed_risk_sha256=canonical_sha256(approved_risk.model_dump(mode="json")),
             approved_risk=approved_risk,
@@ -224,8 +273,28 @@ def test_candidate_rejects_non_gherkin_or_incomplete_traceability() -> None:
         )
 
 
+def test_raw_gherkin_cannot_supply_a_candidate_id_or_code_like_step() -> None:
+    """Provider output cannot select a durable ID or hide executable text in a step."""
+    draft = _candidate().model_dump(mode="json", exclude={"candidate_id"})
+    with pytest.raises(ValidationError, match="locally derived"):
+        GherkinCandidate.model_validate(draft | {"candidate_id": "provider-id"})
+
+    malicious = draft | {
+        "steps": [
+            *draft["steps"][:2],
+            {"number": 3, "keyword": "When", "text": "os.system('untrusted')"},
+            *draft["steps"][3:],
+        ],
+        "gherkin_text": draft["gherkin_text"].replace(
+            "When the changed request is sent", "When os.system('untrusted')"
+        ),
+    }
+    with pytest.raises(ValidationError, match="implementation code"):
+        GherkinCandidateDraft.model_validate(malicious)
+
+
 def _candidate(snapshot_key: str = "0" * 64) -> GherkinCandidate:
-    risk = RiskHypothesis.from_draft(_risk_draft())
+    risk = _risk_draft()
     steps = (
         GherkinStep(number=1, keyword="Given", text="an authenticated clerk"),
         GherkinStep(number=2, keyword="And", text="a protected record exists"),
@@ -239,8 +308,7 @@ def _candidate(snapshot_key: str = "0" * 64) -> GherkinCandidate:
             text="the requirePrivilege record state is recorded",
         ),
     )
-    return GherkinCandidate(
-        candidate_id="candidate-1",
+    return GherkinCandidate.from_draft(GherkinCandidateDraft(
         snapshot_key=snapshot_key,
         reviewed_risk_sha256=canonical_sha256(risk.model_dump(mode="json")),
         approved_risk=risk,
@@ -266,6 +334,71 @@ def _candidate(snapshot_key: str = "0" * 64) -> GherkinCandidate:
         testability_notes=[],
         setup_gaps=[],
         generated_at=datetime(2026, 8, 11, tzinfo=UTC),
+    ))
+
+
+def _context_bundle() -> ContextBundle:
+    anchors = tuple(
+        ContextAnchor(
+            anchor_id=anchor_id,
+            revision_role="candidate",
+            commit_sha="4" * 40,
+            path="api/Patient.java",
+            java_symbol="Patient.delete",
+            start_line=index,
+            end_line=index,
+            text="requirePrivilege" if anchor_id == "anchor-a" else "related evidence",
+            text_sha256=hashlib.sha256(
+                ("requirePrivilege" if anchor_id == "anchor-a" else "related evidence").encode()
+            ).hexdigest(),
+            selection_reason="integration change",
+            score_components=[],
+            change_relation="integration_change" if anchor_id == "anchor-a" else "repository_context",
+            truncated=False,
+        )
+        for index, anchor_id in enumerate(("anchor-a", "anchor-b", "anchor-c"), start=1)
+    )
+    return ContextBundle(
+        snapshot_key="0" * 64,
+        anchors=anchors,
+        selected_file_count=1,
+        selected_anchor_count=3,
+        selected_bytes=100,
+        max_files=40,
+        max_anchors=80,
+        max_bytes=160_000,
+        max_anchor_lines=120,
+        max_blob_bytes=1_000_000,
+        max_search_identifiers=100,
+        max_hits_per_identifier=20,
+        primary_change_represented=True,
+        context_sha256="a" * 64,
+    )
+
+
+def _assessment(risk: RiskHypothesis) -> RiskAssessment:
+    context = _context_bundle()
+    report = GroundingReport(
+        producer="local_grounding_validator",
+        snapshot_key="0" * 64,
+        context_sha256=context.context_sha256,
+        hypothesis_id=risk.hypothesis_id,
+        hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
+        cited_anchor_ids=risk.citation_anchor_ids,
+        identifier_evidence=[
+            IdentifierEvidence(identifier="requirePrivilege", anchor_ids=["anchor-a"])
+        ],
+    )
+    return RiskAssessment(
+        snapshot_key="0" * 64,
+        context_sha256=context.context_sha256,
+        outcome="risks_proposed",
+        hypotheses=[risk],
+        generated_at=datetime(2026, 8, 11, tzinfo=UTC),
+        assessment_sha256="b" * 64,
+        validated_at=datetime(2026, 8, 11, tzinfo=UTC),
+        context_bundle=context,
+        grounding_reports=[report],
     )
 
 
@@ -273,8 +406,8 @@ def test_candidate_requires_complete_bindings_and_phase_order() -> None:
     """A scenario may reach approval only when every approved claim has a legal phase."""
     candidate = _candidate()
     with pytest.raises(ValidationError, match="cover every"):
-        GherkinCandidate.model_validate(
-            candidate.model_dump(mode="json", exclude={"bindings"})
+        GherkinCandidateDraft.model_validate(
+            candidate.model_dump(mode="json", exclude={"bindings", "candidate_id"})
             | {"bindings": candidate.bindings[:-1]}
         )
 
@@ -290,8 +423,8 @@ def test_candidate_steps_are_immutable_after_validation() -> None:
     bad_steps = list(candidate.steps)
     bad_steps[2] = GherkinStep(number=3, keyword="Then", text="the changed request is sent")
     with pytest.raises(ValidationError, match="phase"):
-        GherkinCandidate.model_validate(
-            candidate.model_dump(mode="json")
+        GherkinCandidateDraft.model_validate(
+            candidate.model_dump(mode="json", exclude={"candidate_id"})
             | {
                 "steps": bad_steps,
                 "gherkin_text": candidate.gherkin_text.replace(
@@ -304,21 +437,14 @@ def test_candidate_steps_are_immutable_after_validation() -> None:
 def test_terminal_record_rejects_mixed_snapshot_artifacts() -> None:
     """An approved record cannot join a candidate from another frozen PR snapshot."""
     risk = RiskHypothesis.from_draft(_risk_draft())
-    assessment = RiskAssessment(
-        snapshot_key="0" * 64,
-        context_sha256="a" * 64,
-        outcome="risks_proposed",
-        hypotheses=[risk],
-        generated_at=datetime(2026, 8, 11, tzinfo=UTC),
-        assessment_sha256="b" * 64,
-        validated_at=datetime(2026, 8, 11, tzinfo=UTC),
-    )
+    assessment = _assessment(risk)
     review = HumanReviewedRisk(
         snapshot_key="0" * 64,
         assessment_sha256=assessment.assessment_sha256,
-        original_hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
         selected_hypothesis_id=risk.hypothesis_id,
-        reviewed_risk=risk,
+        selected_hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
+        reviewed_risk=_risk_draft(),
+        reviewed_content_sha256=canonical_sha256(_risk_draft().model_dump(mode="json")),
         approved_at=datetime(2026, 8, 11, tzinfo=UTC),
     )
     candidate = _candidate(snapshot_key="e" * 64)
@@ -339,6 +465,43 @@ def test_terminal_record_rejects_mixed_snapshot_artifacts() -> None:
             explanation="A human approved the scenario.",
             started_at=datetime(2026, 8, 11, tzinfo=UTC),
             finished_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
+            risk_assessment=assessment,
+            human_reviewed_risk=review,
+            gherkin_candidate=candidate,
+            gherkin_approval=approval,
+        )
+
+
+def test_approved_terminal_requires_current_matching_final_freshness() -> None:
+    """Gherkin approval must be preceded by a current check of this exact snapshot."""
+    risk = RiskHypothesis.from_draft(_risk_draft())
+    assessment = _assessment(risk)
+    review = HumanReviewedRisk(
+        snapshot_key="0" * 64,
+        assessment_sha256=assessment.assessment_sha256,
+        selected_hypothesis_id=risk.hypothesis_id,
+        selected_hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
+        reviewed_risk=_risk_draft(),
+        reviewed_content_sha256=canonical_sha256(_risk_draft().model_dump(mode="json")),
+        approved_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+    candidate = _candidate()
+    approval = GherkinApproval(
+        snapshot_key="0" * 64,
+        candidate_id=candidate.candidate_id,
+        candidate_sha256=canonical_sha256(candidate.model_dump(mode="json")),
+        reviewed_risk_sha256=candidate.reviewed_risk_sha256,
+        approved_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
+    )
+    with pytest.raises(ValidationError, match="final matching freshness"):
+        MilestoneTwoRunRecord(
+            run_id="run-currentness",
+            snapshot=PullRequestSnapshot.model_validate(snapshot_payload()),
+            status="approved_gherkin",
+            reason_code="gherkin_approved",
+            explanation="A human approved the scenario.",
+            started_at=datetime(2026, 8, 11, tzinfo=UTC),
+            finished_at=datetime(2026, 8, 11, 0, 2, tzinfo=UTC),
             risk_assessment=assessment,
             human_reviewed_risk=review,
             gherkin_candidate=candidate,

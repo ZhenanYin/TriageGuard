@@ -108,6 +108,20 @@ def test_live_secrets_are_absent_from_dataclass_serialization() -> None:
     assert "secret" not in repr(serialized)
 
 
+def test_value_equal_settings_isolate_process_only_secrets() -> None:
+    """Two equivalent public settings objects must never share provider credentials."""
+    first = Settings(
+        llm_mode="live", groq_api_key="groq-first", github_token="github-first"
+    )
+    second = Settings(
+        llm_mode="live", groq_api_key="groq-second", github_token="github-second"
+    )
+
+    assert first == second
+    assert (first.groq_api_key, first.github_token) == ("groq-first", "github-first")
+    assert (second.groq_api_key, second.github_token) == ("groq-second", "github-second")
+
+
 def test_repeat_count_must_be_at_least_one(monkeypatch):
     """A zero-repeat experiment would create evidence without repetitions."""
     monkeypatch.setenv("TRIAGEGUARD_REPEAT_COUNT", "0")

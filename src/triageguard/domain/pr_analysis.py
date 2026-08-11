@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime
 from typing import Annotated, Literal
@@ -18,7 +19,7 @@ from pydantic import (
 
 from triageguard.domain.models import ResearchArtifact
 from triageguard.domain.statuses import MilestoneTwoStatus
-from triageguard.provenance import canonical_sha256
+from triageguard.provenance import canonical_json, canonical_sha256
 
 FullCommitSha = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -60,6 +61,16 @@ _FAILED_REASON_CODES = {
     "risk_not_approved",
     "gherkin_alignment_failed",
     "gherkin_not_approved",
+}
+_EDITABLE_RISK_FIELDS = {
+    "actor",
+    "preconditions",
+    "action",
+    "protected_asset",
+    "expected_secure_behavior",
+    "possible_failure",
+    "observables",
+    "limitations",
 }
 
 
@@ -131,6 +142,7 @@ class PullRequestSnapshot(ResearchArtifact):
 class SnapshotFreshness(ResearchArtifact):
     """A non-mutating recheck of a frozen snapshot's currentness."""
 
+    snapshot_key: Sha256
     status: Literal["current", "stale", "unknown"]
     reason_code: ReasonCode
     checked_at: datetime
@@ -149,6 +161,8 @@ class SnapshotFreshness(ResearchArtifact):
         )
         if self.status == "current" and any(value is None for value in observed):
             raise ValueError("current freshness requires every observed revision")
+        if self.status == "stale" and any(value is None for value in observed):
+            raise ValueError("stale freshness requires every observed revision")
         if self.status == "unknown" and any(value is not None for value in observed):
             raise ValueError("unknown freshness cannot claim observed revisions")
         return self
@@ -226,6 +240,7 @@ class ContextAnchor(ResearchArtifact):
     java_symbol: StrictStr | None
     start_line: StrictInt = Field(gt=0)
     end_line: StrictInt = Field(gt=0)
+    text: StrictStr = Field(min_length=1)
     text_sha256: Sha256
     selection_reason: StrictStr = Field(min_length=1)
     score_components: tuple[ContextScoreComponent, ...]
@@ -241,6 +256,8 @@ class ContextAnchor(ResearchArtifact):
         names = [component.name for component in self.score_components]
         if len(names) != len(set(names)):
             raise ValueError("anchor score component names must be unique")
+        if self.text_sha256 != hashlib.sha256(self.text.encode("utf-8")).hexdigest():
+            raise ValueError("anchor text SHA-256 must match its exact text")
         return self
 
 
@@ -278,8 +295,15 @@ class ContextBundle(ResearchArtifact):
             raise ValueError("context selection exceeds its configured limits")
         if self.selected_bytes > self.max_bytes:
             raise ValueError("context selection exceeds its byte limit")
-        if set(self.truncated_anchor_ids) - set(anchor_ids):
-            raise ValueError("truncated anchor IDs must be present in the bundle")
+        if any(
+            anchor.end_line - anchor.start_line + 1 > self.max_anchor_lines
+            for anchor in self.anchors
+        ):
+            raise ValueError("context anchor exceeds max_anchor_lines")
+        if set(self.truncated_anchor_ids) != {
+            anchor.anchor_id for anchor in self.anchors if anchor.truncated
+        }:
+            raise ValueError("truncated anchor IDs must exactly match truncated anchors")
         return self
 
 
@@ -371,6 +395,16 @@ class RiskHypothesisDraft(ResearchArtifact):
             raise ValueError("claim evidence bindings must cover every required claim")
         return self
 
+    @property
+    def citation_anchor_ids(self) -> list[str]:
+        return list(
+            dict.fromkeys(
+                anchor_id
+                for binding in self.evidence_bindings
+                for anchor_id in binding.anchor_ids
+            )
+        )
+
 
 class RiskHypothesis(RiskHypothesisDraft):
     """A validated hypothesis with a deterministic workflow-assigned identity."""
@@ -381,11 +415,7 @@ class RiskHypothesis(RiskHypothesisDraft):
     @classmethod
     def reject_model_supplied_id(cls, value: object) -> object:
         if isinstance(value, dict) and "hypothesis_id" in value:
-            supplied_id = value["hypothesis_id"]
-            content = {key: item for key, item in value.items() if key != "hypothesis_id"}
-            expected_id = f"risk-{canonical_sha256(content)}"
-            if supplied_id != expected_id:
-                raise ValueError("hypothesis_id is locally derived and cannot be model supplied")
+            raise ValueError("hypothesis_id is locally derived and cannot be model supplied")
         return value
 
     @model_validator(mode="after")
@@ -399,16 +429,18 @@ class RiskHypothesis(RiskHypothesisDraft):
         """Assign a stable local identity only after validating provider content."""
         return cls.model_validate(draft.model_dump(mode="json"))
 
-    @property
-    def citation_anchor_ids(self) -> list[str]:
-        """Return the stable first-seen union without persisting a duplicate list."""
-        return list(
-            dict.fromkeys(
-                anchor_id
-                for binding in self.evidence_bindings
-                for anchor_id in binding.anchor_ids
-            )
+    @classmethod
+    def from_persisted(cls, value: dict[str, object]) -> RiskHypothesis:
+        """Read a durable artifact only when its recorded ID equals the local derivation."""
+        supplied_id = value.get("hypothesis_id")
+        draft = RiskHypothesisDraft.model_validate(
+            {key: item for key, item in value.items() if key != "hypothesis_id"}
         )
+        result = cls.from_draft(draft)
+        if supplied_id != result.hypothesis_id:
+            raise ValueError("persisted hypothesis ID does not match local derivation")
+        return result
+
 
 
 RiskAssessmentOutcome = Literal[
@@ -479,12 +511,33 @@ class RiskAssessmentDraft(ResearchArtifact):
         return self
 
 
+class IdentifierEvidence(ResearchArtifact):
+    """One locally checked identifier-to-anchor occurrence."""
+
+    identifier: StrictStr = Field(min_length=1)
+    anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
+
+
+class GroundingReport(ResearchArtifact):
+    """Immutable local attestation that a validated risk is grounded in context."""
+
+    producer: Literal["local_grounding_validator"]
+    snapshot_key: Sha256
+    context_sha256: Sha256
+    hypothesis_id: StrictStr = Field(min_length=1)
+    hypothesis_sha256: Sha256
+    cited_anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
+    identifier_evidence: tuple[IdentifierEvidence, ...]
+
+
 class RiskAssessment(RiskAssessmentDraft):
     """A locally validated risk assessment whose risks have stable IDs."""
 
     hypotheses: tuple[RiskHypothesis, ...] = Field(default_factory=tuple)
     assessment_sha256: Sha256
     validated_at: datetime
+    context_bundle: ContextBundle
+    grounding_reports: tuple[GroundingReport, ...]
 
     @model_validator(mode="after")
     def validate_assessment_time(self) -> RiskAssessment:
@@ -492,13 +545,61 @@ class RiskAssessment(RiskAssessmentDraft):
             raise ValueError("validated_at must be timezone-aware UTC")
         if self.validated_at < self.generated_at:
             raise ValueError("validated_at must not precede generated_at")
+        if self.context_bundle.snapshot_key != self.snapshot_key:
+            raise ValueError("context bundle snapshot key must match the assessment")
+        if self.context_bundle.context_sha256 != self.context_sha256:
+            raise ValueError("context bundle hash must match the assessment")
+        if not self.context_bundle.primary_change_represented:
+            raise ValueError("validated assessment requires represented primary integration change")
+        if self.outcome == "risks_proposed":
+            if len(self.grounding_reports) != len(self.hypotheses):
+                raise ValueError("every risk hypothesis requires one grounding report")
+            anchors = {anchor.anchor_id: anchor for anchor in self.context_bundle.anchors}
+            reports = {report.hypothesis_id: report for report in self.grounding_reports}
+            if len(reports) != len(self.grounding_reports):
+                raise ValueError("grounding reports must have unique hypothesis IDs")
+            for hypothesis in self.hypotheses:
+                report = reports.get(hypothesis.hypothesis_id)
+                if report is None:
+                    raise ValueError("risk hypothesis is missing its grounding report")
+                if (
+                    report.snapshot_key != self.snapshot_key
+                    or report.context_sha256 != self.context_sha256
+                    or report.hypothesis_sha256 != canonical_sha256(hypothesis.model_dump(mode="json"))
+                ):
+                    raise ValueError("grounding report does not bind the exact assessment inputs")
+                citations = tuple(hypothesis.citation_anchor_ids)
+                if report.cited_anchor_ids != citations or any(anchor_id not in anchors for anchor_id in citations):
+                    raise ValueError("grounding report citations must resolve to the frozen context catalog")
+                if not any(anchors[anchor_id].change_relation == "integration_change" for anchor_id in citations):
+                    raise ValueError("risk hypothesis requires an integration-change citation")
+                bindings = {binding.identifier: binding for binding in report.identifier_evidence}
+                if set(bindings) != set(hypothesis.code_identifiers):
+                    raise ValueError("grounding report must cover every declared code identifier")
+                bound_ids = set(citations)
+                for identifier, evidence in bindings.items():
+                    if any(anchor_id not in bound_ids for anchor_id in evidence.anchor_ids) or not any(
+                        identifier in anchors[anchor_id].text for anchor_id in evidence.anchor_ids
+                    ):
+                        raise ValueError("identifier evidence must occur in a bound context anchor")
+        elif self.grounding_reports:
+            raise ValueError("abstention assessments cannot contain grounding reports")
         return self
 
 
 class ReviewedFieldChange(ResearchArtifact):
     """An explicit before/after record for a reviewer edit."""
 
-    field_name: StrictStr = Field(min_length=1)
+    field_name: Literal[
+        "actor",
+        "preconditions",
+        "action",
+        "protected_asset",
+        "expected_secure_behavior",
+        "possible_failure",
+        "observables",
+        "limitations",
+    ]
     before: StrictStr
     after: StrictStr
 
@@ -508,9 +609,10 @@ class HumanReviewedRisk(ResearchArtifact):
 
     snapshot_key: Sha256
     assessment_sha256: Sha256
-    original_hypothesis_sha256: Sha256
     selected_hypothesis_id: StrictStr = Field(min_length=1)
-    reviewed_risk: RiskHypothesis
+    selected_hypothesis_sha256: Sha256
+    reviewed_risk: RiskHypothesisDraft
+    reviewed_content_sha256: Sha256
     added_citation_anchor_ids: tuple[StrictStr, ...] = Field(default_factory=tuple)
     removed_citation_anchor_ids: tuple[StrictStr, ...] = Field(default_factory=tuple)
     field_changes: tuple[ReviewedFieldChange, ...] = Field(default_factory=tuple)
@@ -520,8 +622,10 @@ class HumanReviewedRisk(ResearchArtifact):
     def validate_review_coherence(self) -> HumanReviewedRisk:
         if not _is_utc(self.approved_at):
             raise ValueError("approved_at must be timezone-aware UTC")
-        if self.selected_hypothesis_id != self.reviewed_risk.hypothesis_id:
-            raise ValueError("selected hypothesis ID must match the reviewed risk")
+        if self.reviewed_content_sha256 != canonical_sha256(
+            self.reviewed_risk.model_dump(mode="json")
+        ):
+            raise ValueError("reviewed content hash must match the reviewed risk")
         added = set(self.added_citation_anchor_ids)
         removed = set(self.removed_citation_anchor_ids)
         if len(added) != len(self.added_citation_anchor_ids) or len(removed) != len(self.removed_citation_anchor_ids):
@@ -563,13 +667,12 @@ class GherkinStepBinding(ResearchArtifact):
         return self
 
 
-class GherkinCandidate(ResearchArtifact):
-    """A generated, editable but not yet human-approved scenario candidate."""
+class GherkinCandidateDraft(ResearchArtifact):
+    """Raw provider scenario output; it deliberately has no durable identity."""
 
-    candidate_id: StrictStr = Field(min_length=1)
     snapshot_key: Sha256
     reviewed_risk_sha256: Sha256
-    approved_risk: RiskHypothesis
+    approved_risk: RiskHypothesisDraft
     feature_title: StrictStr = Field(min_length=1)
     scenario_title: StrictStr = Field(min_length=1)
     steps: tuple[GherkinStep, ...] = Field(min_length=1)
@@ -592,7 +695,7 @@ class GherkinCandidate(ResearchArtifact):
         return value
 
     @model_validator(mode="after")
-    def validate_candidate_coherence(self) -> GherkinCandidate:
+    def validate_candidate_coherence(self) -> GherkinCandidateDraft:
         if not _is_utc(self.generated_at):
             raise ValueError("generated_at must be timezone-aware UTC")
         if [step.number for step in self.steps] != list(range(1, len(self.steps) + 1)):
@@ -604,7 +707,11 @@ class GherkinCandidate(ResearchArtifact):
         parsed_steps = _parse_gherkin(
             self.gherkin_text, self.feature_title, self.scenario_title
         )
-        if re.search(r"```|\b(?:def|class|import)\b", self.gherkin_text):
+        if re.search(
+            r"```|#|[(){}\[\];]|\b(?:def|class|import|os|sys|subprocess|python|bash|sh|curl|wget|rm|chmod|sudo|eval|exec)\b|/bin/",
+            self.gherkin_text,
+            flags=re.IGNORECASE,
+        ):
             raise ValueError("Gherkin text cannot contain implementation code")
         if any(
             identifier not in self.gherkin_text
@@ -681,6 +788,40 @@ def _gherkin_phases(steps: tuple[GherkinStep, ...]) -> dict[int, str]:
     return phases
 
 
+class GherkinCandidate(GherkinCandidateDraft):
+    """Locally identified, validated successor to raw Gherkin provider output."""
+
+    candidate_id: StrictStr = Field(default="", min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_model_supplied_id(cls, value: object) -> object:
+        if isinstance(value, dict) and "candidate_id" in value:
+            raise ValueError("candidate_id is locally derived and cannot be model supplied")
+        return value
+
+    @model_validator(mode="after")
+    def derive_candidate_id(self) -> GherkinCandidate:
+        content = self.model_dump(mode="json", exclude={"candidate_id"})
+        object.__setattr__(self, "candidate_id", f"gherkin-{canonical_sha256(content)}")
+        return self
+
+    @classmethod
+    def from_draft(cls, draft: GherkinCandidateDraft) -> GherkinCandidate:
+        return cls.model_validate(draft.model_dump(mode="json"))
+
+    @classmethod
+    def from_persisted(cls, value: dict[str, object]) -> GherkinCandidate:
+        supplied_id = value.get("candidate_id")
+        draft = GherkinCandidateDraft.model_validate(
+            {key: item for key, item in value.items() if key != "candidate_id"}
+        )
+        result = cls.from_draft(draft)
+        if supplied_id != result.candidate_id:
+            raise ValueError("persisted candidate ID does not match local derivation")
+        return result
+
+
 class GherkinApproval(ResearchArtifact):
     """The terminal human approval of a validated scenario candidate."""
 
@@ -723,6 +864,8 @@ class MilestoneTwoRunRecord(ResearchArtifact):
         review = self.human_reviewed_risk
         candidate = self.gherkin_candidate
         approval = self.gherkin_approval
+        if self.freshness is not None and self.freshness.snapshot_key != self.snapshot.snapshot_key:
+            raise ValueError("freshness check snapshot key must match the terminal snapshot")
         if assessment is not None and assessment.snapshot_key != self.snapshot.snapshot_key:
             raise ValueError("risk assessment snapshot key must match the terminal snapshot")
         if review is not None:
@@ -738,14 +881,38 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             )
             if selected is None:
                 raise ValueError("reviewed risk must select a hypothesis from the assessment")
-            if review.original_hypothesis_sha256 != canonical_sha256(selected.model_dump(mode="json")):
+            if review.selected_hypothesis_sha256 != canonical_sha256(selected.model_dump(mode="json")):
                 raise ValueError("reviewed risk original hypothesis hash must match the assessment")
+            expected_changes = {
+                field_name: (canonical_json(getattr(selected, field_name)), canonical_json(getattr(review.reviewed_risk, field_name)))
+                for field_name in _EDITABLE_RISK_FIELDS
+                if getattr(selected, field_name) != getattr(review.reviewed_risk, field_name)
+            }
+            reported_changes = {
+                change.field_name: (change.before, change.after)
+                for change in review.field_changes
+            }
+            if reported_changes != expected_changes:
+                raise ValueError("review field changes must exactly describe the reviewed content")
+            original_citations = selected.citation_anchor_ids
+            reviewed_citations = review.reviewed_risk.citation_anchor_ids
+            expected_added = tuple(
+                anchor_id for anchor_id in reviewed_citations if anchor_id not in original_citations
+            )
+            expected_removed = tuple(
+                anchor_id for anchor_id in original_citations if anchor_id not in reviewed_citations
+            )
+            if (
+                review.added_citation_anchor_ids != expected_added
+                or review.removed_citation_anchor_ids != expected_removed
+            ):
+                raise ValueError("review citation deltas must match the reviewed evidence bindings")
         if candidate is not None:
             if review is None:
                 raise ValueError("a Gherkin candidate requires a human-reviewed risk")
             if candidate.snapshot_key != self.snapshot.snapshot_key:
                 raise ValueError("Gherkin candidate snapshot key must match the terminal snapshot")
-            if candidate.reviewed_risk_sha256 != canonical_sha256(review.reviewed_risk.model_dump(mode="json")):
+            if candidate.reviewed_risk_sha256 != review.reviewed_content_sha256:
                 raise ValueError("Gherkin candidate risk hash must match the reviewed risk")
             if candidate.approved_risk != review.reviewed_risk:
                 raise ValueError("Gherkin candidate approved risk must match the reviewed risk")
@@ -764,6 +931,19 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             approval is None or candidate is None or review is None
         ):
             raise ValueError("approved Gherkin requires a candidate, reviewed risk, and approval")
+        if self.status is MilestoneTwoStatus.APPROVED_GHERKIN and (
+            self.freshness is None
+            or self.freshness.status != "current"
+            or (
+                self.freshness.observed_base_sha,
+                self.freshness.observed_head_sha,
+                self.freshness.observed_candidate_sha,
+            )
+            != (self.snapshot.base_sha, self.snapshot.head_sha, self.snapshot.candidate_sha)
+            or approval is None
+            or self.freshness.checked_at > approval.approved_at
+        ):
+            raise ValueError("approved Gherkin requires a current final matching freshness check")
         if self.status is MilestoneTwoStatus.NO_MEANINGFUL_SECURITY_RISK_FOUND and (
             self.risk_assessment is None
             or self.risk_assessment.outcome != "no_meaningful_security_risk_found"
@@ -786,6 +966,12 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             self.freshness is None or self.freshness.status != "stale"
         ):
             raise ValueError("stale terminal status requires a stale freshness check")
+        if self.status is MilestoneTwoStatus.STALE and self.freshness is not None and (
+            self.freshness.observed_base_sha == self.snapshot.base_sha
+            and self.freshness.observed_head_sha == self.snapshot.head_sha
+            and self.freshness.observed_candidate_sha == self.snapshot.candidate_sha
+        ):
+            raise ValueError("stale terminal status requires an observed revision divergence")
         if self.status is MilestoneTwoStatus.STALE and self.reason_code != "snapshot_stale":
             raise ValueError("stale terminal status requires the snapshot_stale reason code")
         if self.status is MilestoneTwoStatus.APPROVED_GHERKIN and self.reason_code != "gherkin_approved":

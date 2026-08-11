@@ -6,15 +6,13 @@ import os
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from typing import Literal
-from weakref import WeakKeyDictionary
+from weakref import finalize
 
 from triageguard.domain.statuses import EnvironmentKind
 
 MIN_REPEAT_COUNT = 1
 MAX_REPEAT_COUNT = 20
-_PROCESS_SECRETS: WeakKeyDictionary[object, tuple[str | None, str | None]] = (
-    WeakKeyDictionary()
-)
+_PROCESS_SECRETS: dict[int, tuple[str | None, str | None]] = {}
 
 
 @dataclass(frozen=True)
@@ -71,7 +69,9 @@ class Settings:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        _PROCESS_SECRETS[self] = (groq_api_key, github_token)
+        identity = id(self)
+        _PROCESS_SECRETS[identity] = (groq_api_key, github_token)
+        finalize(self, _PROCESS_SECRETS.pop, identity, None)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -189,11 +189,11 @@ class PublicSettings:
 
 
 def _groq_api_key(settings: Settings) -> str | None:
-    return _PROCESS_SECRETS.get(settings, (None, None))[0]
+    return _PROCESS_SECRETS.get(id(settings), (None, None))[0]
 
 
 def _github_token(settings: Settings) -> str | None:
-    return _PROCESS_SECRETS.get(settings, (None, None))[1]
+    return _PROCESS_SECRETS.get(id(settings), (None, None))[1]
 
 
 Settings.groq_api_key = property(_groq_api_key)  # type: ignore[attr-defined]
