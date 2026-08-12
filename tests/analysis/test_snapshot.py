@@ -252,3 +252,31 @@ def test_recheck_marks_an_old_snapshot_stale_when_candidate_changes() -> None:
     assert freshness.observed_base_sha == snapshot.base_sha
     assert freshness.observed_head_sha == snapshot.head_sha
     assert freshness.observed_candidate_sha == "0" * 40
+
+
+def test_analysis_configuration_hash_changes_with_diff_limits() -> None:
+    """Different raw-diff bounds must create different research configurations."""
+    common_time = datetime(2026, 8, 12, tzinfo=UTC)
+
+    first = SnapshotAcquirer(
+        github=object(),
+        store=object(),
+        settings=Settings(
+            environment_kind=EnvironmentKind.REAL_PR_ANALYSIS,
+            max_diff_files=1_000,
+            max_diff_bytes=25_000_000,
+        ),
+        clock=lambda: common_time,
+    )
+    second = SnapshotAcquirer(
+        github=object(),
+        store=object(),
+        settings=Settings(
+            environment_kind=EnvironmentKind.REAL_PR_ANALYSIS,
+            max_diff_files=1_001,
+            max_diff_bytes=25_000_001,
+        ),
+        clock=lambda: common_time,
+    )
+
+    assert first._analysis_config_sha256() != second._analysis_config_sha256()

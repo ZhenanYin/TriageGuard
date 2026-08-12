@@ -446,3 +446,67 @@ def test_object_store_rejects_ambiguous_multiple_merge_bases(
             "c" * 40,
         ]
     ]
+
+
+def test_object_store_reads_one_diff_and_matching_numstat_with_fixed_options(
+    tmp_path: Path,
+) -> None:
+    """Each frozen comparison uses fixed, non-executable Git diff options."""
+
+    class RecordingRunner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[str], float]] = []
+
+        def run(
+            self,
+            arguments: list[str],
+            cwd: Path | None = None,
+            *,
+            timeout_seconds: float = 60.0,
+        ) -> bytes:
+            self.calls.append((arguments, timeout_seconds))
+            if "--numstat" in arguments:
+                return b"1\t1\tapi/PatientService.java\0"
+            return b"diff --git a/api/PatientService.java b/api/PatientService.java\n"
+
+    runner = RecordingRunner()
+    store_path = tmp_path / "analysis-store"
+    store = GitObjectStore(store_path, runner=runner)
+
+    patch_bytes, numstat_bytes = store.diff("a" * 40, "b" * 40)
+
+    assert patch_bytes.startswith(b"diff --git ")
+    assert numstat_bytes == b"1\t1\tapi/PatientService.java\0"
+    assert runner.calls == [
+        (
+            [
+                "--git-dir",
+                str(store_path),
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--find-renames=50%",
+                "--unified=3",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "a" * 40,
+                "b" * 40,
+                "--",
+            ],
+            60.0,
+        ),
+        (
+            [
+                "--git-dir",
+                str(store_path),
+                "diff",
+                "--numstat",
+                "-z",
+                "--find-renames=50%",
+                "a" * 40,
+                "b" * 40,
+                "--",
+            ],
+            60.0,
+        ),
+    ]

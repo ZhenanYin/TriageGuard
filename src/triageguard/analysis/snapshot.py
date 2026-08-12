@@ -254,6 +254,8 @@ class SnapshotAcquirer:
         return canonical_sha256(
             {
                 "github_api_version": self._settings.github_api_version,
+                "max_diff_files": self._settings.max_diff_files,
+                "max_diff_bytes": self._settings.max_diff_bytes,
                 "max_context_files": self._settings.max_context_files,
                 "max_context_anchors": self._settings.max_context_anchors,
                 "max_context_bytes": self._settings.max_context_bytes,

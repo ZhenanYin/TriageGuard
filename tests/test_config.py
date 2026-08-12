@@ -64,6 +64,37 @@ def test_context_settings_have_documented_bounded_defaults() -> None:
     assert settings.max_context_hits_per_identifier == 20
 
 
+def test_diff_settings_have_generous_bounded_defaults() -> None:
+    """Raw diffs stay bounded without rejecting ordinary large code changes."""
+    settings = Settings()
+    public_settings = settings.public_view()
+
+    assert settings.max_diff_files == 1_000
+    assert settings.max_diff_bytes == 25_000_000
+    assert public_settings.max_diff_files == 1_000
+    assert public_settings.max_diff_bytes == 25_000_000
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("max_diff_files", 0),
+        ("max_diff_bytes", 0),
+        ("max_diff_files", -1),
+        ("max_diff_bytes", -1),
+        ("max_diff_files", True),
+        ("max_diff_bytes", True),
+    ],
+)
+def test_diff_settings_require_positive_strict_integers(
+    field_name: str,
+    value: object,
+) -> None:
+    """A disabled or nonnumeric diff bound would remove the safety boundary."""
+    with pytest.raises(ValueError, match=field_name):
+        Settings(**{field_name: value})
+
+
 def test_invalid_mode_is_rejected_before_secret_lookup(monkeypatch) -> None:
     """Mode validation must precede any attempt to read credential material."""
     real_getenv = config_module.os.getenv
@@ -98,7 +129,9 @@ def test_live_secret_is_non_printable() -> None:
 def test_live_secrets_are_absent_from_dataclass_serialization() -> None:
     """A generic dataclass serializer must not expose process-only credentials."""
     settings = Settings(
-        llm_mode="live", groq_api_key="groq-live-secret", github_token="github-live-secret"
+        llm_mode="live",
+        groq_api_key="groq-live-secret",
+        github_token="github-live-secret",
     )
 
     serialized = asdict(settings)
@@ -119,7 +152,10 @@ def test_value_equal_settings_isolate_process_only_secrets() -> None:
 
     assert first == second
     assert (first.groq_api_key, first.github_token) == ("groq-first", "github-first")
-    assert (second.groq_api_key, second.github_token) == ("groq-second", "github-second")
+    assert (second.groq_api_key, second.github_token) == (
+        "groq-second",
+        "github-second",
+    )
 
 
 def test_repeat_count_must_be_at_least_one(monkeypatch):
@@ -132,7 +168,9 @@ def test_repeat_count_must_be_at_least_one(monkeypatch):
 
 @pytest.mark.parametrize("value", [0, 21, True, False, "3"])
 def test_settings_rejects_non_strict_or_out_of_range_repeat_counts(value) -> None:
-    with pytest.raises(ValueError, match="repeat_count must be an integer from 1 to 20"):
+    with pytest.raises(
+        ValueError, match="repeat_count must be an integer from 1 to 20"
+    ):
         Settings(repeat_count=value)
 
 
@@ -144,7 +182,9 @@ def test_settings_accepts_both_repeat_count_boundaries(value: int) -> None:
 def test_repeat_count_above_shared_bound_fails_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("TRIAGEGUARD_REPEAT_COUNT", "21")
 
-    with pytest.raises(ValueError, match="repeat_count must be an integer from 1 to 20"):
+    with pytest.raises(
+        ValueError, match="repeat_count must be an integer from 1 to 20"
+    ):
         Settings.from_env()
 
 
@@ -154,7 +194,9 @@ def test_settings_rejects_every_non_groq_provider(provider: str) -> None:
         Settings(llm_provider=provider)
 
 
-def test_non_groq_environment_fails_before_settings_are_constructed(monkeypatch) -> None:
+def test_non_groq_environment_fails_before_settings_are_constructed(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("TRIAGEGUARD_LLM_PROVIDER", "openai")
 
     with pytest.raises(ValueError, match="TRIAGEGUARD_LLM_PROVIDER must be 'groq'"):

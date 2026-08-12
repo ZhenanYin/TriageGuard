@@ -12,6 +12,8 @@ from triageguard.domain.statuses import EnvironmentKind
 
 MIN_REPEAT_COUNT = 1
 MAX_REPEAT_COUNT = 20
+DEFAULT_MAX_DIFF_FILES = 1_000
+DEFAULT_MAX_DIFF_BYTES = 25_000_000
 _PROCESS_SECRETS: dict[int, tuple[str | None, str | None]] = {}
 
 
@@ -27,6 +29,8 @@ class Settings:
     artifacts_dir: Path = Path("artifacts")
     github_api_version: str = "2026-03-10"
     analysis_cache_dir: Path = Path("analysis-cache")
+    max_diff_files: int = DEFAULT_MAX_DIFF_FILES
+    max_diff_bytes: int = DEFAULT_MAX_DIFF_BYTES
     max_context_files: int = 40
     max_context_anchors: int = 80
     max_context_bytes: int = 160_000
@@ -58,6 +62,8 @@ class Settings:
         if not isinstance(self.github_api_version, str) or not self.github_api_version:
             raise ValueError("github_api_version must be a non-empty string")
         for name in (
+            "max_diff_files",
+            "max_diff_bytes",
             "max_context_files",
             "max_context_anchors",
             "max_context_bytes",
@@ -102,6 +108,8 @@ class Settings:
             raise ValueError("TRIAGEGUARD_REPEAT_COUNT must be an integer") from error
 
         context_environment_names = {
+            "max_diff_files": "TRIAGEGUARD_MAX_DIFF_FILES",
+            "max_diff_bytes": "TRIAGEGUARD_MAX_DIFF_BYTES",
             "max_context_files": "TRIAGEGUARD_MAX_CONTEXT_FILES",
             "max_context_anchors": "TRIAGEGUARD_MAX_CONTEXT_ANCHORS",
             "max_context_bytes": "TRIAGEGUARD_MAX_CONTEXT_BYTES",
@@ -111,6 +119,8 @@ class Settings:
             "max_context_hits_per_identifier": "TRIAGEGUARD_MAX_CONTEXT_HITS_PER_IDENTIFIER",
         }
         context_defaults = {
+            "max_diff_files": DEFAULT_MAX_DIFF_FILES,
+            "max_diff_bytes": DEFAULT_MAX_DIFF_BYTES,
             "max_context_files": 40,
             "max_context_anchors": 80,
             "max_context_bytes": 160_000,
@@ -135,7 +145,9 @@ class Settings:
             groq_api_key=groq_api_key,
             github_token=github_token,
             artifacts_dir=Path(os.getenv("TRIAGEGUARD_ARTIFACTS_DIR", "artifacts")),
-            github_api_version=os.getenv("TRIAGEGUARD_GITHUB_API_VERSION", "2026-03-10"),
+            github_api_version=os.getenv(
+                "TRIAGEGUARD_GITHUB_API_VERSION", "2026-03-10"
+            ),
             analysis_cache_dir=Path(
                 os.getenv("TRIAGEGUARD_ANALYSIS_CACHE_DIR", "analysis-cache")
             ),
@@ -153,6 +165,8 @@ class Settings:
             artifacts_dir=self.artifacts_dir,
             github_api_version=self.github_api_version,
             analysis_cache_dir=self.analysis_cache_dir,
+            max_diff_files=self.max_diff_files,
+            max_diff_bytes=self.max_diff_bytes,
             max_context_files=self.max_context_files,
             max_context_anchors=self.max_context_anchors,
             max_context_bytes=self.max_context_bytes,
@@ -175,6 +189,8 @@ class PublicSettings:
     artifacts_dir: Path
     github_api_version: str
     analysis_cache_dir: Path
+    max_diff_files: int
+    max_diff_bytes: int
     max_context_files: int
     max_context_anchors: int
     max_context_bytes: int

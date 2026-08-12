@@ -467,3 +467,44 @@ class GitObjectStore:
             )
 
         return version_text.removeprefix("git version ")
+
+    def diff(self, old_sha: str, new_sha: str) -> tuple[bytes, bytes]:
+        """Read one exact patch and its null-separated file manifest."""
+        if _FULL_COMMIT_SHA.fullmatch(old_sha) is None:
+            raise ValueError("old SHA must be a full 40-character lowercase SHA")
+        if _FULL_COMMIT_SHA.fullmatch(new_sha) is None:
+            raise ValueError("new SHA must be a full 40-character lowercase SHA")
+        if old_sha == new_sha:
+            raise ValueError("diff revisions must be distinct")
+
+        patch_bytes = self._runner.run(
+            [
+                "--git-dir",
+                str(self._root),
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--find-renames=50%",
+                "--unified=3",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                old_sha,
+                new_sha,
+                "--",
+            ]
+        )
+        numstat_bytes = self._runner.run(
+            [
+                "--git-dir",
+                str(self._root),
+                "diff",
+                "--numstat",
+                "-z",
+                "--find-renames=50%",
+                old_sha,
+                new_sha,
+                "--",
+            ]
+        )
+
+        return patch_bytes, numstat_bytes
