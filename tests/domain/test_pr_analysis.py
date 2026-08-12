@@ -1,6 +1,7 @@
 """Contracts for immutable Milestone 2 PR-analysis artifacts."""
 
 import hashlib
+import warnings
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -24,6 +25,7 @@ from triageguard.domain.pr_analysis import (
     RiskAssessmentDraft,
     RiskHypothesis,
     RiskHypothesisDraft,
+    SnapshotFreshness,
 )
 from triageguard.provenance import canonical_sha256
 
@@ -104,7 +106,9 @@ def test_snapshot_rejects_non_utc_acquisition_time() -> None:
     """A local timestamp would make the frozen acquisition order ambiguous."""
     with pytest.raises(ValidationError, match="UTC"):
         PullRequestSnapshot.model_validate(
-            snapshot_payload(acquired_at=datetime(2026, 8, 11, tzinfo=timezone(timedelta(hours=1))))
+            snapshot_payload(
+                acquired_at=datetime(2026, 8, 11, tzinfo=timezone(timedelta(hours=1)))
+            )
         )
 
 
@@ -113,9 +117,10 @@ def test_risk_hypothesis_derives_stable_unique_citation_ids() -> None:
     hypothesis = RiskHypothesis.from_draft(_risk_draft())
 
     assert hypothesis.citation_anchor_ids == ["anchor-b", "anchor-a", "anchor-c"]
-    assert hypothesis.hypothesis_id == RiskHypothesis.from_draft(
-        _risk_draft()
-    ).hypothesis_id
+    assert (
+        hypothesis.hypothesis_id
+        == RiskHypothesis.from_draft(_risk_draft()).hypothesis_id
+    )
 
 
 def _risk_draft(**changes: object) -> RiskHypothesisDraft:
@@ -167,7 +172,9 @@ def _risk_draft(**changes: object) -> RiskHypothesisDraft:
 def test_model_cannot_supply_hypothesis_id_or_prohibited_claims() -> None:
     """Provider output must remain an unconfirmed hypothesis with a local identity."""
     with pytest.raises(ValidationError, match="locally derived"):
-        RiskHypothesis.model_validate({**_risk_draft().model_dump(), "hypothesis_id": "provider-id"})
+        RiskHypothesis.model_validate(
+            {**_risk_draft().model_dump(), "hypothesis_id": "provider-id"}
+        )
 
     for forbidden in (
         "CVSS:4.0/AV:N",
@@ -274,7 +281,9 @@ def test_candidate_rejects_non_gherkin_or_incomplete_traceability() -> None:
     with pytest.raises(ValidationError, match="Feature"):
         GherkinCandidateDraft(
             snapshot_key="0" * 64,
-            reviewed_risk_sha256=canonical_sha256(approved_risk.model_dump(mode="json")),
+            reviewed_risk_sha256=canonical_sha256(
+                approved_risk.model_dump(mode="json")
+            ),
             approved_risk=approved_risk,
             feature_title="Privilege enforcement",
             scenario_title="Unauthorized request is denied",
@@ -322,36 +331,54 @@ def _candidate(snapshot_key: str = "0" * 64) -> GherkinCandidate:
             text="the requirePrivilege record state is recorded",
         ),
     )
-    return GherkinCandidate.from_draft(GherkinCandidateDraft(
-        snapshot_key=snapshot_key,
-        reviewed_risk_sha256=canonical_sha256(risk.model_dump(mode="json")),
-        approved_risk=risk,
-        feature_title="Privilege enforcement",
-        scenario_title="Unauthorized request is denied",
-        steps=steps,
-        gherkin_text="\n".join(
-            (
-                "Feature: Privilege enforcement",
-                "Scenario: Unauthorized request is denied",
-                *(f"{step.keyword} {step.text}" for step in steps),
-            )
-        ),
-        bindings=(
-            GherkinStepBinding(claim_field="actor", source_index=None, step_numbers=[1]),
-            GherkinStepBinding(claim_field="precondition", source_index=0, step_numbers=[2]),
-            GherkinStepBinding(claim_field="action", source_index=None, step_numbers=[3]),
-            GherkinStepBinding(claim_field="expected_secure_behavior", source_index=None, step_numbers=[4]),
-            GherkinStepBinding(claim_field="possible_failure", source_index=None, step_numbers=[5]),
-            GherkinStepBinding(claim_field="observable", source_index=0, step_numbers=[6]),
-            GherkinStepBinding(claim_field="observable", source_index=1, step_numbers=[7]),
-        ),
-        testability_notes=[],
-        setup_gaps=[],
-        generated_at=datetime(2026, 8, 11, tzinfo=UTC),
-    ))
+    return GherkinCandidate.from_draft(
+        GherkinCandidateDraft(
+            snapshot_key=snapshot_key,
+            reviewed_risk_sha256=canonical_sha256(risk.model_dump(mode="json")),
+            approved_risk=risk,
+            feature_title="Privilege enforcement",
+            scenario_title="Unauthorized request is denied",
+            steps=steps,
+            gherkin_text="\n".join(
+                (
+                    "Feature: Privilege enforcement",
+                    "Scenario: Unauthorized request is denied",
+                    *(f"{step.keyword} {step.text}" for step in steps),
+                )
+            ),
+            bindings=(
+                GherkinStepBinding(
+                    claim_field="actor", source_index=None, step_numbers=[1]
+                ),
+                GherkinStepBinding(
+                    claim_field="precondition", source_index=0, step_numbers=[2]
+                ),
+                GherkinStepBinding(
+                    claim_field="action", source_index=None, step_numbers=[3]
+                ),
+                GherkinStepBinding(
+                    claim_field="expected_secure_behavior",
+                    source_index=None,
+                    step_numbers=[4],
+                ),
+                GherkinStepBinding(
+                    claim_field="possible_failure", source_index=None, step_numbers=[5]
+                ),
+                GherkinStepBinding(
+                    claim_field="observable", source_index=0, step_numbers=[6]
+                ),
+                GherkinStepBinding(
+                    claim_field="observable", source_index=1, step_numbers=[7]
+                ),
+            ),
+            testability_notes=[],
+            setup_gaps=[],
+            generated_at=datetime(2026, 8, 11, tzinfo=UTC),
+        )
+    )
 
 
-def _context_bundle() -> ContextBundle:
+def _context_bundle(snapshot_key: str = "0" * 64) -> ContextBundle:
     anchors = tuple(
         ContextAnchor(
             anchor_id=anchor_id,
@@ -363,17 +390,23 @@ def _context_bundle() -> ContextBundle:
             end_line=index,
             text="requirePrivilege" if anchor_id == "anchor-a" else "related evidence",
             text_sha256=hashlib.sha256(
-                ("requirePrivilege" if anchor_id == "anchor-a" else "related evidence").encode()
+                (
+                    "requirePrivilege"
+                    if anchor_id == "anchor-a"
+                    else "related evidence"
+                ).encode()
             ).hexdigest(),
             selection_reason="integration change",
             score_components=[],
-            change_relation="integration_change" if anchor_id == "anchor-a" else "repository_context",
+            change_relation="integration_change"
+            if anchor_id == "anchor-a"
+            else "repository_context",
             truncated=False,
         )
         for index, anchor_id in enumerate(("anchor-a", "anchor-b", "anchor-c"), start=1)
     )
     payload = {
-        "snapshot_key": "0" * 64,
+        "snapshot_key": snapshot_key,
         "anchors": [anchor.model_dump(mode="json") for anchor in anchors],
         "selected_file_count": 1,
         "selected_anchor_count": 3,
@@ -392,11 +425,14 @@ def _context_bundle() -> ContextBundle:
     )
 
 
-def _assessment(risk: RiskHypothesis) -> RiskAssessment:
-    context = _context_bundle()
+def _assessment(
+    risk: RiskHypothesis,
+    snapshot_key: str = "0" * 64,
+) -> RiskAssessment:
+    context = _context_bundle(snapshot_key)
     report = GroundingReport(
         producer="local_grounding_validator",
-        snapshot_key="0" * 64,
+        snapshot_key=snapshot_key,
         context_sha256=context.context_sha256,
         hypothesis_id=risk.hypothesis_id,
         hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
@@ -406,7 +442,7 @@ def _assessment(risk: RiskHypothesis) -> RiskAssessment:
         ],
     )
     return RiskAssessment.from_content(
-        snapshot_key="0" * 64,
+        snapshot_key=snapshot_key,
         context_sha256=context.context_sha256,
         outcome="risks_proposed",
         hypotheses=[risk],
@@ -417,11 +453,14 @@ def _assessment(risk: RiskHypothesis) -> RiskAssessment:
     )
 
 
-def _reviewed_grounding(reviewed: RiskHypothesisDraft) -> GroundingReport:
+def _reviewed_grounding(
+    reviewed: RiskHypothesisDraft,
+    snapshot_key: str = "0" * 64,
+) -> GroundingReport:
     return GroundingReport(
         producer="local_grounding_validator",
-        snapshot_key="0" * 64,
-        context_sha256=_context_bundle().context_sha256,
+        snapshot_key=snapshot_key,
+        context_sha256=_context_bundle(snapshot_key).context_sha256,
         hypothesis_id="reviewed-risk",
         hypothesis_sha256=canonical_sha256(reviewed.model_dump(mode="json")),
         cited_anchor_ids=reviewed.citation_anchor_ids,
@@ -450,14 +489,17 @@ def test_candidate_steps_are_immutable_after_validation() -> None:
         candidate.steps.append(candidate.steps[0])  # type: ignore[attr-defined]
 
     bad_steps = list(candidate.steps)
-    bad_steps[2] = GherkinStep(number=3, keyword="Then", text="the changed request is sent")
+    bad_steps[2] = GherkinStep(
+        number=3, keyword="Then", text="the changed request is sent"
+    )
     with pytest.raises(ValidationError, match="phase"):
         GherkinCandidateDraft.model_validate(
             candidate.model_dump(mode="json", exclude={"candidate_id"})
             | {
                 "steps": bad_steps,
                 "gherkin_text": candidate.gherkin_text.replace(
-                    "When the changed request is sent", "Then the changed request is sent"
+                    "When the changed request is sent",
+                    "Then the changed request is sent",
                 ),
             }
         )
@@ -568,3 +610,126 @@ def test_failed_terminal_record_requires_an_allowlisted_reason_code() -> None:
             started_at=datetime(2026, 8, 11, tzinfo=UTC),
             finished_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
         )
+
+
+def test_persisted_assessment_round_trip_revalidates_derived_hypotheses() -> None:
+    """Saved assessments must reload only when nested local IDs remain genuine."""
+    assessment = _assessment(RiskHypothesis.from_draft(_risk_draft()))
+    persisted = assessment.model_dump(mode="json")
+
+    restored = RiskAssessment.from_persisted(persisted)
+
+    assert restored == assessment
+
+    tampered = assessment.model_dump(mode="json")
+    tampered["hypotheses"][0]["hypothesis_id"] = "risk-" + ("f" * 64)
+
+    with pytest.raises(ValueError, match="persisted hypothesis ID"):
+        RiskAssessment.from_persisted(tampered)
+
+
+def test_persisted_failed_terminal_record_round_trips() -> None:
+    """A saved terminal record must be safely readable in a later session."""
+    record = MilestoneTwoRunRecord(
+        run_id="run-persisted-failure",
+        snapshot=PullRequestSnapshot.model_validate(snapshot_payload()),
+        status="failed",
+        reason_code="model_output_invalid",
+        explanation="The recorded model output did not pass local validation.",
+        started_at=datetime(2026, 8, 11, tzinfo=UTC),
+        finished_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
+    )
+
+    restored = MilestoneTwoRunRecord.from_persisted(record.model_dump(mode="json"))
+
+    assert restored == record
+
+
+def test_context_factory_normalizes_anchors_before_hashing() -> None:
+    """The context factory must not hash a temporary mutable anchor collection."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        context = _context_bundle()
+
+    assert isinstance(context.anchors, tuple)
+
+
+def test_assessment_factory_normalizes_artifact_collections_before_hashing() -> None:
+    """The assessment factory must hash immutable collections without warnings."""
+    risk = RiskHypothesis.from_draft(_risk_draft())
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        assessment = _assessment(risk)
+
+    assert isinstance(assessment.hypotheses, tuple)
+    assert isinstance(assessment.grounding_reports, tuple)
+
+
+def _approved_terminal_record() -> MilestoneTwoRunRecord:
+    snapshot = PullRequestSnapshot.model_validate(snapshot_payload())
+    risk = RiskHypothesis.from_draft(_risk_draft())
+    assessment = _assessment(risk, snapshot.snapshot_key)
+    reviewed = _risk_draft()
+
+    review = HumanReviewedRisk(
+        snapshot_key=snapshot.snapshot_key,
+        assessment_sha256=assessment.assessment_sha256,
+        selected_hypothesis_id=risk.hypothesis_id,
+        selected_hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
+        reviewed_risk=reviewed,
+        reviewed_content_sha256=canonical_sha256(reviewed.model_dump(mode="json")),
+        reviewed_grounding=_reviewed_grounding(
+            reviewed,
+            snapshot.snapshot_key,
+        ),
+        approved_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+    candidate = _candidate(snapshot.snapshot_key)
+    approval = GherkinApproval(
+        snapshot_key=snapshot.snapshot_key,
+        candidate_id=candidate.candidate_id,
+        candidate_sha256=canonical_sha256(candidate.model_dump(mode="json")),
+        reviewed_risk_sha256=candidate.reviewed_risk_sha256,
+        approved_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
+    )
+    freshness = SnapshotFreshness(
+        snapshot_key=snapshot.snapshot_key,
+        status="current",
+        reason_code="snapshot_current",
+        checked_at=datetime(2026, 8, 11, tzinfo=UTC),
+        observed_base_sha=snapshot.base_sha,
+        observed_head_sha=snapshot.head_sha,
+        observed_candidate_sha=snapshot.candidate_sha,
+    )
+
+    return MilestoneTwoRunRecord(
+        run_id="run-approved-persisted",
+        snapshot=snapshot,
+        status="approved_gherkin",
+        reason_code="gherkin_approved",
+        explanation="A reviewer approved the generated scenario.",
+        started_at=datetime(2026, 8, 11, tzinfo=UTC),
+        finished_at=datetime(2026, 8, 11, 0, 2, tzinfo=UTC),
+        freshness=freshness,
+        risk_assessment=assessment,
+        human_reviewed_risk=review,
+        gherkin_candidate=candidate,
+        gherkin_approval=approval,
+    )
+
+
+def test_persisted_approved_terminal_record_revalidates_nested_ids() -> None:
+    """Saved approval evidence must reload through trusted nested ID checks."""
+    record = _approved_terminal_record()
+    persisted = record.model_dump(mode="json")
+
+    restored = MilestoneTwoRunRecord.from_persisted(persisted)
+
+    assert restored == record
+
+    tampered = record.model_dump(mode="json")
+    tampered["risk_assessment"]["hypotheses"][0]["hypothesis_id"] = "risk-" + ("f" * 64)
+
+    with pytest.raises(ValueError, match="persisted hypothesis ID"):
+        MilestoneTwoRunRecord.from_persisted(tampered)
