@@ -274,6 +274,7 @@ class ContextAnchor(ResearchArtifact):
     anchor_id: StrictStr = Field(min_length=1)
     revision_role: Literal["merge_base", "base", "head", "candidate"]
     commit_sha: FullCommitSha
+    blob_sha: FullCommitSha
     path: StrictStr = Field(min_length=1)
     java_symbol: StrictStr | None
     start_line: StrictInt = Field(gt=0)

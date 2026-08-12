@@ -1,5 +1,12 @@
 """Deterministic analysis services for frozen OpenMRS pull requests."""
 
+from triageguard.analysis.context import (
+    ContextBuilder,
+    ContextBuildError,
+    ContextLimits,
+    JavaFileIndex,
+    JavaSyntaxExtractor,
+)
 from triageguard.analysis.diffs import DiffBuilder, DiffBuildError, parse_patch
 from triageguard.analysis.snapshot import (
     SnapshotAcquirer,
@@ -7,8 +14,13 @@ from triageguard.analysis.snapshot import (
 )
 
 __all__ = [
+    "ContextBuildError",
+    "ContextBuilder",
+    "ContextLimits",
     "DiffBuildError",
     "DiffBuilder",
+    "JavaFileIndex",
+    "JavaSyntaxExtractor",
     "SnapshotAcquirer",
     "SnapshotAcquisitionError",
     "parse_patch",
