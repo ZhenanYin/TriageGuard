@@ -323,6 +323,7 @@ def _reviewed_grounding_report(
     hypothesis: RiskHypothesis,
     assessment: RiskAssessment,
     anchors: dict[str, ContextAnchor],
+    reviewed_content_sha256: str,
 ) -> GroundingReport:
     """Create grounding evidence for the immutable reviewed successor."""
     cited_anchor_ids = tuple(hypothesis.citation_anchor_ids)
@@ -342,7 +343,7 @@ def _reviewed_grounding_report(
         snapshot_key=assessment.snapshot_key,
         context_sha256=assessment.context_sha256,
         hypothesis_id=hypothesis.hypothesis_id,
-        hypothesis_sha256=canonical_sha256(hypothesis.model_dump(mode="json")),
+        hypothesis_sha256=reviewed_content_sha256,
         cited_anchor_ids=cited_anchor_ids,
         identifier_evidence=identifier_evidence,
     )
@@ -432,6 +433,9 @@ def create_human_review(
             hypothesis=reviewed_hypothesis,
             assessment=assessment,
             anchors=anchors,
+            reviewed_content_sha256=canonical_sha256(
+                reviewed_risk.model_dump(mode="json")
+            ),
         ),
         added_citation_anchor_ids=tuple(
             anchor_id

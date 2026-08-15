@@ -1,9 +1,11 @@
 """Stateful Milestone 1 application workflow."""
 
 from triageguard.workflow.milestone_two import (
+    MilestoneTwoDependencies,
     MilestoneTwoTransitionError,
     MilestoneTwoWorkflow,
     PreparedPullRequest,
+    resume_milestone_two_workflow,
 )
 from triageguard.workflow.vertical_slice import (
     ContractApprovalError,
@@ -22,6 +24,7 @@ __all__ = [
     "GeneratedWorkflow",
     "InterruptedExternalOperationError",
     "MilestoneOneWorkflow",
+    "MilestoneTwoDependencies",
     "MilestoneTwoTransitionError",
     "MilestoneTwoWorkflow",
     "PreparedPullRequest",
@@ -29,5 +32,6 @@ __all__ = [
     "UnsafeGeneratedCodeError",
     "WorkflowTransitionError",
     "build_replay_workflow",
+    "resume_milestone_two_workflow",
     "resume_replay_workflow",
 ]
