@@ -1,0 +1,23 @@
+{
+  "default_branch": "main",
+  "fixture_commits": {
+    "base": {
+      "commit_sha": "9d473c1e1b71d112e0fada122d6a6f0f95784479",
+      "tree_sha": "f77df74edec713a46df05c9a5035834bd9443c66"
+    },
+    "candidate": {
+      "commit_sha": "8099f28cfc78d7a949d582f5f5e08161922116fe",
+      "tree_sha": "d4cf5a02c699055b36ef3cd6ac4f3d6e7db014d6"
+    },
+    "head": {
+      "commit_sha": "cec265e70689078a8beb57d6e0ce0464d2bc265a",
+      "tree_sha": "524285dffa92d74aa8246a544b27b49c16cf08d4"
+    },
+    "merge_base": {
+      "commit_sha": "1a128316857397d7df2a7d993910df79e6eeeba0",
+      "tree_sha": "2bb4b0f1a90c8242f385678cb1c08342a0e9340b"
+    }
+  },
+  "fixture_kind": "synthetic_openmrs_shaped_pr",
+  "reserved_pull_number": 900000001
+}

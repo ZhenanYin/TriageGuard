@@ -1,0 +1,84 @@
+{
+  "approved_risk": "__APPROVED_RISK__",
+  "bindings": [
+    {
+      "claim_field": "actor",
+      "source_index": null,
+      "step_numbers": [
+        1
+      ]
+    },
+    {
+      "claim_field": "precondition",
+      "source_index": 0,
+      "step_numbers": [
+        1
+      ]
+    },
+    {
+      "claim_field": "action",
+      "source_index": null,
+      "step_numbers": [
+        2
+      ]
+    },
+    {
+      "claim_field": "expected_secure_behavior",
+      "source_index": null,
+      "step_numbers": [
+        3
+      ]
+    },
+    {
+      "claim_field": "possible_failure",
+      "source_index": null,
+      "step_numbers": [
+        4
+      ]
+    },
+    {
+      "claim_field": "observable",
+      "source_index": 0,
+      "step_numbers": [
+        5
+      ]
+    }
+  ],
+  "feature_title": "Patient deletion authorization",
+  "generated_at": "2026-08-15T00:00:00Z",
+  "gherkin_text": "Feature: Patient deletion authorization\n\nScenario: Unauthorized patient deletion is rejected\n\nGiven an authenticated OpenMRS user can reach the patient-deletion service path\nWhen the user requests deletion using purgePatient and deletePatient\nThen The deletion path enforces the required authorization before deleting a patient record.\nAnd The changed path may delete a patient record without the expected authorization enforcement.\nAnd The deletion attempt is rejected when authorization is absent.",
+  "reviewed_risk_sha256": "__REVIEWED_RISK_SHA256__",
+  "scenario_title": "Unauthorized patient deletion is rejected",
+  "setup_gaps": [],
+  "snapshot_key": "__SNAPSHOT_KEY__",
+  "steps": [
+    {
+      "keyword": "Given",
+      "number": 1,
+      "text": "an authenticated OpenMRS user can reach the patient-deletion service path"
+    },
+    {
+      "keyword": "When",
+      "number": 2,
+      "text": "the user requests deletion using purgePatient and deletePatient"
+    },
+    {
+      "keyword": "Then",
+      "number": 3,
+      "text": "The deletion path enforces the required authorization before deleting a patient record."
+    },
+    {
+      "keyword": "And",
+      "number": 4,
+      "text": "The changed path may delete a patient record without the expected authorization enforcement."
+    },
+    {
+      "keyword": "And",
+      "number": 5,
+      "text": "The deletion attempt is rejected when authorization is absent."
+    }
+  ],
+  "testability_notes": [
+    "Run the scenario in an isolated OpenMRS test environment."
+  ]
+}

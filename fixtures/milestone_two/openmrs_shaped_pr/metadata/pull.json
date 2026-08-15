@@ -1,0 +1,15 @@
+{
+  "base": {
+    "ref": "main",
+    "sha": "9d473c1e1b71d112e0fada122d6a6f0f95784479"
+  },
+  "head": {
+    "ref": "synthetic/pr-head",
+    "sha": "cec265e70689078a8beb57d6e0ce0464d2bc265a"
+  },
+  "html_url": "https://github.com/openmrs/openmrs-core/pull/900000001",
+  "merge_commit_sha": "8099f28cfc78d7a949d582f5f5e08161922116fe",
+  "mergeable": true,
+  "number": 900000001,
+  "state": "open"
+}
