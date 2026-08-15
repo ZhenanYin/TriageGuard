@@ -27,8 +27,10 @@ from pydantic import (
     model_validator,
 )
 
-from triageguard.domain import RunRecord
+from triageguard.domain import MilestoneTwoRunRecord, RunRecord
 from triageguard.provenance import canonical_json
+
+TerminalRecord = RunRecord | MilestoneTwoRunRecord
 
 
 class RecorderCorruptionError(RuntimeError):
@@ -99,6 +101,8 @@ class LifecycleEventType(str, Enum):
 
     RUN_STARTED = "run_started"
     CONTRACT_APPROVED = "contract_approved"
+    RISK_APPROVED = "risk_approved"
+    GHERKIN_APPROVED = "gherkin_approved"
     FINALIZATION_STARTED = "finalization_started"
     FINALIZATION_COMPLETED = "finalization_completed"
 
@@ -116,6 +120,8 @@ class LifecycleEvent(BaseModel):
         expected_keys = {
             LifecycleEventType.RUN_STARTED: {"id", "ownership_token"},
             LifecycleEventType.CONTRACT_APPROVED: {"id"},
+            LifecycleEventType.RISK_APPROVED: {"id", "risk_sha256"},
+            LifecycleEventType.GHERKIN_APPROVED: {"id", "gherkin_sha256"},
             LifecycleEventType.FINALIZATION_STARTED: {"record_sha256"},
             LifecycleEventType.FINALIZATION_COMPLETED: {"record_sha256"},
         }[self.event_type]
@@ -123,11 +129,15 @@ class LifecycleEvent(BaseModel):
             raise ValueError(
                 f"{self.event_type.value} requires payload keys: {sorted(expected_keys)}"
             )
-        if self.event_type in {
-            LifecycleEventType.FINALIZATION_STARTED,
-            LifecycleEventType.FINALIZATION_COMPLETED,
-        } and not _is_sha256(self.payload["record_sha256"]):
-            raise ValueError("record_sha256 must be a lowercase SHA-256 digest")
+
+        digest_key = {
+            LifecycleEventType.RISK_APPROVED: "risk_sha256",
+            LifecycleEventType.GHERKIN_APPROVED: "gherkin_sha256",
+            LifecycleEventType.FINALIZATION_STARTED: "record_sha256",
+            LifecycleEventType.FINALIZATION_COMPLETED: "record_sha256",
+        }.get(self.event_type)
+        if digest_key is not None and not _is_sha256(self.payload[digest_key]):
+            raise ValueError(f"{digest_key} must be a lowercase SHA-256 digest")
         return self
 
 
@@ -156,7 +166,9 @@ class TransformationEvent(BaseModel):
             raise ValueError("finished_at must be later than started_at")
         for digest in [*self.input_hashes.values(), *self.output_hashes.values()]:
             if not _is_sha256(digest):
-                raise ValueError("transformation hashes must be lowercase SHA-256 digests")
+                raise ValueError(
+                    "transformation hashes must be lowercase SHA-256 digests"
+                )
         return self
 
 
@@ -175,8 +187,13 @@ class ArtifactWriteJournal(BaseModel):
         if not _is_sha256(self.artifact_sha256):
             raise ValueError("artifact_sha256 must be a lowercase SHA-256 digest")
         if self.provenance.outputs.get(self.artifact_name) != self.artifact_name:
-            raise ValueError("artifact provenance must identify its normalized artifact name")
-        if self.provenance.output_hashes.get(self.artifact_name) != self.artifact_sha256:
+            raise ValueError(
+                "artifact provenance must identify its normalized artifact name"
+            )
+        if (
+            self.provenance.output_hashes.get(self.artifact_name)
+            != self.artifact_sha256
+        ):
             raise ValueError("artifact provenance must contain its computed SHA-256")
         return self
 
@@ -280,9 +297,7 @@ class ArtifactRecorder:
         with self._locked_run(handle, require_mutable=False) as opened:
             return opened.run_directory
 
-    def verify_run_ownership(
-        self, run_id: str, expected: RunOwnership
-    ) -> Path:
+    def verify_run_ownership(self, run_id: str, expected: RunOwnership) -> Path:
         """Compatibility read boundary; mutations still require a RunHandle."""
         return self.verify_run_handle(RunHandle(run_id=run_id, ownership=expected))
 
@@ -341,7 +356,9 @@ class ArtifactRecorder:
             if event.payload["id"] != handle.run_id:
                 raise ValueError("run_started payload id must match RunHandle.run_id")
             if event.payload["ownership_token"] != handle.ownership.ownership_token:
-                raise ValueError("run_started payload ownership does not match RunHandle")
+                raise ValueError(
+                    "run_started payload ownership does not match RunHandle"
+                )
         with self._locked_run(handle, require_mutable=True) as opened:
             return self._append_event_locked(
                 opened.run_fd,
@@ -474,12 +491,12 @@ class ArtifactRecorder:
             ]
 
     def finalize_run(
-        self, handle: RunHandle, record: RunRecord
+        self, handle: RunHandle, record: TerminalRecord
     ) -> ArtifactMetadata:
         """Bind and commit one exact canonical terminal record idempotently."""
         self._require_handle(handle)
-        if not isinstance(record, RunRecord):
-            raise TypeError("record must be a RunRecord")
+        if not isinstance(record, (RunRecord, MilestoneTwoRunRecord)):
+            raise TypeError("record must be a supported terminal record")
         if record.run_id != handle.run_id:
             raise ValueError("record.run_id must match RunHandle.run_id")
         serialized_record = (
@@ -497,7 +514,10 @@ class ArtifactRecorder:
                 terminal_digest, terminal_bytes = self._verified_terminal(
                     opened.run_fd, events
                 )
-                if terminal_digest != record_sha256 or terminal_bytes != serialized_record:
+                if (
+                    terminal_digest != record_sha256
+                    or terminal_bytes != serialized_record
+                ):
                     raise RecorderCorruptionError(
                         "conflicting finalization attempted after run was sealed"
                     )
@@ -623,9 +643,7 @@ class ArtifactRecorder:
         if completed:
             self._verified_terminal(run_fd, events)
             raise RunSealedError("run is sealed by terminal finalization")
-        if self._finalization_payloads(
-            events, LifecycleEventType.FINALIZATION_STARTED
-        ):
+        if self._finalization_payloads(events, LifecycleEventType.FINALIZATION_STARTED):
             raise RunSealedError("run is sealed while finalization is pending")
 
     def _verified_terminal(
@@ -640,16 +658,22 @@ class ArtifactRecorder:
             events, LifecycleEventType.FINALIZATION_COMPLETED
         )
         if len(started) != 1 or len(completed) != 1 or started[0] != completed[0]:
-            raise RecorderCorruptionError("terminal finalization journal is inconsistent")
+            raise RecorderCorruptionError(
+                "terminal finalization journal is inconsistent"
+            )
         digest = completed[0].get("record_sha256")
         if not isinstance(digest, str) or not _is_sha256(digest):
             raise RecorderCorruptionError("terminal finalization digest is invalid")
         try:
             record_bytes = _read_regular_at(run_fd, self._FINAL_RECORD_NAME)
         except (FileNotFoundError, UnsafeRecorderPathError) as error:
-            raise RecorderCorruptionError("terminal final record is unavailable") from error
+            raise RecorderCorruptionError(
+                "terminal final record is unavailable"
+            ) from error
         if hashlib.sha256(record_bytes).hexdigest() != digest:
-            raise RecorderCorruptionError("terminal final record does not match its digest")
+            raise RecorderCorruptionError(
+                "terminal final record does not match its digest"
+            )
         return digest, record_bytes
 
     @staticmethod
@@ -657,9 +681,7 @@ class ArtifactRecorder:
         events: list[dict[str, object]], event_type: LifecycleEventType
     ) -> list[dict[str, object]]:
         return [
-            item["payload"]
-            for item in events
-            if item["event_type"] == event_type.value
+            item["payload"] for item in events if item["event_type"] == event_type.value
         ]
 
     def _append_event_locked(
@@ -722,7 +744,9 @@ class ArtifactRecorder:
             try:
                 item = json.loads(line)
             except (json.JSONDecodeError, UnicodeError) as error:
-                raise RecorderCorruptionError("event log contains invalid JSON") from error
+                raise RecorderCorruptionError(
+                    "event log contains invalid JSON"
+                ) from error
             if not isinstance(item, dict) or set(item) != {
                 "sequence",
                 "timestamp",
@@ -772,10 +796,14 @@ class ArtifactRecorder:
     ) -> TransformationEvent:
         expected_hash = provenance.output_hashes.get(artifact.name)
         if expected_hash is not None and expected_hash != artifact.sha256:
-            raise ValueError("artifact content does not match the declared output SHA-256")
+            raise ValueError(
+                "artifact content does not match the declared output SHA-256"
+            )
         output = provenance.outputs.get(artifact.name)
         if output is not None and output != artifact.name:
-            raise ValueError("artifact output must identify its normalized artifact name")
+            raise ValueError(
+                "artifact output must identify its normalized artifact name"
+            )
         return TransformationEvent.model_validate(
             {
                 **provenance.model_dump(),
@@ -848,11 +876,17 @@ class ArtifactRecorder:
             raise ValueError("artifact name must not be empty")
         candidate = Path(name)
         parts = candidate.parts
-        if candidate.is_absolute() or not parts or any(
-            part in {"", ".", ".."} for part in parts
+        if (
+            candidate.is_absolute()
+            or not parts
+            or any(part in {"", ".", ".."} for part in parts)
         ):
             raise ValueError("artifact path must be a normalized relative file path")
-        if len(parts) == 1 and parts[0] == self._FINAL_RECORD_NAME and allow_final_record:
+        if (
+            len(parts) == 1
+            and parts[0] == self._FINAL_RECORD_NAME
+            and allow_final_record
+        ):
             return parts
         if parts[0] in self._RESERVED_TOP_LEVEL:
             raise ValueError("artifact name is reserved for recorder-owned state")
@@ -1006,4 +1040,6 @@ def _validate_leaf_name(value: str, *, label: str) -> None:
 
 
 def _is_sha256(value: str) -> bool:
-    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
