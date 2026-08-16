@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from triageguard.analysis import ContextBuilder, DiffBuilder, SnapshotAcquirer
+from triageguard.analysis import (
+    ContextBuilder,
+    DiffBuilder,
+    FrozenContextRefiner,
+    SnapshotAcquirer,
+)
 from triageguard.config import Settings
 from triageguard.domain import EnvironmentKind
 from triageguard.llm import ModelRequest, ModelResponse, ReplayGateway
@@ -155,9 +160,11 @@ class _TemplateReplayGateway:
         *,
         risk_templates: Mapping[str, object],
         gherkin_template: Mapping[str, object],
+        testability_template: Mapping[str, object],
     ) -> None:
         self._risk_templates = dict(risk_templates)
         self._gherkin_template = dict(gherkin_template)
+        self._testability_template = dict(testability_template)
 
     def generate(self, request: ModelRequest) -> ModelResponse:
         """Return only a fixture response bound to the given request fields."""
@@ -165,6 +172,8 @@ class _TemplateReplayGateway:
             template = self._risk_template(request)
         elif request.purpose == "gherkin_generation":
             template = self._gherkin_response(request)
+        elif request.purpose == "testability_assessment":
+            template = self._testability_response(request)
         else:
             raise ValueError("The synthetic replay supports only Milestone 2 requests.")
 
@@ -205,18 +214,47 @@ class _TemplateReplayGateway:
     def _gherkin_response(self, request: ModelRequest) -> dict[str, object]:
         snapshot_key = _string_value(request.payload, "snapshot_key")
         reviewed_risk_sha256 = _string_value(request.payload, "reviewed_risk_sha256")
+        context_sha256 = _string_value(request.payload, "context_sha256")
         approved_risk = _mapping_value(request.payload, "approved_risk")
 
         result = _substitute(
             self._gherkin_template,
             {
                 "__SNAPSHOT_KEY__": snapshot_key,
+                "__CONTEXT_SHA256__": context_sha256,
                 "__REVIEWED_RISK_SHA256__": reviewed_risk_sha256,
                 "__APPROVED_RISK__": dict(approved_risk),
+                "__INTEGRATION_ANCHOR_ID__": _integration_anchor_id(
+                    request.payload,
+                ),
             },
         )
         if not isinstance(result, dict):
             raise TypeError("The substituted Gherkin fixture must be an object.")
+        return result
+
+    def _testability_response(self, request: ModelRequest) -> dict[str, object]:
+        """Bind the recorded testability decision to this exact review/context."""
+        context_limits = _mapping_value(request.payload, "context_limits")
+        result = _substitute(
+            self._testability_template,
+            {
+                "__SNAPSHOT_KEY__": _string_value(request.payload, "snapshot_key"),
+                "__CONTEXT_SHA256__": _string_value(
+                    context_limits,
+                    "context_sha256",
+                ),
+                "__REVIEWED_RISK_SHA256__": _string_value(
+                    request.payload,
+                    "reviewed_risk_sha256",
+                ),
+                "__INTEGRATION_ANCHOR_ID__": _integration_anchor_id(
+                    request.payload,
+                ),
+            },
+        )
+        if not isinstance(result, dict):
+            raise TypeError("The substituted testability fixture must be an object.")
         return result
 
 
@@ -243,6 +281,9 @@ def build_milestone_two_replay_workflow(
     gherkin_template = _load_fixture_object(
         _FIXTURE_ROOT / "model" / "gherkin_generation.json"
     )
+    testability_template = _load_fixture_object(
+        _FIXTURE_ROOT / "model" / "testability_assessment.json"
+    )
 
     fixture_commits = _mapping_value(repository_metadata, "fixture_commits")
     base_sha = _fixture_commit_sha(fixture_commits, "base")
@@ -262,6 +303,7 @@ def build_milestone_two_replay_workflow(
     gateway = _TemplateReplayGateway(
         risk_templates=risk_templates,
         gherkin_template=gherkin_template,
+        testability_template=testability_template,
     )
     workflow = MilestoneTwoWorkflow(
         run_id=run_id,
@@ -287,6 +329,7 @@ def build_milestone_two_replay_workflow(
         context_builder=ContextBuilder(),
         store=store,
         gateway=_OutcomeBoundGateway(gateway=gateway, outcome=outcome),
+        evidence_refiner=FrozenContextRefiner(),
     )
     return workflow
 

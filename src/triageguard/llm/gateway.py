@@ -25,6 +25,7 @@ class ModelRequest(BaseModel):
         "mechanical_repair",
         "plain_explanation",
         "gherkin_generation",
+        "testability_assessment",
     ]
     system_prompt: str = Field(min_length=1)
     payload: dict[str, Any]
@@ -130,7 +131,9 @@ def error_sha256(error: BaseException) -> str:
     return hashlib.sha256(str(error).encode("utf-8")).hexdigest()
 
 
-def parse_and_validate_output(content: str, output_schema: dict[str, Any]) -> dict[str, Any]:
+def parse_and_validate_output(
+    content: str, output_schema: dict[str, Any]
+) -> dict[str, Any]:
     """Parse once and reject any result incompatible with the requested JSON Schema."""
     try:
         data = json.loads(content)
@@ -142,7 +145,11 @@ def parse_and_validate_output(content: str, output_schema: dict[str, Any]) -> di
     try:
         validate(data, output_schema)
     except SchemaError as error:
-        raise ModelOutputInvalid("model request contains an invalid JSON Schema") from error
+        raise ModelOutputInvalid(
+            "model request contains an invalid JSON Schema"
+        ) from error
     except ValidationError as error:
-        raise ModelOutputInvalid("model response does not match output schema") from error
+        raise ModelOutputInvalid(
+            "model response does not match output schema"
+        ) from error
     return data

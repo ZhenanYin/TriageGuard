@@ -55,6 +55,13 @@
             "anchor_ids": [
               "__INTEGRATION_ANCHOR_ID__"
             ],
+            "claim_field": "explanation",
+            "observable_index": null
+          },
+          {
+            "anchor_ids": [
+              "__INTEGRATION_ANCHOR_ID__"
+            ],
             "claim_field": "actor",
             "observable_index": null
           },
@@ -88,7 +95,7 @@
           }
         ],
         "expected_secure_behavior": "The deletion path enforces the required authorization before deleting a patient record.",
-        "explanation": "The integration change removes a deletion authorization annotation, so the changed path needs an executable check.",
+        "explanation": "The merge impact removes a deletion authorization annotation from the patient-deletion path, so an authenticated OpenMRS user may be able to request deletion without the expected authorization. The expected protection is for the deletion request to be rejected and the patient record to remain stored. TriageGuard suggested this because the saved merge-impact comparison contains the changed deletion path. This is an unconfirmed hypothesis.",
         "limitations": [
           "The bounded excerpt does not include the complete authorization configuration."
         ],

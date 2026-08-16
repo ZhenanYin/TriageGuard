@@ -111,6 +111,57 @@ def _risk_approved_workflow(
     return workflow, human_review, acquirer
 
 
+def _assess_testability(
+    workflow: MilestoneTwoWorkflow,
+    human_review: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> object:
+    """Move one approved risk through a locally accepted testability decision."""
+    assessment = SimpleNamespace(decision="testable_from_frozen_evidence")
+    draft = object()
+    response = object()
+
+    def fake_generate_testability_assessment(
+        *,
+        human_review: object,
+        context: object,
+        gateway: object,
+    ) -> tuple[object, object]:
+        assert human_review is expected_human_review
+        assert context is workflow._prepared.context
+        assert gateway is workflow._gateway
+        return draft, response
+
+    def fake_validate_testability_assessment(
+        *,
+        draft: object,
+        human_review: object,
+        context: object,
+    ) -> tuple[object, object]:
+        assert draft is expected_draft
+        assert human_review is expected_human_review
+        assert context is workflow._prepared.context
+        return assessment, object()
+
+    expected_human_review = human_review
+    expected_draft = draft
+    monkeypatch.setattr(
+        milestone_two,
+        "generate_testability_assessment",
+        fake_generate_testability_assessment,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        milestone_two,
+        "validate_testability_assessment",
+        fake_validate_testability_assessment,
+        raising=False,
+    )
+
+    assert workflow.assess_testability() is assessment
+    return assessment
+
+
 def test_generate_gherkin_rechecks_freshness_and_uses_approved_risk(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -119,31 +170,51 @@ def test_generate_gherkin_rechecks_freshness_and_uses_approved_risk(
     workflow, human_review, acquirer = _risk_approved_workflow(
         tmp_path,
         monkeypatch,
-        freshness_statuses=("current", "current"),
+        freshness_statuses=("current", "current", "current"),
     )
-    candidate = object()
+    testability_assessment = _assess_testability(
+        workflow,
+        human_review,
+        monkeypatch,
+    )
+    candidate = SimpleNamespace(gherkin_text="Feature: generated scenario")
     response = object()
 
     def fake_generate_gherkin(
         *,
         human_review: object,
+        testability_assessment: object,
+        context: object,
         gateway: object,
     ) -> tuple[object, object]:
         assert human_review is expected_human_review
+        assert testability_assessment is expected_testability_assessment
+        assert context is workflow._prepared.context
         assert gateway is workflow._gateway
         return candidate, response
 
     expected_human_review = human_review
+    expected_testability_assessment = testability_assessment
     monkeypatch.setattr(
         milestone_two,
         "request_gherkin_candidate",
         fake_generate_gherkin,
         raising=False,
     )
+    monkeypatch.setattr(
+        milestone_two,
+        "validate_gherkin_candidate",
+        lambda **_kwargs: SimpleNamespace(approved=True),
+        raising=False,
+    )
 
     assert workflow.generate_gherkin() is candidate
     assert workflow.gherkin_candidate is candidate
-    assert acquirer.rechecked == [acquirer.snapshot, acquirer.snapshot]
+    assert acquirer.rechecked == [
+        acquirer.snapshot,
+        acquirer.snapshot,
+        acquirer.snapshot,
+    ]
 
 
 def test_generate_gherkin_rejects_a_stale_snapshot(
@@ -151,13 +222,38 @@ def test_generate_gherkin_rejects_a_stale_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A changed PR cannot produce a Gherkin candidate from stale evidence."""
-    workflow, _human_review, acquirer = _risk_approved_workflow(
+    workflow, human_review, acquirer = _risk_approved_workflow(
         tmp_path,
         monkeypatch,
-        freshness_statuses=("current", "stale"),
+        freshness_statuses=("current", "current", "stale"),
     )
+    _assess_testability(workflow, human_review, monkeypatch)
 
     with pytest.raises(MilestoneTwoTransitionError, match="snapshot_stale"):
         workflow.generate_gherkin()
 
-    assert acquirer.rechecked == [acquirer.snapshot, acquirer.snapshot]
+    assert acquirer.rechecked == [
+        acquirer.snapshot,
+        acquirer.snapshot,
+        acquirer.snapshot,
+    ]
+
+
+def test_generate_gherkin_requires_a_testability_assessment(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Risk approval alone must not bypass the frozen-evidence testability gate."""
+    workflow, _human_review, acquirer = _risk_approved_workflow(
+        tmp_path,
+        monkeypatch,
+        freshness_statuses=("current", "current"),
+    )
+
+    with pytest.raises(
+        MilestoneTwoTransitionError,
+        match="assess testability",
+    ):
+        workflow.generate_gherkin()
+
+    assert acquirer.rechecked == [acquirer.snapshot]

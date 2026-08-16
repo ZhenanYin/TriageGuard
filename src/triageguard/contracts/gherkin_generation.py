@@ -5,16 +5,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
 from triageguard.domain.pr_analysis import (
+    ContextBundle,
     GherkinApproval,
     GherkinCandidate,
     GherkinCandidateDraft,
     GherkinStep,
     HumanReviewedRisk,
+    TestabilityAssessment,
 )
 from triageguard.llm.gateway import (
     ModelOutputInvalid,
@@ -54,29 +56,117 @@ if not isinstance(_raw_output_schema, dict):
 GHERKIN_OUTPUT_SCHEMA: dict[str, Any] = _raw_output_schema
 
 
-def build_gherkin_request(human_review: HumanReviewedRisk) -> ModelRequest:
-    """Build one strict request bound to a human-approved risk successor."""
+def _validate_gherkin_request_inputs(
+    *,
+    human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
+    context: ContextBundle,
+) -> tuple[HumanReviewedRisk, TestabilityAssessment, ContextBundle]:
+    """Require one coherent reviewed risk, testability result, and frozen context."""
     try:
-        human_review = HumanReviewedRisk.model_validate(
+        reviewed = HumanReviewedRisk.model_validate(
             human_review.model_dump(mode="json")
         )
     except ValidationError as error:
-        raise ValueError("human review failed immutable-content validation") from error
+        raise ValueError(
+            "Gherkin generation requires a valid immutable human review"
+        ) from error
 
-    approved_risk = human_review.reviewed_risk.model_dump(mode="json")
+    try:
+        testability = TestabilityAssessment.model_validate(
+            testability_assessment.model_dump(mode="json")
+        )
+    except ValidationError as error:
+        raise ValueError(
+            "Gherkin generation requires a valid immutable testability assessment"
+        ) from error
+
+    try:
+        frozen_context = ContextBundle.model_validate(context.model_dump(mode="json"))
+    except ValidationError as error:
+        raise ValueError(
+            "Gherkin generation requires valid immutable frozen context evidence"
+        ) from error
+
+    if reviewed.snapshot_key != frozen_context.snapshot_key:
+        raise ValueError("human review snapshot key must match the frozen context")
+    if testability.snapshot_key != reviewed.snapshot_key:
+        raise ValueError(
+            "testability assessment snapshot key must match the human review"
+        )
+    if testability.context_sha256 != frozen_context.context_sha256:
+        raise ValueError(
+            "testability assessment context hash must match the frozen context"
+        )
+    if testability.reviewed_risk_sha256 != reviewed.reviewed_content_sha256:
+        raise ValueError("testability assessment must match the reviewed risk content")
+    if testability.decision != "testable_from_frozen_evidence":
+        raise ValueError(
+            "Gherkin generation requires testable frozen-evidence assessment"
+        )
+
+    anchors_by_id = {anchor.anchor_id: anchor for anchor in frozen_context.anchors}
+    assessment_anchor_ids = tuple(
+        anchor_id
+        for binding in testability.bindings
+        for anchor_id in binding.anchor_ids
+    )
+    if any(anchor_id not in anchors_by_id for anchor_id in assessment_anchor_ids):
+        raise ValueError(
+            "testability assessment cited an anchor absent from the frozen context"
+        )
+    if not any(
+        anchors_by_id[anchor_id].change_relation == "integration_change"
+        for anchor_id in assessment_anchor_ids
+    ):
+        raise ValueError("testability assessment requires integration-change evidence")
+
+    if (
+        reviewed.reviewed_grounding is not None
+        and reviewed.reviewed_grounding.context_sha256 != frozen_context.context_sha256
+    ):
+        raise ValueError("human-review grounding must match the frozen Gherkin context")
+
+    return reviewed, testability, frozen_context
+
+
+def build_gherkin_request(
+    *,
+    human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
+    context: ContextBundle,
+) -> ModelRequest:
+    """Build one strict Gherkin request after local frozen-evidence approval."""
+    reviewed, testability, frozen_context = _validate_gherkin_request_inputs(
+        human_review=human_review,
+        testability_assessment=testability_assessment,
+        context=context,
+    )
+
+    approved_risk = reviewed.reviewed_risk.model_dump(mode="json")
 
     return ModelRequest(
         purpose="gherkin_generation",
         system_prompt=GHERKIN_SYSTEM_PROMPT,
         payload={
-            "snapshot_key": human_review.snapshot_key,
-            "reviewed_risk_sha256": human_review.reviewed_content_sha256,
+            "snapshot_key": reviewed.snapshot_key,
+            "reviewed_risk_sha256": reviewed.reviewed_content_sha256,
+            "testability_assessment_sha256": testability.assessment_sha256,
+            "context_sha256": frozen_context.context_sha256,
             "approved_risk": approved_risk,
+            "context_anchors": [
+                anchor.model_dump(mode="json") for anchor in frozen_context.anchors
+            ],
             "output_rules": {
                 "scenario_count": 1,
                 "feature_count": 1,
                 "citation_rule": (
-                    "Use only the supplied approved-risk terms and identifiers."
+                    "Use only the approved-risk terms and the supplied frozen "
+                    "context anchors."
+                ),
+                "testability_rule": (
+                    "The scenario must remain within the locally approved setup, "
+                    "action, and observable evidence roles."
                 ),
                 "prohibited_content": [
                     "Python or implementation code",
@@ -93,10 +183,21 @@ def build_gherkin_request(human_review: HumanReviewedRisk) -> ModelRequest:
 def generate_gherkin(
     *,
     human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
+    context: ContextBundle,
     gateway: StructuredModelGateway,
 ) -> tuple[GherkinCandidate, ModelResponse]:
-    """Generate and locally validate one Gherkin candidate."""
-    request = build_gherkin_request(human_review)
+    """Generate one scenario only after local frozen-evidence testability approval."""
+    reviewed, _, frozen_context = _validate_gherkin_request_inputs(
+        human_review=human_review,
+        testability_assessment=testability_assessment,
+        context=context,
+    )
+    request = build_gherkin_request(
+        human_review=reviewed,
+        testability_assessment=testability_assessment,
+        context=context,
+    )
     response = gateway.generate(request)
 
     try:
@@ -106,15 +207,19 @@ def generate_gherkin(
             "model response does not form a coherent Gherkin candidate draft"
         ) from error
 
-    if draft.snapshot_key != human_review.snapshot_key:
+    if draft.snapshot_key != reviewed.snapshot_key:
         raise ModelOutputInvalid(
             "model response snapshot key does not match the human review"
         )
-    if draft.reviewed_risk_sha256 != human_review.reviewed_content_sha256:
+    if draft.context_sha256 != frozen_context.context_sha256:
+        raise ModelOutputInvalid(
+            "model response context hash does not match the frozen context"
+        )
+    if draft.reviewed_risk_sha256 != reviewed.reviewed_content_sha256:
         raise ModelOutputInvalid(
             "model response reviewed-risk hash does not match the human review"
         )
-    if draft.approved_risk != human_review.reviewed_risk:
+    if draft.approved_risk != reviewed.reviewed_risk:
         raise ModelOutputInvalid(
             "model response approved risk does not match the human review"
         )
@@ -123,16 +228,33 @@ def generate_gherkin(
 
 
 _STEP_PATTERN = re.compile(r"^(Given|When|Then|And)\s+(.+)$")
+_PROHIBITED_GHERKIN_CONTENT = re.compile(
+    r"```|#|[(){}\[\];|><$`]|"
+    r"\b(?:def|class|import|os|sys|subprocess|python|bash|sh|curl|wget|rm|"
+    r"chmod|sudo|eval|exec|cat|echo)\b|"
+    r"(?:^|\s)/(?:\S+)",
+    flags=re.IGNORECASE,
+)
+_CODE_SHAPED_IDENTIFIER = re.compile(r"\b[a-z][A-Za-z0-9_$]*[A-Z][A-Za-z0-9_$]*\b")
 
 
 class GherkinGenerationError(ValueError):
     """A generated or edited scenario failed local Gherkin safety checks."""
 
 
+GherkinValidationDecision = Literal[
+    "valid_evidence_bound_gherkin",
+    "needs_more_frozen_evidence",
+    "hypothesis_changed",
+    "invalid_gherkin",
+]
+
+
 @dataclass(frozen=True)
 class GherkinValidationReport:
-    """The local decision about whether a candidate still matches its review."""
+    """The local decision about whether edited Gherkin may advance."""
 
+    decision: GherkinValidationDecision
     approved: bool
     reason_codes: tuple[str, ...]
 
@@ -152,6 +274,11 @@ def _required_risk_terms(human_review: HumanReviewedRisk) -> tuple[str, ...]:
         *risk.observables,
         *risk.code_identifiers,
     )
+
+
+def _code_shaped_identifiers(text: str) -> set[str]:
+    """Return Java-like camel-case identifiers introduced in scenario prose."""
+    return set(_CODE_SHAPED_IDENTIFIER.findall(text))
 
 
 def _parse_editable_text(
@@ -206,22 +333,129 @@ def _validate_candidate_identity(
         _add_reason(reason_codes, "candidate_approved_risk_mismatch")
 
 
+def _decision_from_reasons(
+    reason_codes: list[str],
+) -> GherkinValidationDecision:
+    """Classify the reviewer-facing next action from deterministic checks."""
+    if not reason_codes:
+        return "valid_evidence_bound_gherkin"
+    if any(
+        reason_code
+        in {
+            "unknown_step_evidence_anchor",
+            "missing_integration_step_evidence",
+            "unbound_code_identifier",
+        }
+        for reason_code in reason_codes
+    ):
+        return "needs_more_frozen_evidence"
+    if any(
+        reason_code
+        in {
+            "candidate_reviewed_risk_mismatch",
+            "candidate_approved_risk_mismatch",
+            "bound_risk_term_removed",
+        }
+        for reason_code in reason_codes
+    ):
+        return "hypothesis_changed"
+    return "invalid_gherkin"
+
+
+def validate_edited_gherkin(
+    *,
+    candidate: GherkinCandidate,
+    text: str,
+    human_review: HumanReviewedRisk,
+    context: ContextBundle,
+) -> GherkinValidationReport:
+    """Classify one edited scenario against its current frozen evidence context."""
+    reason_codes: list[str] = []
+    _validate_candidate_identity(candidate, human_review, reason_codes)
+
+    try:
+        frozen_context = ContextBundle.model_validate(context.model_dump(mode="json"))
+    except ValidationError:
+        _add_reason(reason_codes, "invalid_frozen_context")
+        frozen_context = None
+
+    if (
+        frozen_context is not None
+        and candidate.context_sha256 != frozen_context.context_sha256
+    ):
+        _add_reason(reason_codes, "candidate_context_mismatch")
+
+    if frozen_context is not None:
+        anchors_by_id = {anchor.anchor_id: anchor for anchor in frozen_context.anchors}
+        evidence_anchor_ids = tuple(
+            anchor_id
+            for binding in candidate.step_evidence_bindings
+            for anchor_id in binding.anchor_ids
+        )
+        if any(anchor_id not in anchors_by_id for anchor_id in evidence_anchor_ids):
+            _add_reason(reason_codes, "unknown_step_evidence_anchor")
+        elif not any(
+            anchors_by_id[anchor_id].change_relation == "integration_change"
+            for anchor_id in evidence_anchor_ids
+        ):
+            _add_reason(reason_codes, "missing_integration_step_evidence")
+
+    try:
+        parsed_steps = _parse_editable_text(
+            text=text,
+            feature_title=candidate.feature_title,
+            scenario_title=candidate.scenario_title,
+        )
+    except GherkinGenerationError as error:
+        _add_reason(reason_codes, str(error))
+        parsed_steps = ()
+
+    if parsed_steps:
+        original_keywords = tuple(step.keyword for step in candidate.steps)
+        edited_keywords = tuple(keyword for keyword, _ in parsed_steps)
+        if (
+            len(parsed_steps) != len(candidate.steps)
+            or edited_keywords != original_keywords
+        ):
+            _add_reason(reason_codes, "gherkin_step_structure_changed")
+
+    if _PROHIBITED_GHERKIN_CONTENT.search(text):
+        _add_reason(reason_codes, "gherkin_text_contains_implementation_code")
+
+    if frozen_context is not None:
+        known_identifiers = _code_shaped_identifiers(candidate.gherkin_text)
+        known_identifiers.update(human_review.reviewed_risk.code_identifiers)
+        for anchor in frozen_context.anchors:
+            known_identifiers.update(_code_shaped_identifiers(anchor.text))
+
+        introduced_identifiers = _code_shaped_identifiers(text) - known_identifiers
+        if introduced_identifiers:
+            _add_reason(reason_codes, "unbound_code_identifier")
+
+    for term in _required_risk_terms(human_review):
+        if term not in text:
+            _add_reason(reason_codes, "bound_risk_term_removed")
+
+    decision = _decision_from_reasons(reason_codes)
+    return GherkinValidationReport(
+        decision=decision,
+        approved=decision == "valid_evidence_bound_gherkin",
+        reason_codes=tuple(reason_codes),
+    )
+
+
 def validate_gherkin_candidate(
     *,
     candidate: GherkinCandidate,
     human_review: HumanReviewedRisk,
+    context: ContextBundle,
 ) -> GherkinValidationReport:
-    """Check a candidate against its exact human-reviewed risk."""
-    reason_codes: list[str] = []
-    _validate_candidate_identity(candidate, human_review, reason_codes)
-
-    for term in _required_risk_terms(human_review):
-        if term not in candidate.gherkin_text:
-            _add_reason(reason_codes, "bound_risk_term_removed")
-
-    return GherkinValidationReport(
-        approved=not reason_codes,
-        reason_codes=tuple(reason_codes),
+    """Validate the candidate's current text against its frozen evidence."""
+    return validate_edited_gherkin(
+        candidate=candidate,
+        text=candidate.gherkin_text,
+        human_review=human_review,
+        context=context,
     )
 
 
@@ -230,11 +464,14 @@ def apply_gherkin_text_edit(
     candidate: GherkinCandidate,
     text: str,
     human_review: HumanReviewedRisk,
+    context: ContextBundle,
 ) -> GherkinCandidate:
     """Create a new candidate after a structure-preserving human text edit."""
-    original_validation = validate_gherkin_candidate(
+    original_validation = validate_edited_gherkin(
         candidate=candidate,
+        text=text,
         human_review=human_review,
+        context=context,
     )
     if not original_validation.approved:
         raise GherkinGenerationError(", ".join(original_validation.reason_codes))
@@ -287,12 +524,15 @@ def approve_gherkin(
     *,
     candidate: GherkinCandidate,
     human_review: HumanReviewedRisk,
+    context: ContextBundle,
     approved_at: datetime,
 ) -> GherkinApproval:
     """Approve only a locally valid candidate tied to this human review."""
-    validation = validate_gherkin_candidate(
+    validation = validate_edited_gherkin(
         candidate=candidate,
+        text=candidate.gherkin_text,
         human_review=human_review,
+        context=context,
     )
     if not validation.approved:
         raise GherkinGenerationError(", ".join(validation.reason_codes))

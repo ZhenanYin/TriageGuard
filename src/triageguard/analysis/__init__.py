@@ -8,6 +8,10 @@ from triageguard.analysis.context import (
     JavaSyntaxExtractor,
 )
 from triageguard.analysis.diffs import DiffBuilder, DiffBuildError, parse_patch
+from triageguard.analysis.refinement import (
+    FrozenContextRefiner,
+    FrozenEvidenceRefinementError,
+)
 from triageguard.analysis.snapshot import (
     SnapshotAcquirer,
     SnapshotAcquisitionError,
@@ -19,6 +23,8 @@ __all__ = [
     "ContextLimits",
     "DiffBuildError",
     "DiffBuilder",
+    "FrozenContextRefiner",
+    "FrozenEvidenceRefinementError",
     "JavaFileIndex",
     "JavaSyntaxExtractor",
     "SnapshotAcquirer",

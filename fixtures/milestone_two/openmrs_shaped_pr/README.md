@@ -15,3 +15,13 @@ The model JSON files are prerecorded structured replay templates. Their
 placeholder values are deterministically replaced only with the snapshot,
 context, integration-anchor, and human-review identities already present in
 the corresponding model request. No LLM call and no network request occurs.
+
+The fixture can demonstrate an approved Gherkin scenario only after locally
+validated frozen-code testability. It can also demonstrate explicit non-risk
+outcomes. In every case, the result is development evidence about TriageGuard;
+it never labels the synthetic change safe or proves anything about OpenMRS.
+
+When a real or replayed review cannot find enough relevant code among its four
+already frozen photographs, Milestone 2 records **insufficient frozen code
+evidence to design an executable scenario**. That is an honest boundary of the
+available code evidence, not a safety conclusion.

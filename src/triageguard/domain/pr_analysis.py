@@ -63,6 +63,7 @@ _FAILED_REASON_CODES = {
     "gherkin_not_approved",
 }
 _EDITABLE_RISK_FIELDS = {
+    "explanation",
     "actor",
     "preconditions",
     "action",
@@ -84,6 +85,13 @@ def _is_utc(value: datetime) -> bool:
 def _canonical_content_hash(value: object) -> str:
     """Hash canonical JSON with sorted keys; callers remove their self-hash first."""
     return canonical_sha256(value)
+
+
+def _reviewed_field_change_value(value: object) -> str:
+    """Match the durable human-review representation for one editable field."""
+    if isinstance(value, str):
+        return value
+    return canonical_json(value)
 
 
 class PullRequestSnapshot(ResearchArtifact):
@@ -386,11 +394,234 @@ class ContextBundle(ResearchArtifact):
         )
 
 
+TestabilityDecision = Literal[
+    "testable_from_frozen_evidence",
+    "needs_more_frozen_evidence",
+    "not_grounded_in_frozen_evidence",
+]
+
+
+class TestabilityBinding(ResearchArtifact):
+    """One frozen evidence role required to design an executable test."""
+
+    role: Literal["setup", "action", "observable"]
+    anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_anchor_ids(self) -> TestabilityBinding:
+        if len(self.anchor_ids) != len(set(self.anchor_ids)):
+            raise ValueError("testability binding anchor IDs must be unique")
+        return self
+
+
+class FrozenEvidenceNeed(ResearchArtifact):
+    """One precise frozen-code gap that blocks an executable scenario."""
+
+    need_id: StrictStr = Field(min_length=1)
+    category: Literal[
+        "setup",
+        "entry_point",
+        "authorization",
+        "observable",
+        "caller",
+        "existing_test",
+    ]
+    search_terms: tuple[StrictStr, ...] = Field(min_length=1)
+    explanation: StrictStr = Field(min_length=1)
+    supporting_anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_need_coherence(self) -> FrozenEvidenceNeed:
+        if len(self.search_terms) != len(set(self.search_terms)):
+            raise ValueError("frozen evidence search terms must be unique")
+        if len(self.supporting_anchor_ids) != len(set(self.supporting_anchor_ids)):
+            raise ValueError("frozen evidence supporting anchor IDs must be unique")
+        return self
+
+
+class TestabilityAssessmentDraft(ResearchArtifact):
+    """Raw model proposal about whether frozen code can support a test."""
+
+    snapshot_key: Sha256
+    context_sha256: Sha256
+    reviewed_risk_sha256: Sha256
+    decision: TestabilityDecision
+    bindings: tuple[TestabilityBinding, ...] = Field(default_factory=tuple)
+    evidence_needs: tuple[FrozenEvidenceNeed, ...] = Field(default_factory=tuple)
+    explanation: StrictStr = Field(min_length=1)
+    generated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_decision_coherence(self) -> TestabilityAssessmentDraft:
+        if not _is_utc(self.generated_at):
+            raise ValueError("generated_at must be timezone-aware UTC")
+
+        roles = [binding.role for binding in self.bindings]
+        if len(roles) != len(set(roles)):
+            raise ValueError("testability binding roles must be unique")
+
+        if self.decision == "testable_from_frozen_evidence":
+            if set(roles) != {"setup", "action", "observable"}:
+                raise ValueError(
+                    "testable assessment requires exactly setup, action, "
+                    "and observable bindings"
+                )
+            if self.evidence_needs:
+                raise ValueError("a testable assessment cannot include evidence needs")
+        else:
+            if self.bindings:
+                raise ValueError(
+                    "a non-testable assessment cannot include test bindings"
+                )
+            if (
+                self.decision == "needs_more_frozen_evidence"
+                and not self.evidence_needs
+            ):
+                raise ValueError(
+                    "a needs-evidence assessment requires at least one "
+                    "frozen evidence need"
+                )
+        return self
+
+
+class TestabilityAssessment(TestabilityAssessmentDraft):
+    """Locally validated testability result bound to one review and context."""
+
+    assessment_sha256: Sha256 = ""
+    validated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_assessment_coherence(self) -> TestabilityAssessment:
+        if not _is_utc(self.validated_at):
+            raise ValueError("validated_at must be timezone-aware UTC")
+        if self.validated_at < self.generated_at:
+            raise ValueError("validated_at must not precede generated_at")
+
+        content = self.model_dump(
+            mode="json",
+            exclude={"assessment_sha256"},
+        )
+        if self.assessment_sha256 != _canonical_content_hash(content):
+            raise ValueError(
+                "assessment SHA-256 must match canonical testability content"
+            )
+        return self
+
+    @classmethod
+    def from_content(
+        cls,
+        **values: object,
+    ) -> TestabilityAssessment:
+        raw_bindings = values.get("bindings", ())
+        raw_needs = values.get("evidence_needs", ())
+
+        if not isinstance(raw_bindings, (list, tuple)):
+            raise TypeError("testability bindings must be a list or tuple")
+        if not isinstance(raw_needs, (list, tuple)):
+            raise TypeError("evidence needs must be a list or tuple")
+
+        normalized_values = {
+            **values,
+            "bindings": tuple(
+                TestabilityBinding.model_validate(binding) for binding in raw_bindings
+            ),
+            "evidence_needs": tuple(
+                FrozenEvidenceNeed.model_validate(need) for need in raw_needs
+            ),
+        }
+        provisional = cls.model_construct(**normalized_values)
+        content = provisional.model_dump(
+            mode="json",
+            exclude={"assessment_sha256"},
+        )
+        return cls.model_validate(
+            {
+                **normalized_values,
+                "assessment_sha256": _canonical_content_hash(content),
+            }
+        )
+
+
+class ContextRefinement(ResearchArtifact):
+    """One immutable link from an earlier context to frozen added evidence."""
+
+    snapshot_key: Sha256
+    parent_context_sha256: Sha256
+    refined_context_sha256: Sha256
+    evidence_need_ids: tuple[StrictStr, ...]
+    added_anchor_ids: tuple[StrictStr, ...]
+    exhausted: StrictBool
+    created_at: datetime
+    refinement_sha256: Sha256 = ""
+
+    @model_validator(mode="after")
+    def validate_refinement_coherence(self) -> ContextRefinement:
+        if not _is_utc(self.created_at):
+            raise ValueError("created_at must be timezone-aware UTC")
+        if len(self.evidence_need_ids) != len(set(self.evidence_need_ids)):
+            raise ValueError("context refinement evidence need IDs must be unique")
+        if len(self.added_anchor_ids) != len(set(self.added_anchor_ids)):
+            raise ValueError("context refinement added anchor IDs must be unique")
+
+        if self.exhausted:
+            if self.added_anchor_ids:
+                raise ValueError("an exhausted context refinement cannot add anchors")
+            if self.parent_context_sha256 != self.refined_context_sha256:
+                raise ValueError(
+                    "an exhausted context refinement must retain its parent hash"
+                )
+        elif (
+            self.parent_context_sha256 == self.refined_context_sha256
+            or not self.added_anchor_ids
+        ):
+            raise ValueError(
+                "a successful context refinement requires new anchors and a "
+                "distinct successor context"
+            )
+
+        content = self.model_dump(
+            mode="json",
+            exclude={"refinement_sha256"},
+        )
+        if self.refinement_sha256 != _canonical_content_hash(content):
+            raise ValueError(
+                "refinement SHA-256 must match canonical refinement content"
+            )
+        return self
+
+    @classmethod
+    def from_content(
+        cls,
+        **values: object,
+    ) -> ContextRefinement:
+        normalized_values = {
+            **values,
+            "evidence_need_ids": tuple(values.get("evidence_need_ids", ())),
+            "added_anchor_ids": tuple(values.get("added_anchor_ids", ())),
+        }
+        provisional = cls.model_construct(**normalized_values)
+        content = provisional.model_dump(
+            mode="json",
+            exclude={"refinement_sha256"},
+        )
+        return cls.model_validate(
+            {
+                **normalized_values,
+                "refinement_sha256": _canonical_content_hash(content),
+            }
+        )
+
+
 class ClaimEvidenceBinding(ResearchArtifact):
     """Citations supporting one claim field in an unconfirmed risk hypothesis."""
 
     claim_field: Literal[
-        "actor", "action", "expected_secure_behavior", "possible_failure", "observable"
+        "explanation",
+        "actor",
+        "action",
+        "expected_secure_behavior",
+        "possible_failure",
+        "observable",
     ]
     observable_index: StrictInt | None
     anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
@@ -467,6 +698,7 @@ class RiskHypothesisDraft(ResearchArtifact):
                 raise ValueError("claim evidence bindings must not duplicate a claim")
             seen.add(key)
         required = {
+            ("explanation", None),
             ("actor", None),
             ("action", None),
             ("expected_secure_behavior", None),
@@ -814,6 +1046,7 @@ class ReviewedFieldChange(ResearchArtifact):
     """An explicit before/after record for a reviewer edit."""
 
     field_name: Literal[
+        "explanation",
         "actor",
         "preconditions",
         "action",
@@ -872,6 +1105,19 @@ class GherkinStep(ResearchArtifact):
     text: StrictStr = Field(min_length=1)
 
 
+class GherkinStepEvidenceBinding(ResearchArtifact):
+    """Frozen code evidence supporting one concrete Gherkin step."""
+
+    step_number: StrictInt = Field(gt=0)
+    anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_anchor_ids(self) -> GherkinStepEvidenceBinding:
+        if len(self.anchor_ids) != len(set(self.anchor_ids)):
+            raise ValueError("Gherkin step evidence anchor IDs must be unique")
+        return self
+
+
 class GherkinStepBinding(ResearchArtifact):
     """Traceability from one approved-risk claim to concrete step numbers."""
 
@@ -904,6 +1150,7 @@ class GherkinCandidateDraft(ResearchArtifact):
     """Raw provider scenario output; it deliberately has no durable identity."""
 
     snapshot_key: Sha256
+    context_sha256: Sha256
     reviewed_risk_sha256: Sha256
     approved_risk: RiskHypothesisDraft
     feature_title: StrictStr = Field(min_length=1)
@@ -911,6 +1158,7 @@ class GherkinCandidateDraft(ResearchArtifact):
     steps: tuple[GherkinStep, ...] = Field(min_length=1)
     gherkin_text: StrictStr = Field(min_length=1)
     bindings: tuple[GherkinStepBinding, ...]
+    step_evidence_bindings: tuple[GherkinStepEvidenceBinding, ...]
     testability_notes: tuple[StrictStr, ...]
     setup_gaps: tuple[StrictStr, ...]
     generated_at: datetime
@@ -967,6 +1215,15 @@ class GherkinCandidateDraft(ResearchArtifact):
             raise ValueError("Gherkin text steps must exactly match structured steps")
         phases = _gherkin_phases(self.steps)
         step_numbers = {step.number for step in self.steps}
+        evidence_step_numbers = [
+            binding.step_number for binding in self.step_evidence_bindings
+        ]
+        if len(evidence_step_numbers) != len(set(evidence_step_numbers)):
+            raise ValueError("Gherkin step evidence bindings must not duplicate a step")
+        if set(evidence_step_numbers) != step_numbers:
+            raise ValueError(
+                "Gherkin step evidence bindings must cover every step exactly once"
+            )
         if any(
             number not in step_numbers
             for binding in self.bindings
@@ -1130,6 +1387,8 @@ class MilestoneTwoRunRecord(ResearchArtifact):
     freshness: SnapshotFreshness | None = None
     risk_assessment: RiskAssessment | None = None
     human_reviewed_risk: HumanReviewedRisk | None = None
+    testability_assessment: TestabilityAssessment | None = None
+    context_refinements: tuple[ContextRefinement, ...] = Field(default_factory=tuple)
     gherkin_candidate: GherkinCandidate | None = None
     gherkin_approval: GherkinApproval | None = None
 
@@ -1141,6 +1400,8 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             raise ValueError("finished_at must not precede started_at")
         assessment = self.risk_assessment
         review = self.human_reviewed_risk
+        testability = self.testability_assessment
+        refinements = self.context_refinements
         candidate = self.gherkin_candidate
         approval = self.gherkin_approval
         if (
@@ -1199,8 +1460,10 @@ class MilestoneTwoRunRecord(ResearchArtifact):
                 raise ValueError("reviewed risk cannot change a non-editable field")
             expected_changes = {
                 field_name: (
-                    canonical_json(getattr(selected, field_name)),
-                    canonical_json(getattr(review.reviewed_risk, field_name)),
+                    _reviewed_field_change_value(getattr(selected, field_name)),
+                    _reviewed_field_change_value(
+                        getattr(review.reviewed_risk, field_name)
+                    ),
                 )
                 for field_name in _EDITABLE_RISK_FIELDS
                 if getattr(selected, field_name)
@@ -1263,6 +1526,47 @@ class MilestoneTwoRunRecord(ResearchArtifact):
                 raise ValueError(
                     "reviewed grounding must resolve every identifier in bound context"
                 )
+        if testability is not None:
+            if assessment is None or review is None:
+                raise ValueError(
+                    "a testability assessment requires its assessment and reviewed risk"
+                )
+            if (
+                testability.snapshot_key != self.snapshot.snapshot_key
+                or testability.context_sha256 != assessment.context_sha256
+                or testability.reviewed_risk_sha256 != review.reviewed_content_sha256
+            ):
+                raise ValueError(
+                    "testability assessment must bind the terminal snapshot, context, "
+                    "and reviewed risk"
+                )
+            context_anchor_ids = {
+                anchor.anchor_id for anchor in assessment.context_bundle.anchors
+            }
+            testability_anchor_ids = {
+                anchor_id
+                for binding in testability.bindings
+                for anchor_id in binding.anchor_ids
+            } | {
+                anchor_id
+                for need in testability.evidence_needs
+                for anchor_id in need.supporting_anchor_ids
+            }
+            if not testability_anchor_ids.issubset(context_anchor_ids):
+                raise ValueError(
+                    "testability assessment must cite the bound frozen context"
+                )
+        if len(refinements) != len(
+            {refinement.refinement_sha256 for refinement in refinements}
+        ):
+            raise ValueError("terminal context refinements must be unique")
+        if any(
+            refinement.snapshot_key != self.snapshot.snapshot_key
+            for refinement in refinements
+        ):
+            raise ValueError(
+                "context refinement snapshot key must match the terminal snapshot"
+            )
         if candidate is not None:
             if review is None:
                 raise ValueError("a Gherkin candidate requires a human-reviewed risk")
@@ -1348,6 +1652,26 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             raise ValueError(
                 "insufficient-context terminal status requires a supported reason code"
             )
+        if self.status is MilestoneTwoStatus.INSUFFICIENT_FROZEN_EVIDENCE_FOR_SCENARIO:
+            if (
+                assessment is None
+                or review is None
+                or testability is None
+                or testability.decision != "needs_more_frozen_evidence"
+                or not refinements
+                or not refinements[-1].exhausted
+                or candidate is not None
+                or approval is not None
+            ):
+                raise ValueError(
+                    "insufficient-frozen-evidence status requires an exhausted "
+                    "testability refinement without Gherkin"
+                )
+            if self.reason_code != "insufficient_frozen_evidence_for_scenario":
+                raise ValueError(
+                    "insufficient-frozen-evidence terminal status requires its "
+                    "supported reason code"
+                )
         if self.status is MilestoneTwoStatus.STALE and (
             self.freshness is None or self.freshness.status != "stale"
         ):

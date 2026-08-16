@@ -19,9 +19,7 @@ from pydantic import (
 from triageguard.domain.statuses import EnvironmentKind, WorkflowStatus
 from triageguard.provenance import canonical_sha256
 
-_REVISION_PATTERN = (
-    r"^(?:base|candidate|[a-z][a-z0-9]*(?:-[a-z0-9]+)+|[0-9a-f]{7,64})$"
-)
+_REVISION_PATTERN = r"^(?:base|candidate|[a-z][a-z0-9]*(?:-[a-z0-9]+)+|[0-9a-f]{7,64})$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _CVSS4_BASE_METRICS = (
     "AV",
@@ -313,9 +311,7 @@ class ExecutionManifest(ResearchArtifact):
             raise ValueError("execution manifest finished_at precedes started_at")
         if set(self.files) != set(_EXECUTION_FILENAMES):
             raise ValueError("execution manifest must bind every required file exactly")
-        prefix = (
-            f"artifacts/executions/{self.repetition_index:04d}-{self.side}/files/"
-        )
+        prefix = f"artifacts/executions/{self.repetition_index:04d}-{self.side}/files/"
         for kind, filename in _EXECUTION_FILENAMES.items():
             if self.files[kind].relative_path != f"{prefix}{filename}":
                 raise ValueError(f"execution manifest path mismatch for {kind}")
@@ -334,9 +330,7 @@ class DifferentialEvidence(ResearchArtifact):
     explanation: StrictStr = Field(min_length=1)
     base_differing_run_indexes: list[StrictInt]
     candidate_differing_run_indexes: list[StrictInt]
-    execution_manifest_sha256s: list[
-        StrictStr
-    ] = Field(default_factory=list)
+    execution_manifest_sha256s: list[StrictStr] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_terminal_coherence(self) -> DifferentialEvidence:
@@ -350,7 +344,9 @@ class DifferentialEvidence(ResearchArtifact):
             raise ValueError("base and candidate revisions must be distinct")
         _validate_manifest_digests(
             self.execution_manifest_sha256s,
-            expected_count=(2 * self.repetitions if self.execution_manifest_sha256s else 0),
+            expected_count=(
+                2 * self.repetitions if self.execution_manifest_sha256s else 0
+            ),
         )
         for label, indexes in (
             ("base", self.base_differing_run_indexes),
@@ -378,29 +374,42 @@ class DifferentialEvidence(ResearchArtifact):
         if self.explanation != expected_explanation:
             raise ValueError("explanation does not agree with status and reason_code")
         expected_behaviors = _DIFFERENTIAL_BEHAVIORS.get(self.status)
-        if expected_behaviors is not None and (
-            self.base.security_behavior,
-            self.candidate.security_behavior,
-        ) != expected_behaviors:
-            raise ValueError("status does not agree with the representative observations")
+        if (
+            expected_behaviors is not None
+            and (
+                self.base.security_behavior,
+                self.candidate.security_behavior,
+            )
+            != expected_behaviors
+        ):
+            raise ValueError(
+                "status does not agree with the representative observations"
+            )
         if self.status is WorkflowStatus.UNSTABLE_RESULT and (
             self.base.security_behavior is None
             or self.candidate.security_behavior is None
         ):
-            raise ValueError("unstable evidence requires supported representative facts")
+            raise ValueError(
+                "unstable evidence requires supported representative facts"
+            )
 
         has_differences = bool(
-            self.base_differing_run_indexes
-            or self.candidate_differing_run_indexes
+            self.base_differing_run_indexes or self.candidate_differing_run_indexes
         )
         if self.status is WorkflowStatus.UNSTABLE_RESULT:
             if self.stable or not has_differences:
-                raise ValueError("unstable evidence requires at least one differing run")
+                raise ValueError(
+                    "unstable evidence requires at least one differing run"
+                )
         elif self.status is WorkflowStatus.EXECUTION_INCONCLUSIVE:
             if self.stable or has_differences:
-                raise ValueError("inconclusive evidence cannot claim stable differences")
+                raise ValueError(
+                    "inconclusive evidence cannot claim stable differences"
+                )
         elif not self.stable or has_differences:
-            raise ValueError("stable differential evidence cannot contain differing runs")
+            raise ValueError(
+                "stable differential evidence cannot contain differing runs"
+            )
         return self
 
 
@@ -449,9 +458,7 @@ class RunRecord(ResearchArtifact):
                 "severity cannot be recorded without differential evidence"
             )
         if evidence is not None and severity is None:
-            raise ValueError(
-                "differential evidence requires severity assessment"
-            )
+            raise ValueError("differential evidence requires severity assessment")
         if evidence is not None:
             if (
                 self.status is not evidence.status
@@ -466,9 +473,7 @@ class RunRecord(ResearchArtifact):
                 or self.candidate_revision != evidence.candidate_revision
             ):
                 raise ValueError("RunRecord revisions must match its evidence")
-            if self.execution_manifest_sha256s != (
-                evidence.execution_manifest_sha256s
-            ):
+            if self.execution_manifest_sha256s != (evidence.execution_manifest_sha256s):
                 raise ValueError("RunRecord manifest digests must match its evidence")
             if len(self.execution_manifest_sha256s) != 2 * evidence.repetitions:
                 raise ValueError("terminal evidence must bind every execution manifest")
@@ -585,7 +590,9 @@ _INCONCLUSIVE_CONCLUSIONS = {
 
 def _is_utc(value: datetime) -> bool:
     offset = value.utcoffset()
-    return value.tzinfo is not None and offset is not None and offset.total_seconds() == 0
+    return (
+        value.tzinfo is not None and offset is not None and offset.total_seconds() == 0
+    )
 
 
 def _validate_manifest_digests(
@@ -610,9 +617,7 @@ def _validate_version_severity(
     *,
     insufficient: bool,
 ) -> None:
-    expected_evidence_sha256 = canonical_sha256(
-        observation.model_dump(mode="json")
-    )
+    expected_evidence_sha256 = canonical_sha256(observation.model_dump(mode="json"))
     if assessment.evidence_sha256 != expected_evidence_sha256:
         raise ValueError("severity observation hash does not match runtime evidence")
     if insufficient:
@@ -643,7 +648,5 @@ def _validate_version_severity(
         metrics=assessment.metrics,
         assessment_label="expert_authored_provisional",
     )
-    if assessment.profile_sha256 != canonical_sha256(
-        profile.model_dump(mode="json")
-    ):
+    if assessment.profile_sha256 != canonical_sha256(profile.model_dump(mode="json")):
         raise ValueError("severity profile hash does not match its metric profile")

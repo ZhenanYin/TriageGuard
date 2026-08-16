@@ -1,0 +1,23 @@
+{
+  "bindings": [
+    {
+      "anchor_ids": ["__INTEGRATION_ANCHOR_ID__"],
+      "role": "setup"
+    },
+    {
+      "anchor_ids": ["__INTEGRATION_ANCHOR_ID__"],
+      "role": "action"
+    },
+    {
+      "anchor_ids": ["__INTEGRATION_ANCHOR_ID__"],
+      "role": "observable"
+    }
+  ],
+  "context_sha256": "__CONTEXT_SHA256__",
+  "decision": "testable_from_frozen_evidence",
+  "evidence_needs": [],
+  "explanation": "The frozen integration evidence identifies the patient-deletion setup, the changed deletion action, and an observable authorization result.",
+  "generated_at": "2026-08-15T00:00:00Z",
+  "reviewed_risk_sha256": "__REVIEWED_RISK_SHA256__",
+  "snapshot_key": "__SNAPSHOT_KEY__"
+}

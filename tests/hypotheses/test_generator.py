@@ -144,6 +144,11 @@ def test_risk_request_contains_only_frozen_evidence() -> None:
     assert "GROQ_API_KEY" not in serialized
     assert "GITHUB_TOKEN" not in serialized
     assert request.output_schema["additionalProperties"] is False
+    assert request.payload["output_rules"]["readable_hypothesis_rule"] == (
+        "Write explanation as one complete, readable paragraph stating what "
+        "changed, what could go wrong, the expected protection, why it was "
+        "suggested, and that it remains unconfirmed."
+    )
 
 
 def _model_response(
@@ -200,6 +205,11 @@ def _model_response(
                     "deletePatient",
                 ],
                 "evidence_bindings": [
+                    {
+                        "claim_field": "explanation",
+                        "observable_index": None,
+                        "anchor_ids": ["anchor-integration"],
+                    },
                     {
                         "claim_field": "actor",
                         "observable_index": None,

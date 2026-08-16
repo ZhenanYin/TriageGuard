@@ -27,6 +27,7 @@ def test_offline_replay_reaches_approved_gherkin(tmp_path) -> None:
         {},
         hypothesis.citation_anchor_ids,
     )
+    testability = workflow.assess_testability()
     candidate = workflow.generate_gherkin()
     record = workflow.approve_gherkin(candidate.gherkin_text)
 
@@ -36,6 +37,7 @@ def test_offline_replay_reaches_approved_gherkin(tmp_path) -> None:
     assert prepared.snapshot.head_sha != prepared.snapshot.candidate_sha
     assert assessment.outcome == "risks_proposed"
     assert review.selected_hypothesis_id == hypothesis.hypothesis_id
+    assert testability.decision == "testable_from_frozen_evidence"
     assert candidate.snapshot_key == prepared.snapshot.snapshot_key
     assert record.status.value == "approved_gherkin"
     assert record.gherkin_candidate == candidate

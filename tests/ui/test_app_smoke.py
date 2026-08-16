@@ -17,7 +17,7 @@ from triageguard.execution import (
 )
 from triageguard.llm import ReplayGateway
 from triageguard.research import ArtifactRecorder
-from triageguard.ui.app import (
+from triageguard.ui.milestone_one_app import (
     ANALYSIS_EXPLANATION,
     ANALYSIS_SOURCE_LABEL,
     CONTROLLED_FIXTURE_WARNING,
@@ -29,9 +29,7 @@ from triageguard.ui.app import (
 )
 from triageguard.workflow import MilestoneOneWorkflow, UnsafeGeneratedCodeError
 
-FIXTURE_ROOT = (
-    Path(__file__).parents[2] / "fixtures" / "patient_delete_authorization"
-)
+FIXTURE_ROOT = Path(__file__).parents[2] / "fixtures" / "patient_delete_authorization"
 
 
 def _fixture_payload(name: str) -> dict:
@@ -455,7 +453,13 @@ def test_streamlit_app_renders_only_the_current_wizard_page(
     monkeypatch.setenv("TRIAGEGUARD_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("TRIAGEGUARD_LLM_MODE", "replay")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    app_path = Path(__file__).parents[2] / "src" / "triageguard" / "ui" / "app.py"
+    app_path = (
+        Path(__file__).parents[2]
+        / "src"
+        / "triageguard"
+        / "ui"
+        / "milestone_one_app.py"
+    )
 
     app = AppTest.from_file(str(app_path), default_timeout=10).run()
 
@@ -478,9 +482,7 @@ def test_streamlit_app_renders_only_the_current_wizard_page(
 
     buttons["Next: Review risk"].click().run()
     assert not app.exception
-    assert [header.value for header in app.header] == [
-        "2. Review the security risk"
-    ]
+    assert [header.value for header in app.header] == ["2. Review the security risk"]
     buttons = {button.label: button for button in app.button}
     assert set(buttons) == {"Back", "Use this risk", "Next: Review test"}
     assert buttons["Next: Review test"].disabled is True
@@ -492,8 +494,9 @@ def test_streamlit_app_renders_only_the_current_wizard_page(
         "3. Review and generate the test"
     ]
     assert (
-        app.session_state.filtered_state["triageguard_milestone_one_state"]
-        .prepared.run_id
+        app.session_state.filtered_state[
+            "triageguard_milestone_one_state"
+        ].prepared.run_id
         == original_run_id
     )
 
@@ -505,7 +508,13 @@ def test_guided_replay_run_explains_the_regression_without_requiring_json(
     monkeypatch.setenv("TRIAGEGUARD_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("TRIAGEGUARD_LLM_MODE", "replay")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    app_path = Path(__file__).parents[2] / "src" / "triageguard" / "ui" / "app.py"
+    app_path = (
+        Path(__file__).parents[2]
+        / "src"
+        / "triageguard"
+        / "ui"
+        / "milestone_one_app.py"
+    )
     app = AppTest.from_file(str(app_path), default_timeout=45).run()
 
     buttons = {button.label: button for button in app.button}
@@ -524,13 +533,9 @@ def test_guided_replay_run_explains_the_regression_without_requiring_json(
 
     assert not app.exception
     assert any(
-        item.value == "Potential security regression detected"
-        for item in app.subheader
+        item.value == "Potential security regression detected" for item in app.subheader
     )
-    assert any(
-        "without the required permission" in item.value
-        for item in app.error
-    )
+    assert any("without the required permission" in item.value for item in app.error)
     table = app.dataframe[0].value
     assert list(table["Version"]) == ["Secure base", "Candidate"]
     assert list(table["Meaning"]) == [
@@ -558,8 +563,7 @@ def test_guided_replay_run_explains_the_regression_without_requiring_json(
     assert "7.1 High" in rendered_text
     assert "Provisional CVSS 4.0" in rendered_text
     assert (
-        "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:H/VA:N/"
-        "SC:N/SI:N/SA:N"
+        "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N"
     ) in rendered_text
     assert "0.0" not in rendered_text
     assert "score delta" not in rendered_text.lower()
@@ -583,9 +587,7 @@ def test_guided_replay_run_explains_the_regression_without_requiring_json(
         for item in collection
         if isinstance(item.value, str)
     )
-    rendered_state = app.session_state.filtered_state[
-        "triageguard_milestone_one_state"
-    ]
+    rendered_state = app.session_state.filtered_state["triageguard_milestone_one_state"]
     for metric in rendered_state.result.severity_assessment.candidate.metrics:
         assert f"{metric.metric}: {metric.value}" in details_text
         assert metric.rationale in details_text
@@ -594,8 +596,9 @@ def test_guided_replay_run_explains_the_regression_without_requiring_json(
     assert "Expert judgment" in details_text
     assert "not measured by pytest" in details_text
     assert (
-        app.session_state.filtered_state["triageguard_milestone_one_state"]
-        .result.status.value
+        app.session_state.filtered_state[
+            "triageguard_milestone_one_state"
+        ].result.status.value
         == "candidate_regression_observed"
     )
     completed_state = rendered_state
@@ -619,18 +622,14 @@ def test_guided_replay_run_explains_the_regression_without_requiring_json(
 
     buttons = {button.label: button for button in app.button}
     buttons["Next: Run comparison"].click().run()
-    returned_state = app.session_state.filtered_state[
-        "triageguard_milestone_one_state"
-    ]
+    returned_state = app.session_state.filtered_state["triageguard_milestone_one_state"]
     assert [header.value for header in app.header] == ["4. Run the comparison"]
     assert returned_state.result == completed_result
     assert event_log.read_text(encoding="utf-8") == events_before_navigation
 
     buttons = {button.label: button for button in app.button}
     buttons["Start New Run"].click().run()
-    replacement = app.session_state.filtered_state[
-        "triageguard_milestone_one_state"
-    ]
+    replacement = app.session_state.filtered_state["triageguard_milestone_one_state"]
     assert [header.value for header in app.header] == ["1. Understand the change"]
     assert replacement.current_page == 1
     assert replacement.prepared.run_id != completed_run_id
@@ -642,7 +641,13 @@ def test_live_configuration_without_credentials_fails_before_state_creation(
     monkeypatch.setenv("TRIAGEGUARD_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("TRIAGEGUARD_LLM_MODE", "live")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    app_path = Path(__file__).parents[2] / "src" / "triageguard" / "ui" / "app.py"
+    app_path = (
+        Path(__file__).parents[2]
+        / "src"
+        / "triageguard"
+        / "ui"
+        / "milestone_one_app.py"
+    )
 
     app = AppTest.from_file(str(app_path), default_timeout=10).run()
 
@@ -679,7 +684,13 @@ def test_generation_failure_view_never_contains_raw_exception_text(
 
 
 def test_import_is_side_effect_free_and_entrypoint_is_guarded(tmp_path: Path) -> None:
-    app_path = Path(__file__).parents[2] / "src" / "triageguard" / "ui" / "app.py"
+    app_path = (
+        Path(__file__).parents[2]
+        / "src"
+        / "triageguard"
+        / "ui"
+        / "milestone_one_app.py"
+    )
     tree = ast.parse(app_path.read_text(encoding="utf-8"))
     guarded_calls = [
         node
@@ -697,7 +708,7 @@ def test_import_is_side_effect_free_and_entrypoint_is_guarded(tmp_path: Path) ->
     environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
     environment["TRIAGEGUARD_ARTIFACTS_DIR"] = str(tmp_path / "artifacts")
     completed = subprocess.run(
-        [sys.executable, "-c", "import triageguard.ui.app"],
+        [sys.executable, "-c", "import triageguard.ui.milestone_one_app"],
         cwd=tmp_path,
         env=environment,
         capture_output=True,
@@ -826,7 +837,13 @@ def test_invalid_provider_app_configuration_creates_no_gateway_or_run(
 ) -> None:
     monkeypatch.setenv("TRIAGEGUARD_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("TRIAGEGUARD_LLM_PROVIDER", "openai")
-    app_path = Path(__file__).parents[2] / "src" / "triageguard" / "ui" / "app.py"
+    app_path = (
+        Path(__file__).parents[2]
+        / "src"
+        / "triageguard"
+        / "ui"
+        / "milestone_one_app.py"
+    )
 
     app = AppTest.from_file(str(app_path), default_timeout=10).run()
 
@@ -845,7 +862,13 @@ def test_invalid_repeat_configuration_fails_before_evidence_widget(
 ) -> None:
     monkeypatch.setenv("TRIAGEGUARD_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("TRIAGEGUARD_REPEAT_COUNT", "21")
-    app_path = Path(__file__).parents[2] / "src" / "triageguard" / "ui" / "app.py"
+    app_path = (
+        Path(__file__).parents[2]
+        / "src"
+        / "triageguard"
+        / "ui"
+        / "milestone_one_app.py"
+    )
 
     app = AppTest.from_file(str(app_path), default_timeout=10).run()
 
@@ -918,7 +941,13 @@ def test_streamlit_terminal_reset_replaces_session_workflow_with_fresh_run(
     old_run_id = terminal_state.prepared.run_id
 
     monkeypatch.setenv("TRIAGEGUARD_ARTIFACTS_DIR", str(tmp_path / "app"))
-    app_path = Path(__file__).parents[2] / "src" / "triageguard" / "ui" / "app.py"
+    app_path = (
+        Path(__file__).parents[2]
+        / "src"
+        / "triageguard"
+        / "ui"
+        / "milestone_one_app.py"
+    )
     app = AppTest.from_file(str(app_path), default_timeout=10).run()
     app.session_state["triageguard_milestone_one_state"] = terminal_state
     app.run()
@@ -937,9 +966,7 @@ def test_streamlit_terminal_reset_replaces_session_workflow_with_fresh_run(
     assert buttons["Start New Run"].disabled is False
     buttons["Start New Run"].click().run()
 
-    replacement = app.session_state.filtered_state[
-        "triageguard_milestone_one_state"
-    ]
+    replacement = app.session_state.filtered_state["triageguard_milestone_one_state"]
     assert replacement.prepared.run_id != old_run_id
     assert replacement.result is None
     assert replacement.generated is None

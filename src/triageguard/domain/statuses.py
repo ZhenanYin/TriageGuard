@@ -16,6 +16,9 @@ class MilestoneTwoStatus(str, Enum):
     APPROVED_GHERKIN = "approved_gherkin"
     NO_MEANINGFUL_SECURITY_RISK_FOUND = "no_meaningful_security_risk_found"
     INSUFFICIENT_CONTEXT_TO_ASSESS = "insufficient_context_to_assess"
+    INSUFFICIENT_FROZEN_EVIDENCE_FOR_SCENARIO = (
+        "insufficient_frozen_evidence_for_scenario"
+    )
     STALE = "stale"
     FAILED = "failed"
 

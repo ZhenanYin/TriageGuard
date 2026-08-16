@@ -1,8 +1,10 @@
 """Tests for LLM-generated Gherkin bound to a human-reviewed risk."""
 
+import hashlib
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from triageguard.contracts.gherkin_generation import (
     GherkinGenerationError,
@@ -10,12 +12,23 @@ from triageguard.contracts.gherkin_generation import (
     approve_gherkin,
     build_gherkin_request,
     generate_gherkin,
+    validate_edited_gherkin,
     validate_gherkin_candidate,
 )
 from triageguard.domain.pr_analysis import (
     ClaimEvidenceBinding,
+    ContextAnchor,
+    ContextBundle,
+    GherkinCandidateDraft,
+    GherkinStepEvidenceBinding,
     HumanReviewedRisk,
     RiskHypothesisDraft,
+)
+from triageguard.domain.pr_analysis import (
+    TestabilityAssessment as ValidatedTestabilityAssessment,
+)
+from triageguard.domain.pr_analysis import (
+    TestabilityBinding as FrozenTestabilityBinding,
 )
 from triageguard.llm.replay_gateway import ReplayGateway
 from triageguard.provenance import canonical_sha256
@@ -48,6 +61,11 @@ def _human_review() -> HumanReviewedRisk:
         evidence_bindings=(
             ClaimEvidenceBinding(
                 claim_field="actor",
+                observable_index=None,
+                anchor_ids=("anchor-integration",),
+            ),
+            ClaimEvidenceBinding(
+                claim_field="explanation",
                 observable_index=None,
                 anchor_ids=("anchor-integration",),
             ),
@@ -96,26 +114,110 @@ def _human_review() -> HumanReviewedRisk:
     )
 
 
-def test_gherkin_request_is_bound_to_the_human_review() -> None:
-    """The model request contains the exact approved risk, not a raw proposal."""
-    human_review = _human_review()
+def _context() -> ContextBundle:
+    """Return saved integration-change evidence for the approved risk."""
+    text = "void purgePatient(Patient patient) {\n    deletePatient(patient);\n}\n"
+    anchor = ContextAnchor(
+        anchor_id="anchor-integration",
+        revision_role="candidate",
+        commit_sha="d" * 40,
+        blob_sha="e" * 40,
+        path="api/PatientService.java",
+        java_symbol="purgePatient",
+        start_line=1,
+        end_line=3,
+        text=text,
+        text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        selection_reason="primary integration change",
+        score_components=(),
+        change_relation="integration_change",
+        truncated=False,
+    )
+    return ContextBundle.from_content(
+        snapshot_key="a" * 64,
+        anchors=(anchor,),
+        selected_file_count=1,
+        selected_anchor_count=1,
+        selected_bytes=len(text.encode("utf-8")),
+        max_files=10,
+        max_anchors=20,
+        max_bytes=40_000,
+        max_anchor_lines=40,
+        max_blob_bytes=40_000,
+        max_search_identifiers=20,
+        max_hits_per_identifier=10,
+        primary_change_represented=True,
+    )
 
-    request = build_gherkin_request(human_review)
+
+def _testability_assessment(
+    human_review: HumanReviewedRisk,
+    context: ContextBundle,
+) -> ValidatedTestabilityAssessment:
+    """Return one locally shaped testability approval for the frozen anchor."""
+    return ValidatedTestabilityAssessment.from_content(
+        snapshot_key=human_review.snapshot_key,
+        context_sha256=context.context_sha256,
+        reviewed_risk_sha256=human_review.reviewed_content_sha256,
+        decision="testable_from_frozen_evidence",
+        bindings=(
+            FrozenTestabilityBinding(
+                role="setup",
+                anchor_ids=("anchor-integration",),
+            ),
+            FrozenTestabilityBinding(
+                role="action",
+                anchor_ids=("anchor-integration",),
+            ),
+            FrozenTestabilityBinding(
+                role="observable",
+                anchor_ids=("anchor-integration",),
+            ),
+        ),
+        evidence_needs=(),
+        explanation=(
+            "The saved integration change supplies setup, action, and an "
+            "observable authorization outcome."
+        ),
+        generated_at=datetime(2026, 8, 16, tzinfo=UTC),
+        validated_at=datetime(2026, 8, 16, tzinfo=UTC),
+    )
+
+
+def test_gherkin_request_is_bound_to_the_human_review() -> None:
+    """The request uses one approved risk and locally testable frozen evidence."""
+    human_review = _human_review()
+    context = _context()
+    assessment = _testability_assessment(human_review, context)
+
+    request = build_gherkin_request(
+        human_review=human_review,
+        testability_assessment=assessment,
+        context=context,
+    )
 
     assert request.purpose == "gherkin_generation"
     assert request.payload["snapshot_key"] == human_review.snapshot_key
     assert request.payload["reviewed_risk_sha256"] == canonical_sha256(
         human_review.reviewed_risk.model_dump(mode="json")
     )
+    assert request.payload["testability_assessment_sha256"] == (
+        assessment.assessment_sha256
+    )
+    assert request.payload["context_sha256"] == context.context_sha256
     assert request.payload["approved_risk"] == human_review.reviewed_risk.model_dump(
         mode="json"
     )
+    assert request.payload["context_anchors"] == [
+        anchor.model_dump(mode="json") for anchor in context.anchors
+    ]
     assert request.output_schema["additionalProperties"] is False
 
 
 def _candidate_response(human_review: HumanReviewedRisk) -> dict[str, object]:
     """Return one locally replayed structured Gherkin response."""
     approved_risk = human_review.reviewed_risk
+    context = _context()
     steps = [
         {
             "number": 1,
@@ -165,6 +267,7 @@ def _candidate_response(human_review: HumanReviewedRisk) -> dict[str, object]:
 
     return {
         "snapshot_key": human_review.snapshot_key,
+        "context_sha256": context.context_sha256,
         "reviewed_risk_sha256": human_review.reviewed_content_sha256,
         "approved_risk": approved_risk.model_dump(mode="json"),
         "feature_title": feature_title,
@@ -208,6 +311,13 @@ def _candidate_response(human_review: HumanReviewedRisk) -> dict[str, object]:
                 "step_numbers": [6],
             },
         ],
+        "step_evidence_bindings": [
+            {
+                "step_number": number,
+                "anchor_ids": ["anchor-integration"],
+            }
+            for number in range(1, 7)
+        ],
         "testability_notes": ["Run the scenario against an OpenMRS test environment."],
         "setup_gaps": [],
         "generated_at": "2026-08-12T00:00:00Z",
@@ -223,8 +333,13 @@ def test_generate_gherkin_returns_a_locally_identified_candidate() -> None:
         }
     )
 
+    context = _context()
+    assessment = _testability_assessment(human_review, context)
+
     candidate, response = generate_gherkin(
         human_review=human_review,
+        testability_assessment=assessment,
+        context=context,
         gateway=gateway,
     )
 
@@ -237,8 +352,12 @@ def test_generate_gherkin_returns_a_locally_identified_candidate() -> None:
 
 def _candidate(human_review: HumanReviewedRisk):
     """Return one locally validated candidate from the replay fixture."""
+    context = _context()
+    assessment = _testability_assessment(human_review, context)
     candidate, _ = generate_gherkin(
         human_review=human_review,
+        testability_assessment=assessment,
+        context=context,
         gateway=ReplayGateway(
             {
                 "gherkin_generation": _candidate_response(human_review),
@@ -265,6 +384,7 @@ def test_edit_cannot_remove_the_failure_oracle() -> None:
             candidate=candidate,
             text=edited_text,
             human_review=human_review,
+            context=_context(),
         )
 
 
@@ -276,6 +396,7 @@ def test_approve_gherkin_binds_exact_candidate_and_review_hashes() -> None:
     approval = approve_gherkin(
         candidate=candidate,
         human_review=human_review,
+        context=_context(),
         approved_at=datetime(2026, 8, 12, tzinfo=UTC),
     )
 
@@ -295,9 +416,11 @@ def test_candidate_validation_accepts_the_exact_reviewed_scenario() -> None:
     report = validate_gherkin_candidate(
         candidate=candidate,
         human_review=human_review,
+        context=_context(),
     )
 
     assert report.approved is True
+    assert report.decision == "valid_evidence_bound_gherkin"
     assert report.reason_codes == ()
 
 
@@ -319,6 +442,7 @@ def test_edit_rejects_step_insertion_and_reordering() -> None:
             candidate=candidate,
             text=inserted_step_text,
             human_review=human_review,
+            context=_context(),
         )
 
     reordered_step_text = candidate.gherkin_text.replace(
@@ -339,15 +463,173 @@ def test_edit_rejects_step_insertion_and_reordering() -> None:
             candidate=candidate,
             text=reordered_step_text,
             human_review=human_review,
+            context=_context(),
         )
 
 
 def test_gherkin_request_rejects_a_tampered_human_review() -> None:
     """A changed review hash cannot be used to request a new scenario."""
     human_review = _human_review()
+    context = _context()
+    assessment = _testability_assessment(human_review, context)
     tampered_review = human_review.model_copy(
         update={"reviewed_content_sha256": "f" * 64}
     )
 
     with pytest.raises(ValueError, match="human review"):
-        build_gherkin_request(tampered_review)
+        build_gherkin_request(
+            human_review=tampered_review,
+            testability_assessment=assessment,
+            context=context,
+        )
+
+
+def test_candidate_records_current_context_and_evidence_for_every_step() -> None:
+    """Every generated Gherkin step must name frozen evidence in its context."""
+    human_review = _human_review()
+    context = _context()
+    response_data = _candidate_response(human_review)
+    response_data["context_sha256"] = context.context_sha256
+    response_data["step_evidence_bindings"] = [
+        {
+            "step_number": number,
+            "anchor_ids": ["anchor-integration"],
+        }
+        for number in range(1, 7)
+    ]
+
+    candidate = GherkinCandidateDraft.model_validate(response_data)
+
+    assert candidate.context_sha256 == context.context_sha256
+    assert candidate.step_evidence_bindings == (
+        GherkinStepEvidenceBinding(
+            step_number=1,
+            anchor_ids=("anchor-integration",),
+        ),
+        GherkinStepEvidenceBinding(
+            step_number=2,
+            anchor_ids=("anchor-integration",),
+        ),
+        GherkinStepEvidenceBinding(
+            step_number=3,
+            anchor_ids=("anchor-integration",),
+        ),
+        GherkinStepEvidenceBinding(
+            step_number=4,
+            anchor_ids=("anchor-integration",),
+        ),
+        GherkinStepEvidenceBinding(
+            step_number=5,
+            anchor_ids=("anchor-integration",),
+        ),
+        GherkinStepEvidenceBinding(
+            step_number=6,
+            anchor_ids=("anchor-integration",),
+        ),
+    )
+
+
+def test_candidate_rejects_missing_step_evidence() -> None:
+    """A scenario cannot leave one of its steps without frozen-code support."""
+    human_review = _human_review()
+    context = _context()
+    response_data = _candidate_response(human_review)
+    response_data["context_sha256"] = context.context_sha256
+    response_data["step_evidence_bindings"] = [
+        {
+            "step_number": 1,
+            "anchor_ids": ["anchor-integration"],
+        }
+    ]
+
+    with pytest.raises(ValidationError, match="step evidence bindings"):
+        GherkinCandidateDraft.model_validate(response_data)
+
+
+def test_edited_gherkin_classifies_evidence_bound_scenario_as_valid() -> None:
+    """An unchanged scenario remains valid for its exact frozen context."""
+    human_review = _human_review()
+    context = _context()
+    candidate = _candidate(human_review)
+
+    report = validate_edited_gherkin(
+        candidate=candidate,
+        text=candidate.gherkin_text,
+        human_review=human_review,
+        context=context,
+    )
+
+    assert report.approved is True
+    assert report.decision == "valid_evidence_bound_gherkin"
+    assert report.reason_codes == ()
+
+
+def test_edited_gherkin_classifies_removed_failure_oracle_as_hypothesis_changed() -> (
+    None
+):
+    """Removing a required security outcome changes the approved risk idea."""
+    human_review = _human_review()
+    context = _context()
+    candidate = _candidate(human_review)
+    edited_text = candidate.gherkin_text.replace(
+        human_review.reviewed_risk.possible_failure,
+        "the request completes normally",
+    )
+
+    report = validate_edited_gherkin(
+        candidate=candidate,
+        text=edited_text,
+        human_review=human_review,
+        context=context,
+    )
+
+    assert report.approved is False
+    assert report.decision == "hypothesis_changed"
+    assert "bound_risk_term_removed" in report.reason_codes
+
+
+def test_edited_gherkin_classifies_new_unbound_identifier_as_needing_evidence() -> None:
+    """A new route-like code identifier needs saved code evidence before approval."""
+    human_review = _human_review()
+    context = _context()
+    candidate = _candidate(human_review)
+    edited_text = candidate.gherkin_text.replace(
+        "When the user requests deletePatient for a patient record",
+        (
+            "When the user requests deletePatient through "
+            "authorizePatientDeletion for a patient record"
+        ),
+    )
+
+    report = validate_edited_gherkin(
+        candidate=candidate,
+        text=edited_text,
+        human_review=human_review,
+        context=context,
+    )
+
+    assert report.approved is False
+    assert report.decision == "needs_more_frozen_evidence"
+    assert "unbound_code_identifier" in report.reason_codes
+
+
+def test_edited_gherkin_classifies_executable_content_as_invalid() -> None:
+    """Executable-looking content cannot be smuggled into a scenario step."""
+    human_review = _human_review()
+    context = _context()
+    candidate = _candidate(human_review)
+    edited_text = candidate.gherkin_text.replace(
+        human_review.reviewed_risk.expected_secure_behavior,
+        human_review.reviewed_risk.expected_secure_behavior + " and import os",
+    )
+
+    report = validate_edited_gherkin(
+        candidate=candidate,
+        text=edited_text,
+        human_review=human_review,
+        context=context,
+    )
+
+    assert report.approved is False
+    assert report.decision == "invalid_gherkin"
+    assert "gherkin_text_contains_implementation_code" in report.reason_codes

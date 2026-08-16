@@ -115,6 +115,11 @@ def _risk_draft(
                 anchor_ids=("anchor-integration",),
             ),
             ClaimEvidenceBinding(
+                claim_field="explanation",
+                observable_index=None,
+                anchor_ids=("anchor-integration",),
+            ),
+            ClaimEvidenceBinding(
                 claim_field="action",
                 observable_index=None,
                 anchor_ids=("anchor-integration",),

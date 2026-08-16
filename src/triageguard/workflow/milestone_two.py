@@ -15,7 +15,9 @@ from typing import Protocol
 from triageguard.analysis.context import ContextLimits
 from triageguard.config import Settings
 from triageguard.contracts import (
+    GherkinValidationReport,
     apply_gherkin_text_edit,
+    validate_edited_gherkin,
     validate_gherkin_candidate,
 )
 from triageguard.contracts import (
@@ -26,7 +28,9 @@ from triageguard.contracts import (
 )
 from triageguard.domain import (
     ContextBundle,
+    ContextRefinement,
     DiffArtifact,
+    FrozenEvidenceNeed,
     GherkinApproval,
     GherkinCandidate,
     HumanReviewedRisk,
@@ -36,6 +40,8 @@ from triageguard.domain import (
     RiskAssessment,
     RiskAssessmentDraft,
     SnapshotFreshness,
+    TestabilityAssessment,
+    TestabilityAssessmentDraft,
 )
 from triageguard.hypotheses import (
     RiskGroundingReport,
@@ -51,6 +57,12 @@ from triageguard.research.recorder import (
     LifecycleEventType,
     TransformationEvent,
 )
+from triageguard.testability.generator import (
+    generate_testability_assessment,
+)
+from triageguard.testability.validator import (
+    validate_testability_assessment,
+)
 
 
 class MilestoneTwoTransitionError(RuntimeError):
@@ -64,7 +76,10 @@ class _State(str, Enum):
     PREPARED = "prepared"
     RISKS_READY = "risks_ready"
     RISK_APPROVED = "risk_approved"
+    TESTABILITY_READY = "testability_ready"
+    EVIDENCE_REFINEMENT_REQUIRED = "evidence_refinement_required"
     GHERKIN_READY = "gherkin_ready"
+    GHERKIN_VALIDATED = "gherkin_validated"
     STALE = "stale"
     FINALIZED = "finalized"
 
@@ -112,6 +127,22 @@ class _ContextBuilder(Protocol):
         """Build the bounded evidence catalog for this frozen snapshot."""
 
 
+class _EvidenceRefiner(Protocol):
+    """Refine only the already frozen evidence for one prepared pull request."""
+
+    def refine(
+        self,
+        *,
+        snapshot: PullRequestSnapshot,
+        context: ContextBundle,
+        assessment: TestabilityAssessment,
+        store: object,
+        limits: ContextLimits,
+        created_at: datetime,
+    ) -> tuple[ContextBundle, ContextRefinement]:
+        """Return a successor context or an exhausted refinement record."""
+
+
 @dataclass(frozen=True)
 class MilestoneTwoDependencies:
     """Exact dependencies required to resume one authenticated workflow run."""
@@ -123,6 +154,7 @@ class MilestoneTwoDependencies:
     context_builder: _ContextBuilder
     store: object
     gateway: StructuredModelGateway
+    evidence_refiner: _EvidenceRefiner | None = None
 
 
 def _with_workflow_lease(method):
@@ -139,6 +171,73 @@ def _with_workflow_lease(method):
     return wrapped
 
 
+def _gherkin_evidence_assessment(
+    *,
+    candidate: GherkinCandidate,
+    human_review: HumanReviewedRisk,
+    context: ContextBundle,
+    generated_at: datetime,
+) -> TestabilityAssessment:
+    """Turn an unsupported scenario edit into a bounded frozen-code search."""
+    anchors_by_id = {anchor.anchor_id: anchor for anchor in context.anchors}
+    candidate_anchor_ids = tuple(
+        anchor_id
+        for binding in candidate.step_evidence_bindings
+        for anchor_id in binding.anchor_ids
+        if anchor_id in anchors_by_id
+        and anchors_by_id[anchor_id].change_relation == "integration_change"
+    )
+    review_anchor_ids = tuple(
+        anchor_id
+        for anchor_id in human_review.reviewed_risk.citation_anchor_ids
+        if anchor_id in anchors_by_id
+        and anchors_by_id[anchor_id].change_relation == "integration_change"
+    )
+    supporting_anchor_ids = tuple(
+        dict.fromkeys(candidate_anchor_ids + review_anchor_ids)
+    )
+    search_terms = tuple(dict.fromkeys(human_review.reviewed_risk.code_identifiers))
+    if not supporting_anchor_ids or not search_terms:
+        raise MilestoneTwoTransitionError(
+            "Cannot refine frozen evidence: the approved risk does not provide "
+            "a bound code search target."
+        )
+
+    need = FrozenEvidenceNeed(
+        need_id=(
+            "gherkin-edit-"
+            + canonical_sha256(
+                {
+                    "candidate": canonical_sha256(candidate.model_dump(mode="json")),
+                    "reviewed_risk": human_review.reviewed_content_sha256,
+                    "context": context.context_sha256,
+                }
+            )[:16]
+        ),
+        category="entry_point",
+        search_terms=search_terms,
+        explanation=(
+            "The edited scenario needs additional frozen code evidence for an "
+            "entry point tied to the approved risk before it can be supported."
+        ),
+        supporting_anchor_ids=supporting_anchor_ids,
+    )
+    return TestabilityAssessment.from_content(
+        snapshot_key=human_review.snapshot_key,
+        context_sha256=context.context_sha256,
+        reviewed_risk_sha256=human_review.reviewed_content_sha256,
+        decision="needs_more_frozen_evidence",
+        bindings=(),
+        evidence_needs=(need,),
+        explanation=(
+            "The edited scenario is not fully supported by the current frozen "
+            "code evidence."
+        ),
+        generated_at=generated_at,
+        validated_at=generated_at,
+    )
+
+
 class MilestoneTwoWorkflow:
     """Coordinate one human-gated Milestone 2 pull-request analysis run."""
 
@@ -153,6 +252,7 @@ class MilestoneTwoWorkflow:
         context_builder: _ContextBuilder,
         store: object,
         gateway: StructuredModelGateway,
+        evidence_refiner: _EvidenceRefiner | None = None,
         _run_handle: RunHandle | None = None,
     ) -> None:
         """Create an empty run before any PR, Git, or model operation occurs."""
@@ -163,6 +263,7 @@ class MilestoneTwoWorkflow:
         self._context_builder = context_builder
         self._store = store
         self._gateway = gateway
+        self._evidence_refiner = evidence_refiner
         self._operation_lock = RLock()
 
         self._started_at = datetime.now(UTC)
@@ -181,8 +282,14 @@ class MilestoneTwoWorkflow:
         self._risk_grounding_report: RiskGroundingReport | None = None
         self._freshness: SnapshotFreshness | None = None
         self._human_reviewed_risk: HumanReviewedRisk | None = None
+        self._testability_draft: TestabilityAssessmentDraft | None = None
+        self._testability_response: ModelResponse | None = None
+        self._testability_assessment: TestabilityAssessment | None = None
+        self._context_refinements: list[ContextRefinement] = []
         self._gherkin_candidate: GherkinCandidate | None = None
         self._gherkin_response: ModelResponse | None = None
+        self._gherkin_validation_report: GherkinValidationReport | None = None
+        self._validated_gherkin_text: str | None = None
         self._gherkin_approval: GherkinApproval | None = None
         self._terminal_record: MilestoneTwoRunRecord | None = None
 
@@ -207,9 +314,24 @@ class MilestoneTwoWorkflow:
         return self._human_reviewed_risk
 
     @property
+    def testability_assessment(self) -> TestabilityAssessment | None:
+        """Return the current locally validated frozen-evidence decision."""
+        return self._testability_assessment
+
+    @property
+    def context_refinements(self) -> tuple[ContextRefinement, ...]:
+        """Return the immutable frozen-evidence refinements in this run."""
+        return tuple(self._context_refinements)
+
+    @property
     def gherkin_candidate(self) -> GherkinCandidate | None:
         """Return the locally validated Gherkin candidate after generation."""
         return self._gherkin_candidate
+
+    @property
+    def gherkin_validation_report(self) -> GherkinValidationReport | None:
+        """Return the latest local decision about the edited Gherkin text."""
+        return self._gherkin_validation_report
 
     @property
     def gherkin_approval(self) -> GherkinApproval | None:
@@ -344,12 +466,208 @@ class MilestoneTwoWorkflow:
         return review
 
     @_with_workflow_lease
+    def assess_testability(self) -> TestabilityAssessment:
+        """Assess whether frozen code evidence can support an executable scenario."""
+        if self._state is not _State.RISK_APPROVED or self._human_reviewed_risk is None:
+            raise MilestoneTwoTransitionError(
+                "Cannot assess testability: approve a risk before continuing."
+            )
+
+        prepared = self._require_prepared("assess testability")
+        freshness = self._snapshot_acquirer.recheck(prepared.snapshot)
+        self._freshness = freshness
+        if freshness.status == "stale":
+            self._state = _State.STALE
+            raise MilestoneTwoTransitionError(
+                "snapshot_stale: the pull request changed before "
+                "testability assessment."
+            )
+        if freshness.status != "current":
+            raise MilestoneTwoTransitionError(
+                "snapshot_currentness_unknown: testability assessment requires "
+                "a current snapshot."
+            )
+
+        draft, response = generate_testability_assessment(
+            human_review=self._human_reviewed_risk,
+            context=prepared.context,
+            gateway=self._gateway,
+        )
+        assessment, _report = validate_testability_assessment(
+            draft=draft,
+            human_review=self._human_reviewed_risk,
+            context=prepared.context,
+        )
+        if assessment is None:
+            raise MilestoneTwoTransitionError(
+                "Cannot assess testability: local validation rejected the model output."
+            )
+
+        if self._is_typed_prepared(prepared):
+            self._persist_testability_assessment(
+                prepared=prepared,
+                human_review=self._human_reviewed_risk,
+                draft=draft,
+                assessment=assessment,
+                response=response,
+                freshness=freshness,
+            )
+
+        self._testability_draft = draft
+        self._testability_response = response
+        self._testability_assessment = assessment
+        if assessment.decision == "testable_from_frozen_evidence":
+            self._state = _State.TESTABILITY_READY
+        else:
+            self._state = _State.EVIDENCE_REFINEMENT_REQUIRED
+        return assessment
+
+    @_with_workflow_lease
+    def refine_frozen_evidence(self) -> ContextRefinement:
+        """Replace the context only with bounded code from saved snapshots."""
+        if (
+            self._state is not _State.EVIDENCE_REFINEMENT_REQUIRED
+            or self._human_reviewed_risk is None
+            or self._testability_assessment is None
+        ):
+            raise MilestoneTwoTransitionError(
+                "Cannot refine frozen evidence: a reviewed risk needs more "
+                "frozen evidence before continuing."
+            )
+        if self._evidence_refiner is None:
+            raise MilestoneTwoTransitionError(
+                "Cannot refine frozen evidence: no frozen-evidence refiner "
+                "is configured."
+            )
+
+        prepared = self._require_prepared("refine frozen evidence")
+        freshness = self._snapshot_acquirer.recheck(prepared.snapshot)
+        self._freshness = freshness
+        if freshness.status == "stale":
+            self._state = _State.STALE
+            raise MilestoneTwoTransitionError(
+                "snapshot_stale: the pull request changed before frozen "
+                "evidence refinement."
+            )
+        if freshness.status != "current":
+            raise MilestoneTwoTransitionError(
+                "snapshot_currentness_unknown: frozen evidence refinement "
+                "requires a current snapshot."
+            )
+
+        refined_context, refinement = self._evidence_refiner.refine(
+            snapshot=prepared.snapshot,
+            context=prepared.context,
+            assessment=self._testability_assessment,
+            store=self._store,
+            limits=ContextLimits.from_settings(self._settings),
+            created_at=datetime.now(UTC),
+        )
+        if refinement.exhausted:
+            if self._is_typed_prepared(prepared) and isinstance(
+                self._testability_assessment,
+                TestabilityAssessment,
+            ):
+                self._persist_exhausted_context_refinement(
+                    prepared=prepared,
+                    human_review=self._human_reviewed_risk,
+                    assessment=self._testability_assessment,
+                    refinement=refinement,
+                    freshness=freshness,
+                )
+            self._context_refinements.append(refinement)
+            return refinement
+
+        self._context_refinements.append(refinement)
+        self._prepared = PreparedPullRequest(
+            snapshot=prepared.snapshot,
+            diffs=prepared.diffs,
+            context=refined_context,
+        )
+        self._risk_draft = None
+        self._risk_response = None
+        self._risk_assessment = None
+        self._risk_grounding_report = None
+        self._human_reviewed_risk = None
+        self._testability_draft = None
+        self._testability_response = None
+        self._testability_assessment = None
+        self._gherkin_candidate = None
+        self._gherkin_response = None
+        self._gherkin_validation_report = None
+        self._validated_gherkin_text = None
+        self._gherkin_approval = None
+        self._state = _State.PREPARED
+        return refinement
+
+    @_with_workflow_lease
+    def finish_with_insufficient_frozen_evidence(self) -> MilestoneTwoRunRecord:
+        """Seal an exhausted frozen-evidence search without treating it as safe."""
+        if (
+            self._state is not _State.EVIDENCE_REFINEMENT_REQUIRED
+            or self._risk_assessment is None
+            or self._human_reviewed_risk is None
+            or self._testability_assessment is None
+            or self._testability_assessment.decision != "needs_more_frozen_evidence"
+            or not self._context_refinements
+            or not self._context_refinements[-1].exhausted
+        ):
+            raise MilestoneTwoTransitionError(
+                "Cannot finish with insufficient frozen evidence: an exhausted "
+                "frozen-evidence refinement is required before continuing."
+            )
+
+        prepared = self._require_prepared("finish with insufficient frozen evidence")
+        freshness = self._snapshot_acquirer.recheck(prepared.snapshot)
+        self._freshness = freshness
+        if freshness.status == "stale":
+            self._state = _State.STALE
+            raise MilestoneTwoTransitionError(
+                "snapshot_stale: the pull request changed before finalization."
+            )
+        if freshness.status != "current":
+            raise MilestoneTwoTransitionError(
+                "snapshot_currentness_unknown: finalization requires "
+                "a current snapshot."
+            )
+
+        record = MilestoneTwoRunRecord(
+            run_id=self._run_handle.run_id,
+            snapshot=prepared.snapshot,
+            status=MilestoneTwoStatus.INSUFFICIENT_FROZEN_EVIDENCE_FOR_SCENARIO,
+            reason_code="insufficient_frozen_evidence_for_scenario",
+            explanation=(
+                "Insufficient frozen code evidence to design an executable scenario."
+            ),
+            started_at=self._started_at,
+            finished_at=datetime.now(UTC),
+            freshness=freshness,
+            risk_assessment=self._risk_assessment,
+            human_reviewed_risk=self._human_reviewed_risk,
+            testability_assessment=self._testability_assessment,
+            context_refinements=tuple(self._context_refinements),
+            gherkin_candidate=None,
+            gherkin_approval=None,
+        )
+        self._write_final_measurements(record)
+        self._recorder.finalize_run(self._run_handle, record)
+
+        self._terminal_record = record
+        self._state = _State.FINALIZED
+        return record
+
+    @_with_workflow_lease
     def generate_gherkin(self) -> GherkinCandidate:
         """Recheck freshness and generate one candidate for the approved risk."""
         prepared = self._require_prepared("generate Gherkin")
-        if self._state is not _State.RISK_APPROVED or self._human_reviewed_risk is None:
+        if (
+            self._state is not _State.TESTABILITY_READY
+            or self._human_reviewed_risk is None
+            or self._testability_assessment is None
+        ):
             raise MilestoneTwoTransitionError(
-                "Cannot generate Gherkin: approve a risk before continuing."
+                "Cannot generate Gherkin: assess testability after approving "
+                "a risk before continuing."
             )
         freshness = self._snapshot_acquirer.recheck(prepared.snapshot)
         self._freshness = freshness
@@ -366,8 +684,21 @@ class MilestoneTwoWorkflow:
 
         candidate, response = request_gherkin_candidate(
             human_review=self._human_reviewed_risk,
+            testability_assessment=self._testability_assessment,
+            context=prepared.context,
             gateway=self._gateway,
         )
+        generated_report = validate_gherkin_candidate(
+            candidate=candidate,
+            human_review=self._human_reviewed_risk,
+            context=prepared.context,
+        )
+        if not generated_report.approved:
+            raise MilestoneTwoTransitionError(
+                "Cannot generate Gherkin: local validation rejected the "
+                "generated scenario."
+            )
+
         if self._is_typed_prepared(prepared):
             self._persist_gherkin_generation(
                 prepared=prepared,
@@ -378,20 +709,117 @@ class MilestoneTwoWorkflow:
             )
         self._gherkin_candidate = candidate
         self._gherkin_response = response
+        self._gherkin_validation_report = generated_report
+        self._validated_gherkin_text = candidate.gherkin_text
         self._state = _State.GHERKIN_READY
         return candidate
 
     @_with_workflow_lease
-    def approve_gherkin(self, text: str) -> MilestoneTwoRunRecord:
-        """Recheck, validate a human edit, and seal final Gherkin evidence."""
-        prepared = self._require_prepared("approve Gherkin")
+    def validate_edited_gherkin(self, text: str) -> GherkinValidationReport:
+        """Classify a reviewer edit before it may become final evidence."""
+        prepared = self._require_prepared("validate edited Gherkin")
         if (
             self._state is not _State.GHERKIN_READY
             or self._human_reviewed_risk is None
             or self._gherkin_candidate is None
         ):
             raise MilestoneTwoTransitionError(
-                "Cannot approve Gherkin: generate Gherkin before continuing."
+                "Cannot validate Gherkin: generate Gherkin before continuing."
+            )
+        if text == self._gherkin_candidate.gherkin_text:
+            raise MilestoneTwoTransitionError(
+                "Cannot validate Gherkin: change the generated Gherkin "
+                "before continuing."
+            )
+
+        freshness = self._snapshot_acquirer.recheck(prepared.snapshot)
+        self._freshness = freshness
+        if freshness.status == "stale":
+            self._state = _State.STALE
+            raise MilestoneTwoTransitionError(
+                "snapshot_stale: the pull request changed before Gherkin validation."
+            )
+        if freshness.status != "current":
+            raise MilestoneTwoTransitionError(
+                "snapshot_currentness_unknown: Gherkin validation requires "
+                "a current snapshot."
+            )
+
+        report = validate_edited_gherkin(
+            candidate=self._gherkin_candidate,
+            text=text,
+            human_review=self._human_reviewed_risk,
+            context=prepared.context,
+        )
+        self._gherkin_validation_report = report
+
+        if report.decision == "valid_evidence_bound_gherkin":
+            source_candidate = self._gherkin_candidate
+            edited_candidate = apply_gherkin_text_edit(
+                candidate=source_candidate,
+                text=text,
+                human_review=self._human_reviewed_risk,
+                context=prepared.context,
+            )
+            if self._is_typed_prepared(prepared):
+                self._persist_gherkin_validation(
+                    prepared=prepared,
+                    human_review=self._human_reviewed_risk,
+                    source_candidate=source_candidate,
+                    candidate=edited_candidate,
+                    validation=report,
+                    freshness=freshness,
+                )
+            self._gherkin_candidate = edited_candidate
+            self._validated_gherkin_text = text
+            self._state = _State.GHERKIN_VALIDATED
+        elif report.decision == "needs_more_frozen_evidence":
+            self._testability_draft = None
+            self._testability_response = None
+            evidence_assessment = _gherkin_evidence_assessment(
+                candidate=self._gherkin_candidate,
+                human_review=self._human_reviewed_risk,
+                context=prepared.context,
+                generated_at=datetime.now(UTC),
+            )
+            if self._is_typed_prepared(prepared):
+                self._persist_gherkin_evidence_gap(
+                    prepared=prepared,
+                    human_review=self._human_reviewed_risk,
+                    candidate=self._gherkin_candidate,
+                    text=text,
+                    validation=report,
+                    assessment=evidence_assessment,
+                    freshness=freshness,
+                )
+            self._testability_assessment = evidence_assessment
+            self._state = _State.EVIDENCE_REFINEMENT_REQUIRED
+        elif report.decision == "hypothesis_changed":
+            self._human_reviewed_risk = None
+            self._testability_draft = None
+            self._testability_response = None
+            self._testability_assessment = None
+            self._gherkin_candidate = None
+            self._gherkin_response = None
+            self._validated_gherkin_text = None
+            self._state = _State.RISKS_READY
+
+        return report
+
+    @_with_workflow_lease
+    def approve_gherkin(self, text: str) -> MilestoneTwoRunRecord:
+        """Seal only the exact Gherkin text that passed local validation."""
+        prepared = self._require_prepared("approve Gherkin")
+        if (
+            self._state not in {_State.GHERKIN_READY, _State.GHERKIN_VALIDATED}
+            or self._human_reviewed_risk is None
+            or self._gherkin_candidate is None
+            or self._gherkin_validation_report is None
+            or not self._gherkin_validation_report.approved
+            or self._validated_gherkin_text != text
+        ):
+            raise MilestoneTwoTransitionError(
+                "Cannot approve Gherkin: validate changed Gherkin before continuing."
             )
 
         freshness = self._snapshot_acquirer.recheck(prepared.snapshot)
@@ -407,14 +835,10 @@ class MilestoneTwoWorkflow:
                 "a current snapshot."
             )
 
-        edited_candidate = apply_gherkin_text_edit(
-            candidate=self._gherkin_candidate,
-            text=text,
-            human_review=self._human_reviewed_risk,
-        )
         approval = approve_gherkin_candidate(
-            candidate=edited_candidate,
+            candidate=self._gherkin_candidate,
             human_review=self._human_reviewed_risk,
+            context=prepared.context,
             approved_at=datetime.now(UTC),
         )
         record = MilestoneTwoRunRecord(
@@ -428,7 +852,9 @@ class MilestoneTwoWorkflow:
             freshness=freshness,
             risk_assessment=self._risk_assessment,
             human_reviewed_risk=self._human_reviewed_risk,
-            gherkin_candidate=edited_candidate,
+            testability_assessment=self._testability_assessment,
+            context_refinements=tuple(self._context_refinements),
+            gherkin_candidate=self._gherkin_candidate,
             gherkin_approval=approval,
         )
         self._recorder.record_event(
@@ -442,7 +868,6 @@ class MilestoneTwoWorkflow:
         self._write_final_measurements(record)
         self._recorder.finalize_run(self._run_handle, record)
 
-        self._gherkin_candidate = edited_candidate
         self._gherkin_approval = approval
         self._terminal_record = record
         self._state = _State.FINALIZED
@@ -730,6 +1155,96 @@ class MilestoneTwoWorkflow:
             reason_code="human_review_recorded",
         )
 
+    def _persist_testability_assessment(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        human_review: HumanReviewedRisk,
+        draft: TestabilityAssessmentDraft,
+        assessment: TestabilityAssessment,
+        response: ModelResponse,
+        freshness: SnapshotFreshness,
+    ) -> None:
+        """Save a locally validated testability decision before Gherkin work."""
+        if (
+            draft.snapshot_key != prepared.snapshot.snapshot_key
+            or draft.context_sha256 != prepared.context.context_sha256
+            or draft.reviewed_risk_sha256 != human_review.reviewed_content_sha256
+            or assessment.snapshot_key != prepared.snapshot.snapshot_key
+            or assessment.context_sha256 != prepared.context.context_sha256
+            or assessment.reviewed_risk_sha256 != human_review.reviewed_content_sha256
+            or freshness.snapshot_key != prepared.snapshot.snapshot_key
+        ):
+            raise MilestoneTwoTransitionError(
+                "Testability assessment is not bound to the current reviewed "
+                "frozen evidence."
+            )
+
+        payload = {
+            "draft": draft.model_dump(mode="json"),
+            "assessment": assessment.model_dump(mode="json"),
+            "response": response.model_dump(mode="json"),
+            "freshness": freshness.model_dump(mode="json"),
+        }
+        self._persist_transition(
+            artifact_name="artifacts/workflow/testability_assessment.json",
+            event_type="workflow_testability_assessment",
+            payload=payload,
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+                "reviewed_risk": human_review.reviewed_content_sha256,
+                "testability": assessment.assessment_sha256,
+            },
+            reason_code="testability_assessment_recorded",
+        )
+
+    def _persist_exhausted_context_refinement(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        human_review: HumanReviewedRisk,
+        assessment: TestabilityAssessment,
+        refinement: ContextRefinement,
+        freshness: SnapshotFreshness,
+    ) -> None:
+        """Save the bounded proof that no further frozen code was available."""
+        evidence_need_ids = tuple(need.need_id for need in assessment.evidence_needs)
+        if (
+            assessment.decision != "needs_more_frozen_evidence"
+            or not refinement.exhausted
+            or refinement.snapshot_key != prepared.snapshot.snapshot_key
+            or refinement.parent_context_sha256 != prepared.context.context_sha256
+            or refinement.refined_context_sha256 != prepared.context.context_sha256
+            or refinement.evidence_need_ids != evidence_need_ids
+            or assessment.snapshot_key != prepared.snapshot.snapshot_key
+            or assessment.context_sha256 != prepared.context.context_sha256
+            or assessment.reviewed_risk_sha256 != human_review.reviewed_content_sha256
+            or freshness.snapshot_key != prepared.snapshot.snapshot_key
+            or freshness.status != "current"
+        ):
+            raise MilestoneTwoTransitionError(
+                "Exhausted frozen-evidence refinement is not bound to the "
+                "current reviewed evidence."
+            )
+
+        payload = {
+            "refinement": refinement.model_dump(mode="json"),
+            "freshness": freshness.model_dump(mode="json"),
+        }
+        self._persist_transition(
+            artifact_name="artifacts/workflow/exhausted_context_refinement.json",
+            event_type="workflow_frozen_evidence_exhausted",
+            payload=payload,
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+                "reviewed_risk": human_review.reviewed_content_sha256,
+                "testability": assessment.assessment_sha256,
+            },
+            reason_code="frozen_evidence_exhausted",
+        )
+
     def _persist_gherkin_generation(
         self,
         *,
@@ -764,6 +1279,121 @@ class MilestoneTwoWorkflow:
                 "reviewed_risk": human_review.reviewed_content_sha256,
             },
             reason_code="gherkin_response_recorded",
+        )
+
+    def _persist_gherkin_validation(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        human_review: HumanReviewedRisk,
+        source_candidate: GherkinCandidate,
+        candidate: GherkinCandidate,
+        validation: GherkinValidationReport,
+        freshness: SnapshotFreshness,
+    ) -> None:
+        """Save one accepted edited successor before it may be approved."""
+        source_candidate_sha256 = canonical_sha256(
+            source_candidate.model_dump(mode="json")
+        )
+        if (
+            not validation.approved
+            or source_candidate.snapshot_key != prepared.snapshot.snapshot_key
+            or source_candidate.context_sha256 != prepared.context.context_sha256
+            or source_candidate.reviewed_risk_sha256
+            != human_review.reviewed_content_sha256
+            or candidate.snapshot_key != prepared.snapshot.snapshot_key
+            or candidate.context_sha256 != prepared.context.context_sha256
+            or candidate.reviewed_risk_sha256 != human_review.reviewed_content_sha256
+            or candidate.approved_risk != human_review.reviewed_risk
+            or freshness.snapshot_key != prepared.snapshot.snapshot_key
+        ):
+            raise MilestoneTwoTransitionError(
+                "Validated Gherkin is not bound to the current reviewed "
+                "frozen evidence."
+            )
+
+        payload = {
+            "source_candidate_sha256": source_candidate_sha256,
+            "candidate": candidate.model_dump(mode="json"),
+            "validation": {
+                "decision": validation.decision,
+                "approved": validation.approved,
+                "reason_codes": list(validation.reason_codes),
+            },
+            "freshness": freshness.model_dump(mode="json"),
+        }
+        self._persist_transition(
+            artifact_name="artifacts/workflow/gherkin_validation.json",
+            event_type="workflow_gherkin_validation",
+            payload=payload,
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+                "reviewed_risk": human_review.reviewed_content_sha256,
+                "source_candidate": source_candidate_sha256,
+            },
+            reason_code="gherkin_edit_validated",
+        )
+
+    def _persist_gherkin_evidence_gap(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        human_review: HumanReviewedRisk,
+        candidate: GherkinCandidate,
+        text: str,
+        validation: GherkinValidationReport,
+        assessment: TestabilityAssessment,
+        freshness: SnapshotFreshness,
+    ) -> None:
+        """Save an edited-scenario evidence gap before frozen-code refinement."""
+        source_candidate_sha256 = canonical_sha256(candidate.model_dump(mode="json"))
+        expected_assessment = _gherkin_evidence_assessment(
+            candidate=candidate,
+            human_review=human_review,
+            context=prepared.context,
+            generated_at=assessment.generated_at,
+        )
+        if (
+            text == candidate.gherkin_text
+            or validation.decision != "needs_more_frozen_evidence"
+            or validation.approved
+            or assessment != expected_assessment
+            or candidate.snapshot_key != prepared.snapshot.snapshot_key
+            or candidate.context_sha256 != prepared.context.context_sha256
+            or candidate.reviewed_risk_sha256 != human_review.reviewed_content_sha256
+            or candidate.approved_risk != human_review.reviewed_risk
+            or freshness.snapshot_key != prepared.snapshot.snapshot_key
+            or freshness.status != "current"
+        ):
+            raise MilestoneTwoTransitionError(
+                "The edited Gherkin evidence gap is not bound to the current "
+                "reviewed frozen evidence."
+            )
+
+        payload = {
+            "source_candidate_sha256": source_candidate_sha256,
+            "text": text,
+            "validation": {
+                "decision": validation.decision,
+                "approved": validation.approved,
+                "reason_codes": list(validation.reason_codes),
+            },
+            "assessment": assessment.model_dump(mode="json"),
+            "freshness": freshness.model_dump(mode="json"),
+        }
+        self._persist_transition(
+            artifact_name="artifacts/workflow/gherkin_evidence_gap.json",
+            event_type="workflow_gherkin_evidence_gap",
+            payload=payload,
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+                "reviewed_risk": human_review.reviewed_content_sha256,
+                "source_candidate": source_candidate_sha256,
+                "testability": assessment.assessment_sha256,
+            },
+            reason_code="gherkin_edit_needs_frozen_evidence",
         )
 
     def _persist_transition(
@@ -948,6 +1578,8 @@ class MilestoneTwoWorkflow:
             self._freshness = terminal_record.freshness
             self._risk_assessment = terminal_record.risk_assessment
             self._human_reviewed_risk = terminal_record.human_reviewed_risk
+            self._testability_assessment = terminal_record.testability_assessment
+            self._context_refinements = list(terminal_record.context_refinements)
             self._gherkin_candidate = terminal_record.gherkin_candidate
             self._gherkin_approval = terminal_record.gherkin_approval
             self._state = _State.FINALIZED
@@ -1104,6 +1736,104 @@ class MilestoneTwoWorkflow:
         self._freshness = review_freshness
         self._state = _State.RISK_APPROVED
 
+        testability_item = self._load_durable_artifact(
+            "artifacts/workflow/testability_assessment.json"
+        )
+        if testability_item is None:
+            return
+
+        testability_payload, _testability_event = testability_item
+        try:
+            saved_draft = testability_payload["draft"]
+            saved_assessment = testability_payload["assessment"]
+            saved_response = testability_payload["response"]
+            saved_freshness = testability_payload["freshness"]
+            if (
+                not isinstance(saved_draft, dict)
+                or not isinstance(saved_assessment, dict)
+                or not isinstance(saved_response, dict)
+                or not isinstance(saved_freshness, dict)
+            ):
+                raise TypeError("testability payload structure is invalid")
+            testability_draft = TestabilityAssessmentDraft.model_validate(saved_draft)
+            testability_assessment = TestabilityAssessment.model_validate(
+                saved_assessment
+            )
+            testability_response = ModelResponse.model_validate(saved_response)
+            testability_freshness = SnapshotFreshness.model_validate(saved_freshness)
+        except (KeyError, TypeError, ValueError) as error:
+            raise MilestoneTwoTransitionError(
+                "The saved testability assessment is invalid."
+            ) from error
+
+        revalidated_assessment, testability_report = validate_testability_assessment(
+            draft=testability_draft,
+            human_review=review,
+            context=prepared.context,
+        )
+        if (
+            revalidated_assessment is None
+            or not testability_report.approved
+            or revalidated_assessment != testability_assessment
+            or testability_response.data != testability_draft.model_dump(mode="json")
+            or testability_freshness.snapshot_key != prepared.snapshot.snapshot_key
+            or testability_freshness.status != "current"
+        ):
+            raise MilestoneTwoTransitionError(
+                "The saved testability assessment is not bound to current "
+                "reviewed frozen evidence."
+            )
+
+        self._testability_draft = testability_draft
+        self._testability_response = testability_response
+        self._testability_assessment = testability_assessment
+        self._freshness = testability_freshness
+        if testability_assessment.decision == "testable_from_frozen_evidence":
+            self._state = _State.TESTABILITY_READY
+        else:
+            self._state = _State.EVIDENCE_REFINEMENT_REQUIRED
+            exhausted_refinement_item = self._load_durable_artifact(
+                "artifacts/workflow/exhausted_context_refinement.json"
+            )
+            if exhausted_refinement_item is None:
+                return
+
+            exhausted_payload, _exhausted_event = exhausted_refinement_item
+            try:
+                saved_refinement = exhausted_payload["refinement"]
+                saved_freshness = exhausted_payload["freshness"]
+                if not isinstance(saved_refinement, dict) or not isinstance(
+                    saved_freshness,
+                    dict,
+                ):
+                    raise TypeError("exhausted-refinement payload structure is invalid")
+                refinement = ContextRefinement.model_validate(saved_refinement)
+                refinement_freshness = SnapshotFreshness.model_validate(saved_freshness)
+            except (KeyError, TypeError, ValueError) as error:
+                raise MilestoneTwoTransitionError(
+                    "The saved exhausted frozen-evidence refinement is invalid."
+                ) from error
+
+            if (
+                testability_assessment.decision != "needs_more_frozen_evidence"
+                or not refinement.exhausted
+                or refinement.snapshot_key != prepared.snapshot.snapshot_key
+                or refinement.parent_context_sha256 != prepared.context.context_sha256
+                or refinement.refined_context_sha256 != prepared.context.context_sha256
+                or refinement.evidence_need_ids
+                != tuple(need.need_id for need in testability_assessment.evidence_needs)
+                or refinement_freshness.snapshot_key != prepared.snapshot.snapshot_key
+                or refinement_freshness.status != "current"
+            ):
+                raise MilestoneTwoTransitionError(
+                    "The saved exhausted frozen-evidence refinement is not bound "
+                    "to current reviewed evidence."
+                )
+
+            self._context_refinements = [refinement]
+            self._freshness = refinement_freshness
+            return
+
         gherkin_item = self._load_durable_artifact(
             "artifacts/workflow/gherkin_generation.json"
         )
@@ -1132,6 +1862,7 @@ class MilestoneTwoWorkflow:
         validation = validate_gherkin_candidate(
             candidate=candidate,
             human_review=review,
+            context=prepared.context,
         )
         if (
             not validation.approved
@@ -1147,8 +1878,166 @@ class MilestoneTwoWorkflow:
 
         self._gherkin_candidate = candidate
         self._gherkin_response = gherkin_response
+        self._gherkin_validation_report = validation
+        self._validated_gherkin_text = candidate.gherkin_text
         self._freshness = gherkin_freshness
         self._state = _State.GHERKIN_READY
+
+        evidence_gap_item = self._load_durable_artifact(
+            "artifacts/workflow/gherkin_evidence_gap.json"
+        )
+        if evidence_gap_item is not None:
+            evidence_gap_payload, _evidence_gap_event = evidence_gap_item
+            try:
+                source_candidate_sha256 = evidence_gap_payload[
+                    "source_candidate_sha256"
+                ]
+                text = evidence_gap_payload["text"]
+                saved_validation = evidence_gap_payload["validation"]
+                saved_assessment = evidence_gap_payload["assessment"]
+                saved_freshness = evidence_gap_payload["freshness"]
+                if (
+                    not isinstance(source_candidate_sha256, str)
+                    or not isinstance(text, str)
+                    or not isinstance(saved_validation, dict)
+                    or not isinstance(saved_assessment, dict)
+                    or not isinstance(saved_freshness, dict)
+                ):
+                    raise TypeError("Gherkin-evidence-gap payload structure is invalid")
+
+                decision = saved_validation["decision"]
+                approved = saved_validation["approved"]
+                reason_codes = saved_validation["reason_codes"]
+                if (
+                    decision != "needs_more_frozen_evidence"
+                    or approved is not False
+                    or not isinstance(reason_codes, list)
+                    or any(
+                        not isinstance(reason_code, str) for reason_code in reason_codes
+                    )
+                ):
+                    raise ValueError("Gherkin evidence-gap validation is invalid")
+
+                evidence_gap_validation = GherkinValidationReport(
+                    decision=decision,
+                    approved=approved,
+                    reason_codes=tuple(reason_codes),
+                )
+                evidence_gap_assessment = TestabilityAssessment.model_validate(
+                    saved_assessment
+                )
+                evidence_gap_freshness = SnapshotFreshness.model_validate(
+                    saved_freshness
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise MilestoneTwoTransitionError(
+                    "The saved Gherkin evidence gap is invalid."
+                ) from error
+
+            revalidated_gap = validate_edited_gherkin(
+                candidate=candidate,
+                text=text,
+                human_review=review,
+                context=prepared.context,
+            )
+            expected_gap_assessment = _gherkin_evidence_assessment(
+                candidate=candidate,
+                human_review=review,
+                context=prepared.context,
+                generated_at=evidence_gap_assessment.generated_at,
+            )
+            if (
+                source_candidate_sha256
+                != canonical_sha256(candidate.model_dump(mode="json"))
+                or revalidated_gap != evidence_gap_validation
+                or evidence_gap_assessment != expected_gap_assessment
+                or evidence_gap_freshness.snapshot_key != prepared.snapshot.snapshot_key
+                or evidence_gap_freshness.status != "current"
+            ):
+                raise MilestoneTwoTransitionError(
+                    "The saved Gherkin evidence gap is not bound to current "
+                    "reviewed frozen evidence."
+                )
+
+            self._testability_draft = None
+            self._testability_response = None
+            self._testability_assessment = evidence_gap_assessment
+            self._gherkin_validation_report = evidence_gap_validation
+            self._validated_gherkin_text = None
+            self._freshness = evidence_gap_freshness
+            self._state = _State.EVIDENCE_REFINEMENT_REQUIRED
+            return
+
+        validation_item = self._load_durable_artifact(
+            "artifacts/workflow/gherkin_validation.json"
+        )
+        if validation_item is None:
+            return
+
+        validation_payload, _validation_event = validation_item
+        try:
+            source_candidate_sha256 = validation_payload["source_candidate_sha256"]
+            saved_candidate = validation_payload["candidate"]
+            saved_validation = validation_payload["validation"]
+            saved_freshness = validation_payload["freshness"]
+            if (
+                not isinstance(source_candidate_sha256, str)
+                or not isinstance(saved_candidate, dict)
+                or not isinstance(saved_validation, dict)
+                or not isinstance(saved_freshness, dict)
+            ):
+                raise TypeError("Gherkin-validation payload structure is invalid")
+
+            edited_candidate = GherkinCandidate.from_persisted(saved_candidate)
+            decision = saved_validation["decision"]
+            approved = saved_validation["approved"]
+            reason_codes = saved_validation["reason_codes"]
+            if (
+                decision != "valid_evidence_bound_gherkin"
+                or approved is not True
+                or not isinstance(reason_codes, list)
+                or any(not isinstance(reason_code, str) for reason_code in reason_codes)
+            ):
+                raise ValueError("Gherkin validation result is invalid")
+
+            edited_validation = GherkinValidationReport(
+                decision=decision,
+                approved=approved,
+                reason_codes=tuple(reason_codes),
+            )
+            validation_freshness = SnapshotFreshness.model_validate(saved_freshness)
+        except (KeyError, TypeError, ValueError) as error:
+            raise MilestoneTwoTransitionError(
+                "The saved Gherkin validation is invalid."
+            ) from error
+
+        revalidated_edit = validate_gherkin_candidate(
+            candidate=edited_candidate,
+            human_review=review,
+            context=prepared.context,
+        )
+        if (
+            source_candidate_sha256
+            != canonical_sha256(candidate.model_dump(mode="json"))
+            or not revalidated_edit.approved
+            or revalidated_edit != edited_validation
+            or edited_candidate.snapshot_key != prepared.snapshot.snapshot_key
+            or edited_candidate.context_sha256 != prepared.context.context_sha256
+            or edited_candidate.reviewed_risk_sha256 != review.reviewed_content_sha256
+            or edited_candidate.approved_risk != review.reviewed_risk
+            or validation_freshness.snapshot_key != prepared.snapshot.snapshot_key
+            or validation_freshness.status != "current"
+        ):
+            raise MilestoneTwoTransitionError(
+                "The saved Gherkin validation is not bound to current reviewed "
+                "frozen evidence."
+            )
+
+        self._gherkin_candidate = edited_candidate
+        self._gherkin_validation_report = edited_validation
+        self._validated_gherkin_text = edited_candidate.gherkin_text
+        self._freshness = validation_freshness
+        self._state = _State.GHERKIN_VALIDATED
 
     def _require_prepared(self, action: str) -> PreparedPullRequest:
         """Require the frozen snapshot/evidence stage before downstream actions."""
@@ -1188,6 +2077,7 @@ def resume_milestone_two_workflow(
         context_builder=dependencies.context_builder,
         store=dependencies.store,
         gateway=dependencies.gateway,
+        evidence_refiner=dependencies.evidence_refiner,
         _run_handle=run_handle,
     )
     with dependencies.recorder.workflow_lease(run_handle):

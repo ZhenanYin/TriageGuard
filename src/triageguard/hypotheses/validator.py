@@ -26,6 +26,7 @@ from triageguard.provenance import canonical_json, canonical_sha256
 
 REQUIRED_CLAIM_FIELDS = frozenset(
     {
+        "explanation",
         "actor",
         "action",
         "expected_secure_behavior",
@@ -36,6 +37,7 @@ REQUIRED_CLAIM_FIELDS = frozenset(
 
 EDITABLE_REVIEW_FIELDS = frozenset(
     {
+        "explanation",
         "actor",
         "preconditions",
         "action",
@@ -122,6 +124,7 @@ def _validate_claim_bindings(
             _add_reason(reason_codes, "unknown_evidence_anchor")
 
     required_claims = {
+        ("explanation", None),
         ("actor", None),
         ("action", None),
         ("expected_secure_behavior", None),

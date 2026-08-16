@@ -37,9 +37,9 @@ def test_replay_gateway_returns_named_fixture_and_records_model_identity():
     assert response.provider == "replay"
     assert response.model == "replay/openai-gpt-oss-120b"
     assert len(response.prompt_sha256) == 64
-    assert response.response_sha256 == hashlib.sha256(
-        b'{"plan_id":"plan-1"}'
-    ).hexdigest()
+    assert (
+        response.response_sha256 == hashlib.sha256(b'{"plan_id":"plan-1"}').hexdigest()
+    )
     assert response.input_tokens == 0
     assert response.output_tokens == 0
     assert response.attempts[0].outcome == "succeeded"
@@ -61,6 +61,24 @@ def test_model_request_accepts_gherkin_generation() -> None:
     )
 
     assert request.purpose == "gherkin_generation"
+
+
+def test_model_request_accepts_testability_assessment() -> None:
+    """The frozen-evidence testability call needs its own auditable purpose."""
+    request = ModelRequest(
+        purpose="testability_assessment",
+        system_prompt="Assess testability using only frozen code evidence.",
+        payload={"reviewed_risk_sha256": "a" * 64},
+        output_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        max_output_tokens=2048,
+    )
+
+    assert request.purpose == "testability_assessment"
 
 
 def test_replay_gateway_refuses_to_synthesize_a_missing_fixture():
@@ -163,10 +181,10 @@ def test_live_gateway_uses_strict_groq_schema_and_returns_call_metadata():
     assert response.attempts[0].outcome == "succeeded"
 
 
-@pytest.mark.parametrize(
-    "content", ["not json", '{"wrong":"shape"}']
-)
-def test_live_gateway_fails_explicitly_for_invalid_or_schema_incompatible_output(content):
+@pytest.mark.parametrize("content", ["not json", '{"wrong":"shape"}'])
+def test_live_gateway_fails_explicitly_for_invalid_or_schema_incompatible_output(
+    content,
+):
     """An invalid model result must not enter the workflow through a fallback path."""
     gateway = GroqStructuredGateway(
         _live_settings(), client=_FakeGroqClient([_completion(content, 1, 1)])
@@ -188,7 +206,8 @@ def test_live_gateway_rejects_a_response_violating_any_json_schema_constraint():
         }
     )
     gateway = GroqStructuredGateway(
-        _live_settings(), client=_FakeGroqClient([_completion('{"plan_id":"id"}', 1, 1)])
+        _live_settings(),
+        client=_FakeGroqClient([_completion('{"plan_id":"id"}', 1, 1)]),
     )
 
     with pytest.raises(ModelOutputInvalid):

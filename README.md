@@ -19,31 +19,43 @@ The research question is whether a human-reviewed security-risk hypothesis can
 be turned into a trustworthy executable experiment whose conclusions remain
 limited to what the resulting evidence supports.
 
-## What is implemented now: Milestone 1
+## What is implemented now
 
-Milestone 1 implements one complete local vertical slice for a controlled,
-OpenMRS-shaped patient-deletion authorization regression. A clerk can view
-patients but lacks `Delete Patients`; the secure behavior is to deny the delete
-request and preserve the patient. The controlled candidate intentionally weakens
-that boundary so the pipeline can be exercised end to end.
+TriageGuard currently contains two separate research milestones.
 
-This is not analysis of a real OpenMRS pull request, execution of real OpenMRS
-revisions, or evidence of a production OpenMRS vulnerability. The base and
-candidate are local fixture behaviors. Their outputs are development evidence
-about TriageGuard's workflow, not publication evidence about OpenMRS.
+**Milestone 1** is a controlled local vertical slice for an OpenMRS-shaped
+patient-deletion authorization regression. It can generate constrained pytest,
+run fixture comparisons, and calculate a provisional CVSS result only for that
+controlled fixture. It is not evidence about a real OpenMRS pull request.
 
-The Streamlit interface has four separate wizard pages. Each page exposes a
-user decision and enforces a corresponding system action:
+**Milestone 2** is a human-guided, evidence-bounded review of one OpenMRS Core
+pull request. It freezes four exact code photographs before any model request:
+
+- **M — shared starting point:** where the PR and main branch last matched.
+- **B — current main:** what main looked like when analysis began.
+- **H — PR head:** the author’s proposed code.
+- **C — merge preview:** what main would look like if the PR merged then.
+
+It compares author change (**M → H**), merge impact (**B → C**), and
+main-branch drift (**M → B**). The model may propose readable, unconfirmed
+risk hypotheses, testability assessments, and Gherkin candidates. Local,
+deterministic validation decides whether each item is grounded in the frozen
+code evidence.
+
+Milestone 2 has five human-gated pages:
 
 | Page | User action | System action |
 |---|---|---|
-| 1. Understand the change | Review the controlled comparison | Load the prepared base/candidate context and its fixture provenance |
-| 2. Review the security risk | Select the prepared authorization risk | Freeze the selected risk hypothesis and its evidence contract |
-| 3. Review and generate the test | Review or edit the Gherkin scenario, then approve it | Reject meaning-changing edits; request a structured plan and generated test; apply deterministic validation |
-| 4. Run the comparison | Choose the repetition count and start the paired experiment | Execute the approved test against both fixture behaviors, classify the evidence, and calculate CVSS only when eligible |
+| 1. Choose a pull request | Submit one OpenMRS Core PR URL | Freeze M/B/H/C, the three comparisons, and bounded Java evidence |
+| 2. Understand the change | Review the saved photographs and comparisons | Request and locally ground possible risk hypotheses |
+| 3. Review possible risks | Read and select one unconfirmed hypothesis | Preserve its cited frozen evidence |
+| 4. Choose and edit one risk | Edit one readable paragraph and review testability | Require saved code evidence for setup, action, and observable outcome; refine only M/B/H/C when necessary |
+| 5. Create and approve the scenario | Review or edit one Gherkin scenario | Validate it against the reviewed risk and current frozen evidence before approval |
 
-`Next` remains locked until the current gate is satisfied. A finalized run is
-immutable; **Start New Run** begins a separate record.
+Milestone 2 stops after an approved evidence-bound Gherkin scenario, a supported
+non-risk outcome, or an explicit insufficient-frozen-evidence outcome. It does
+not generate pytest, execute OpenMRS, calculate CVSS, or claim that a real PR
+is safe.
 
 ## Model boundary and deterministic gates
 
@@ -195,61 +207,65 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```
 
-### File-based replay setup (recommended first run)
+### Milestone 2 replay setup (recommended first run)
 
-Replay mode uses the checked-in structured responses, makes no provider request,
-and requires no API key. Copy this sourceable replay template to ignored
-`.env`, edit locally as needed, then run `source .env` from the repository root.
-Never commit `.env`; it is excluded by the repository `.gitignore`. Sourcing
-the replay template also clears any `GROQ_API_KEY` inherited from an earlier
-live session:
+The Milestone 2 replay interface uses an OpenMRS-shaped synthetic fixture and
+checked-in model responses. It makes no GitHub or provider request and requires
+no API key. It is useful for reviewing the interface and workflow, but it is
+not a real pull-request analysis.
 
 ```bash
 source .venv/bin/activate
-cp .env.example .env
-# Edit .env locally if needed, then source it from the repository root.
-source .env
+export TRIAGEGUARD_LLM_MODE=replay
+export TRIAGEGUARD_ENVIRONMENT_KIND=controlled_fixture
 python -m streamlit run src/triageguard/ui/app.py
 ```
 
-Open the local URL printed by Streamlit. Select the prepared risk, review the
-Given/When/Then scenario, approve generation, and run the paired comparison. The
-expected controlled-fixture result is a protected secure base, an unauthorized
-candidate deletion, base **Not scored**, and candidate **7.1 High**.
+Open the local URL printed by Streamlit. The default URL is a reserved synthetic
+OpenMRS-shaped PR. Follow the five pages to inspect saved comparisons, read and
+edit one unconfirmed risk paragraph, check testability, and approve a Gherkin
+scenario.
 
-### Optional live Groq mode
+### Milestone 2 live OpenMRS Core mode
 
-Live mode supports the `groq` provider and defaults to
-`openai/gpt-oss-120b`. Keep the API key in the local process environment only;
-never paste it into chat, commands, source, fixtures, artifacts, or commits. This
-session-only setup prompts without echoing the key or writing it to shell
-history:
+Live mode reads one public, open OpenMRS Core PR from GitHub, freezes its exact
+M/B/H/C evidence, and asks Groq for structured risk, testability, and Gherkin
+proposals. Keep credentials in the local process environment only; never paste
+them into chat, source, fixtures, artifacts, or commits. A GitHub token is
+recommended for API rate limits but is not required for a public repository.
+
+Run this from the repository root. The two `read -s` commands prompt without
+echoing a secret or placing it in shell history:
 
 ```bash
 source .venv/bin/activate
 export TRIAGEGUARD_LLM_MODE=live
 export TRIAGEGUARD_LLM_PROVIDER=groq
 export TRIAGEGUARD_LLM_MODEL=openai/gpt-oss-120b
-export TRIAGEGUARD_ARTIFACTS_DIR=artifacts
-export TRIAGEGUARD_REPEAT_COUNT=3
-export TRIAGEGUARD_ENVIRONMENT_KIND=controlled_fixture
-GROQ_API_KEY="$(python -c 'import getpass; print(getpass.getpass("Groq API key: "))')"
+export TRIAGEGUARD_ENVIRONMENT_KIND=real_pr_analysis
+export TRIAGEGUARD_ARTIFACTS_DIR=artifacts/milestone-two-live
+export TRIAGEGUARD_ANALYSIS_CACHE_DIR=analysis-cache/milestone-two-live
+read -s "GROQ_API_KEY?Groq API key: "
 export GROQ_API_KEY
+read -s "GITHUB_TOKEN?GitHub token (recommended; Enter to skip): "
+export GITHUB_TOKEN
 test -n "$GROQ_API_KEY"
 python -m streamlit run src/triageguard/ui/app.py
 ```
 
-Before generation, confirm the UI reports `Live (Groq structured generation)`,
-provider `groq`, and the intended model. A missing key or unsupported provider
-fails before a gateway call or research run; there is no replay fallback.
+Before submitting a PR URL, confirm the UI reports **Live · groq** and the
+intended model. The first live run should use a public, open OpenMRS Core PR and
+should be reviewed as an engineering smoke test, not as a vulnerability finding.
+There is no replay fallback: a missing key, unsupported PR, GitHub error, or
+provider failure stops the run without inventing a result.
 
 After stopping Streamlit with <kbd>Ctrl</kbd>+<kbd>C</kbd>, clear the session in
 that same shell:
 
 ```bash
-unset GROQ_API_KEY TRIAGEGUARD_LLM_MODE TRIAGEGUARD_LLM_PROVIDER
+unset GROQ_API_KEY GITHUB_TOKEN TRIAGEGUARD_LLM_MODE TRIAGEGUARD_LLM_PROVIDER
 unset TRIAGEGUARD_LLM_MODEL TRIAGEGUARD_ARTIFACTS_DIR
-unset TRIAGEGUARD_REPEAT_COUNT TRIAGEGUARD_ENVIRONMENT_KIND
+unset TRIAGEGUARD_ANALYSIS_CACHE_DIR TRIAGEGUARD_ENVIRONMENT_KIND
 deactivate
 ```
 
@@ -328,14 +344,13 @@ in the artifact directory.
 
 The near-term research sequence is:
 
-1. Add a real OpenMRS PR diff and whole-system context adapter.
-2. Propose evidence-grounded risk hypotheses with explicit abstention when
-   context is insufficient, while preserving human selection and editing.
-3. Execute approved tests against exact real base and PR revisions in isolated
+1. Operate and evaluate Milestone 2 against a reviewed sample of real OpenMRS
+   Core pull requests.
+2. Execute approved tests against exact real base and PR revisions in isolated
    environments.
-4. Surface the evidence and provisional expert review as a GitHub check.
-5. Build the expert-labeled real-PR and seeded/mutation study corpus.
-6. Run the preregistered, sample-size-justified publication evaluation.
+3. Surface the evidence and provisional expert review as a GitHub check.
+4. Build the expert-labeled real-PR and seeded/mutation study corpus.
+5. Run the preregistered, sample-size-justified publication evaluation.
 
 Until those stages are implemented and evaluated, TriageGuard should be
 described as a local research prototype that demonstrates one auditable,

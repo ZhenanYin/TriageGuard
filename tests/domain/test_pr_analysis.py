@@ -11,11 +11,14 @@ from triageguard.domain.pr_analysis import (
     ClaimEvidenceBinding,
     ContextAnchor,
     ContextBundle,
+    ContextRefinement,
+    FrozenEvidenceNeed,
     GherkinApproval,
     GherkinCandidate,
     GherkinCandidateDraft,
     GherkinStep,
     GherkinStepBinding,
+    GherkinStepEvidenceBinding,
     GroundingReport,
     HumanReviewedRisk,
     IdentifierEvidence,
@@ -26,6 +29,9 @@ from triageguard.domain.pr_analysis import (
     RiskHypothesis,
     RiskHypothesisDraft,
     SnapshotFreshness,
+)
+from triageguard.domain.pr_analysis import (
+    TestabilityAssessment as Assessment,
 )
 from triageguard.provenance import canonical_sha256
 
@@ -138,6 +144,11 @@ def _risk_draft(**changes: object) -> RiskHypothesisDraft:
         "observables": ["HTTP response", "Persistent record state"],
         "code_identifiers": ["requirePrivilege"],
         "evidence_bindings": [
+            ClaimEvidenceBinding(
+                claim_field="explanation",
+                observable_index=None,
+                anchor_ids=["anchor-b"],
+            ),
             ClaimEvidenceBinding(
                 claim_field="actor", observable_index=None, anchor_ids=["anchor-b"]
             ),
@@ -283,6 +294,7 @@ def test_candidate_rejects_non_gherkin_or_incomplete_traceability() -> None:
     with pytest.raises(ValidationError, match="Feature"):
         GherkinCandidateDraft(
             snapshot_key="0" * 64,
+            context_sha256=_context_bundle().context_sha256,
             reviewed_risk_sha256=canonical_sha256(
                 approved_risk.model_dump(mode="json")
             ),
@@ -292,6 +304,12 @@ def test_candidate_rejects_non_gherkin_or_incomplete_traceability() -> None:
             steps=[GherkinStep(number=1, keyword="Given", text="a clerk")],
             gherkin_text="not gherkin",
             bindings=[],
+            step_evidence_bindings=(
+                GherkinStepEvidenceBinding(
+                    step_number=1,
+                    anchor_ids=("anchor-a",),
+                ),
+            ),
             testability_notes=[],
             setup_gaps=[],
             generated_at=datetime(2026, 8, 11, tzinfo=UTC),
@@ -336,6 +354,7 @@ def _candidate(snapshot_key: str = "0" * 64) -> GherkinCandidate:
     return GherkinCandidate.from_draft(
         GherkinCandidateDraft(
             snapshot_key=snapshot_key,
+            context_sha256=_context_bundle(snapshot_key).context_sha256,
             reviewed_risk_sha256=canonical_sha256(risk.model_dump(mode="json")),
             approved_risk=risk,
             feature_title="Privilege enforcement",
@@ -373,10 +392,22 @@ def _candidate(snapshot_key: str = "0" * 64) -> GherkinCandidate:
                     claim_field="observable", source_index=1, step_numbers=[7]
                 ),
             ),
+            step_evidence_bindings=_step_evidence_bindings(),
             testability_notes=[],
             setup_gaps=[],
             generated_at=datetime(2026, 8, 11, tzinfo=UTC),
         )
+    )
+
+
+def _step_evidence_bindings() -> tuple[GherkinStepEvidenceBinding, ...]:
+    """Bind every fixture step to saved integration-change evidence."""
+    return tuple(
+        GherkinStepEvidenceBinding(
+            step_number=step_number,
+            anchor_ids=("anchor-a",),
+        )
+        for step_number in range(1, 8)
     )
 
 
@@ -615,6 +646,72 @@ def test_failed_terminal_record_requires_an_allowlisted_reason_code() -> None:
         )
 
 
+def test_exhausted_frozen_evidence_terminal_preserves_its_testability_history() -> None:
+    """An untestable risk is not safe when every allowed code search is exhausted."""
+    approved = _approved_terminal_record()
+    assert approved.risk_assessment is not None
+    assert approved.human_reviewed_risk is not None
+    snapshot = approved.snapshot
+    assessment = approved.risk_assessment
+    review = approved.human_reviewed_risk
+    need = FrozenEvidenceNeed(
+        need_id="need-observable",
+        category="observable",
+        search_terms=("response",),
+        explanation="Find a frozen observable outcome for the reviewed action.",
+        supporting_anchor_ids=("anchor-a",),
+    )
+    testability = Assessment.from_content(
+        snapshot_key=snapshot.snapshot_key,
+        context_sha256=assessment.context_sha256,
+        reviewed_risk_sha256=review.reviewed_content_sha256,
+        decision="needs_more_frozen_evidence",
+        bindings=(),
+        evidence_needs=(need,),
+        explanation="The frozen context does not establish an executable observable.",
+        generated_at=datetime(2026, 8, 12, tzinfo=UTC),
+        validated_at=datetime(2026, 8, 12, tzinfo=UTC),
+    )
+    refinement = ContextRefinement.from_content(
+        snapshot_key=snapshot.snapshot_key,
+        parent_context_sha256=assessment.context_sha256,
+        refined_context_sha256=assessment.context_sha256,
+        evidence_need_ids=(need.need_id,),
+        added_anchor_ids=(),
+        exhausted=True,
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+    )
+
+    record = MilestoneTwoRunRecord(
+        run_id="run-exhausted-frozen-evidence",
+        snapshot=snapshot,
+        status="insufficient_frozen_evidence_for_scenario",
+        reason_code="insufficient_frozen_evidence_for_scenario",
+        explanation="Insufficient frozen code evidence to design an executable scenario.",
+        started_at=datetime(2026, 8, 11, tzinfo=UTC),
+        finished_at=datetime(2026, 8, 12, tzinfo=UTC),
+        freshness=SnapshotFreshness(
+            snapshot_key=snapshot.snapshot_key,
+            status="current",
+            reason_code="snapshot_current",
+            checked_at=datetime(2026, 8, 12, tzinfo=UTC),
+            observed_base_sha=snapshot.base_sha,
+            observed_head_sha=snapshot.head_sha,
+            observed_candidate_sha=snapshot.candidate_sha,
+        ),
+        risk_assessment=assessment,
+        human_reviewed_risk=review,
+        testability_assessment=testability,
+        context_refinements=(refinement,),
+        gherkin_candidate=None,
+        gherkin_approval=None,
+    )
+
+    assert record.status == "insufficient_frozen_evidence_for_scenario"
+    assert record.testability_assessment == testability
+    assert record.context_refinements == (refinement,)
+
+
 def test_persisted_assessment_round_trip_revalidates_derived_hypotheses() -> None:
     """Saved assessments must reload only when nested local IDs remain genuine."""
     assessment = _assessment(RiskHypothesis.from_draft(_risk_draft()))
@@ -736,3 +833,22 @@ def test_persisted_approved_terminal_record_revalidates_nested_ids() -> None:
 
     with pytest.raises(ValueError, match="persisted hypothesis ID"):
         MilestoneTwoRunRecord.from_persisted(tampered)
+
+
+def test_readable_hypothesis_explanation_must_have_frozen_evidence() -> None:
+    """The reviewer-facing risk paragraph must cite the saved code catalog."""
+    hypothesis = _risk_draft()
+
+    assert any(
+        binding.claim_field == "explanation" for binding in hypothesis.evidence_bindings
+    )
+
+    payload = hypothesis.model_dump(mode="json")
+    payload["evidence_bindings"] = [
+        binding
+        for binding in payload["evidence_bindings"]
+        if binding["claim_field"] != "explanation"
+    ]
+
+    with pytest.raises(ValidationError, match="cover every required claim"):
+        RiskHypothesisDraft.model_validate(payload)

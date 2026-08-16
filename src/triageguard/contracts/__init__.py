@@ -13,6 +13,7 @@ from triageguard.contracts.gherkin_generation import (
     approve_gherkin,
     build_gherkin_request,
     generate_gherkin,
+    validate_edited_gherkin,
     validate_gherkin_candidate,
 )
 
@@ -26,6 +27,7 @@ __all__ = [
     "build_gherkin_request",
     "generate_gherkin",
     "render_gherkin",
+    "validate_edited_gherkin",
     "validate_gherkin_alignment",
     "validate_gherkin_candidate",
 ]
