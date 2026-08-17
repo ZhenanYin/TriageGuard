@@ -12,7 +12,9 @@ from triageguard.analysis.context import (
     ContextBuilder,
     ContextBuildError,
     ContextLimits,
+    JavaSymbol,
     JavaSyntaxExtractor,
+    _symbol_from_node,
 )
 from triageguard.analysis.diffs import parse_patch
 from triageguard.config import Settings
@@ -83,6 +85,33 @@ def test_java_extractor_rejects_a_syntax_error() -> None:
         )
 
     assert error.value.reason_code == "java_parse_failed"
+
+
+def test_symbol_spans_use_source_byte_offsets_not_parser_point_properties() -> None:
+    """A native parser position accessor must not be needed for evidence lines."""
+
+    class ByteOnlyNode:
+        start_byte = 0
+        end_byte = len(b"class Patient {\n    void purge() {}\n}\n") - 1
+
+        @property
+        def start_point(self) -> object:
+            raise AssertionError("unsafe native start-point access")
+
+        @property
+        def end_point(self) -> object:
+            raise AssertionError("unsafe native end-point access")
+
+    source = b"class Patient {\n    void purge() {}\n}\n"
+
+    assert _symbol_from_node(source, ByteOnlyNode(), "Patient", "class") == (
+        JavaSymbol(
+            name="Patient",
+            kind="class",
+            start_line=1,
+            end_line=3,
+        )
+    )
 
 
 def _snapshot() -> PullRequestSnapshot:

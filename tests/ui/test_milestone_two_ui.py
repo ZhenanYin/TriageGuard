@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -36,6 +37,23 @@ def test_preparation_error_message_exposes_only_safe_snapshot_details() -> None:
     assert milestone_two_app._preparation_error_message(RuntimeError("internal")) == (
         "The pull request could not be prepared for review."
     )
+
+
+def test_initial_pull_request_url_is_blank_only_in_live_mode() -> None:
+    """Replay keeps its fixture, while live analysis requires an explicit URL."""
+    replay_state = SimpleNamespace(
+        prepared=None,
+        settings=SimpleNamespace(llm_mode="replay"),
+    )
+    live_state = SimpleNamespace(
+        prepared=None,
+        settings=SimpleNamespace(llm_mode="live"),
+    )
+
+    assert milestone_two_app._initial_pull_request_url(replay_state) == (
+        SUPPORTED_PR_URL
+    )
+    assert milestone_two_app._initial_pull_request_url(live_state) == ""
 
 
 def _app_state(

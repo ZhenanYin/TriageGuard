@@ -105,32 +105,32 @@ class JavaSyntaxExtractor:
                 name = _field_text(source, node, "name")
                 if name is not None:
                     classes.append(name)
-                    symbols.append(_symbol_from_node(node, name, "class"))
+                    symbols.append(_symbol_from_node(source, node, name, "class"))
             elif node.type == "interface_declaration":
                 name = _field_text(source, node, "name")
                 if name is not None:
                     interfaces.append(name)
-                    symbols.append(_symbol_from_node(node, name, "interface"))
+                    symbols.append(_symbol_from_node(source, node, name, "interface"))
             elif node.type == "enum_declaration":
                 name = _field_text(source, node, "name")
                 if name is not None:
                     enums.append(name)
-                    symbols.append(_symbol_from_node(node, name, "enum"))
+                    symbols.append(_symbol_from_node(source, node, name, "enum"))
             elif node.type == "record_declaration":
                 name = _field_text(source, node, "name")
                 if name is not None:
                     records.append(name)
-                    symbols.append(_symbol_from_node(node, name, "record"))
+                    symbols.append(_symbol_from_node(source, node, name, "record"))
             elif node.type == "constructor_declaration":
                 name = _field_text(source, node, "name")
                 if name is not None:
                     constructors.append(name)
-                    symbols.append(_symbol_from_node(node, name, "constructor"))
+                    symbols.append(_symbol_from_node(source, node, name, "constructor"))
             elif node.type == "method_declaration":
                 name = _field_text(source, node, "name")
                 if name is not None:
                     methods.append(name)
-                    symbols.append(_symbol_from_node(node, name, "method"))
+                    symbols.append(_symbol_from_node(source, node, name, "method"))
             elif node.type == "method_invocation":
                 name = _field_text(source, node, "name")
                 if name is not None:
@@ -639,10 +639,20 @@ def _ensure_primary_budget(
         )
 
 
-def _symbol_from_node(node: Node, name: str, kind: str) -> JavaSymbol:
-    """Record one Tree-sitter declaration span using one-based line numbers."""
-    start_line = node.start_point.row + 1
-    end_line = max(start_line, node.end_point.row + 1)
+def _symbol_from_node(
+    source: bytes,
+    node: Node,
+    name: str,
+    kind: str,
+) -> JavaSymbol:
+    """Record one declaration span from safe Tree-sitter byte offsets.
+
+    The macOS Tree-sitter Java binding can crash Python while resolving a
+    node's ``start_point`` or ``end_point``. Byte offsets describe the same
+    source positions without crossing that unsafe native-code boundary.
+    """
+    start_line = source.count(b"\n", 0, node.start_byte) + 1
+    end_line = max(start_line, source.count(b"\n", 0, node.end_byte) + 1)
     return JavaSymbol(
         name=name,
         kind=kind,

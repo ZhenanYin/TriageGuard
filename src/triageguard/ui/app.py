@@ -43,6 +43,15 @@ def _preparation_error_message(error: Exception) -> str:
     return "The pull request could not be prepared for review."
 
 
+def _initial_pull_request_url(state: MilestoneTwoAppState) -> str:
+    """Return the one safe initial URL for the selected analysis mode."""
+    if state.prepared is not None:
+        return state.prepared.snapshot.pull_url
+    if state.settings.llm_mode == "replay":
+        return _SUPPORTED_PR_URL
+    return ""
+
+
 def create_milestone_two_app_state(settings: Settings) -> MilestoneTwoAppState:
     """Create replay or live workflow state while retaining public settings only."""
     public_settings = settings.public_view()
@@ -208,16 +217,15 @@ def _render_choose_pull_request(st: Any, state: MilestoneTwoAppState) -> None:
         "Paste an OpenMRS Core pull-request URL. TriageGuard will save four "
         "exact code photographs before asking the model for possible risks."
     )
-    st.info(
-        "This default replay demo uses a synthetic OpenMRS-shaped pull request. "
-        "It does not contact GitHub or an LLM."
-    )
+    if state.settings.llm_mode == "replay":
+        st.info(
+            "This default replay demo uses a synthetic OpenMRS-shaped pull "
+            "request. It does not contact GitHub or an LLM."
+        )
 
     pr_url = st.text_input(
         "OpenMRS Core pull-request URL",
-        value=state.prepared.snapshot.pull_url
-        if state.prepared is not None
-        else _SUPPORTED_PR_URL,
+        value=_initial_pull_request_url(state),
     )
     if st.button(
         "Analyze pull request",
