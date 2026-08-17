@@ -494,6 +494,7 @@ def _assessment(
         producer="local_grounding_validator",
         snapshot_key=snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256="8" * 64,
         hypothesis_id=risk.hypothesis_id,
         hypothesis_sha256=canonical_sha256(risk.model_dump(mode="json")),
         cited_anchor_ids=risk.citation_anchor_ids,
@@ -504,6 +505,7 @@ def _assessment(
     return RiskAssessment.from_content(
         snapshot_key=snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256="8" * 64,
         outcome="risks_proposed",
         hypotheses=[risk],
         generated_at=datetime(2026, 8, 11, tzinfo=UTC),
@@ -521,6 +523,7 @@ def _reviewed_grounding(
         producer="local_grounding_validator",
         snapshot_key=snapshot_key,
         context_sha256=_context_bundle(snapshot_key).context_sha256,
+        evidence_envelope_sha256="8" * 64,
         hypothesis_id="reviewed-risk",
         hypothesis_sha256=canonical_sha256(reviewed.model_dump(mode="json")),
         cited_anchor_ids=reviewed.citation_anchor_ids,

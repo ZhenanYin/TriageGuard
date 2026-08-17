@@ -784,6 +784,7 @@ class RiskAssessmentDraft(ResearchArtifact):
 
     snapshot_key: Sha256
     context_sha256: Sha256
+    evidence_envelope_sha256: Sha256
     outcome: RiskAssessmentOutcome
     hypotheses: tuple[RiskHypothesisDraft, ...] = Field(default_factory=tuple)
     rationale: StrictStr | None = None
@@ -866,6 +867,7 @@ class GroundingReport(ResearchArtifact):
     producer: Literal["local_grounding_validator"]
     snapshot_key: Sha256
     context_sha256: Sha256
+    evidence_envelope_sha256: Sha256
     hypothesis_id: StrictStr = Field(min_length=1)
     hypothesis_sha256: Sha256
     cited_anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
@@ -918,6 +920,7 @@ class RiskAssessment(RiskAssessmentDraft):
                 if (
                     report.snapshot_key != self.snapshot_key
                     or report.context_sha256 != self.context_sha256
+                    or report.evidence_envelope_sha256 != self.evidence_envelope_sha256
                     or report.hypothesis_sha256
                     != canonical_sha256(hypothesis.model_dump(mode="json"))
                 ):

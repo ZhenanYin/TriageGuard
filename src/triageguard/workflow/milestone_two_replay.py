@@ -205,10 +205,13 @@ class _TemplateReplayGateway:
         if not isinstance(raw_template, Mapping):
             raise TypeError("The risk fixture lacked the requested recorded outcome.")
 
-        snapshot = _mapping_value(request.payload, "snapshot")
-        context_limits = _mapping_value(request.payload, "context_limits")
-        snapshot_key = _string_value(snapshot, "snapshot_key")
-        context_sha256 = _string_value(context_limits, "context_sha256")
+        snapshot_key = _string_value(request.payload, "snapshot_key")
+        context_sha256 = _string_value(request.payload, "context_sha256")
+        evidence_envelope = _mapping_value(request.payload, "evidence_envelope")
+        evidence_envelope_sha256 = _string_value(
+            evidence_envelope,
+            "envelope_sha256",
+        )
         integration_anchor_id = _integration_anchor_id(request.payload)
 
         result = _substitute(
@@ -216,6 +219,7 @@ class _TemplateReplayGateway:
             {
                 "__SNAPSHOT_KEY__": snapshot_key,
                 "__CONTEXT_SHA256__": context_sha256,
+                "__EVIDENCE_ENVELOPE_SHA256__": evidence_envelope_sha256,
                 "__INTEGRATION_ANCHOR_ID__": integration_anchor_id,
             },
         )
@@ -423,7 +427,11 @@ def _string_value(
 
 def _integration_anchor_id(payload: Mapping[str, Any]) -> str:
     """Require exactly one citeable primary integration anchor in the request."""
-    anchors = payload.get("context_anchors")
+    raw_envelope = payload.get("evidence_envelope")
+    if isinstance(raw_envelope, Mapping):
+        anchors = raw_envelope.get("visible_anchors")
+    else:
+        anchors = payload.get("context_anchors")
     if not isinstance(anchors, list):
         raise TypeError("The synthetic replay request lacked context anchors.")
 

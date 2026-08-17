@@ -11,12 +11,21 @@ from triageguard.domain.pr_analysis import (
     ContextBundle,
     PullRequestSnapshot,
 )
+from triageguard.evidence import (
+    EvidenceArtifactBinding,
+    ModelEvidenceBudgetError,
+    ModelEvidenceEnvelope,
+)
+from triageguard.hypotheses import generator as risk_generator
 from triageguard.hypotheses.generator import (
+    build_risk_evidence,
     build_risk_request,
     generate_risk_assessment,
 )
+from triageguard.llm import ModelOutputInvalid
 from triageguard.llm.replay_gateway import ReplayGateway
-from triageguard.provenance import canonical_json
+from triageguard.llm.request_budget import ProviderRequestBudget
+from triageguard.provenance import canonical_json, canonical_sha256
 
 
 def _snapshot() -> PullRequestSnapshot:
@@ -119,47 +128,203 @@ def _context(snapshot: PullRequestSnapshot) -> ContextBundle:
     )
 
 
-def test_risk_request_contains_only_frozen_evidence() -> None:
-    """The model receives immutable evidence, never process configuration."""
+def _envelope(
+    snapshot: PullRequestSnapshot,
+    context: ContextBundle,
+    diffs: tuple[object, ...],
+) -> ModelEvidenceEnvelope:
+    """Expose the exact complete anchor used by the risk model."""
+    return ModelEvidenceEnvelope.from_content(
+        stage="risk_hypothesis",
+        snapshot_key=snapshot.snapshot_key,
+        context_sha256=context.context_sha256,
+        comparison_bindings=tuple(
+            EvidenceArtifactBinding(name=diff.kind, sha256=diff.artifact_sha256)
+            for diff in diffs
+        ),
+        input_bindings=(),
+        visible_anchors=tuple(
+            {
+                "anchor_id": anchor.anchor_id,
+                "revision_role": anchor.revision_role,
+                "path": anchor.path,
+                "java_symbol": anchor.java_symbol,
+                "start_line": anchor.start_line,
+                "end_line": anchor.end_line,
+                "change_relation": anchor.change_relation,
+                "visible_text": anchor.text,
+                "source_text_sha256": anchor.text_sha256,
+                "visible_text_sha256": anchor.text_sha256,
+                "selection_reason": "required_by_stage",
+            }
+            for anchor in context.anchors
+        ),
+        omitted_anchors=(),
+        catalog_anchor_ids=tuple(anchor.anchor_id for anchor in context.anchors),
+        max_request_body_bytes=7_000,
+        selection_policy_version="risk-evidence-v1",
+        output_schema_sha256=canonical_sha256(risk_generator.RISK_OUTPUT_SCHEMA),
+    )
+
+
+def test_risk_request_contains_the_exact_immutable_evidence_envelope() -> None:
+    """The risk model must see and echo the envelope that defines visibility."""
     snapshot = _snapshot()
+    diffs = _diffs(snapshot)
     context = _context(snapshot)
+    envelope = _envelope(snapshot, context, diffs)
 
     request = build_risk_request(
         snapshot=snapshot,
+        diffs=diffs,
+        context=context,
+        evidence_envelope=envelope,
+    )
+
+    assert request.payload["evidence_envelope"] == envelope.model_dump(mode="json")
+    assert (
+        request.output_schema["properties"]["evidence_envelope_sha256"]["pattern"]
+        == "^[0-9a-f]{64}$"
+    )
+    assert "text_truncated_for_model" not in canonical_json(request.payload)
+
+
+def test_risk_evidence_builder_measures_the_exact_whole_anchor_request() -> None:
+    """The real risk schema and complete anchor fit the declared wire budget."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    result = build_risk_evidence(
+        snapshot=snapshot,
         diffs=_diffs(snapshot),
         context=context,
+        budget=ProviderRequestBudget(
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            max_body_bytes=7_000,
+        ),
+    )
+
+    assert result.request_body_bytes <= result.envelope.max_request_body_bytes
+    assert result.envelope.visible_anchors[0].visible_text == context.anchors[0].text
+    assert result.envelope.visible_anchors[0].source_text_sha256 == (
+        context.anchors[0].text_sha256
+    )
+
+
+def test_risk_request_contains_only_frozen_evidence() -> None:
+    """The model receives immutable evidence, never process configuration."""
+    snapshot = _snapshot()
+    diffs = _diffs(snapshot)
+    context = _context(snapshot)
+    envelope = _envelope(snapshot, context, diffs)
+
+    request = build_risk_request(
+        snapshot=snapshot,
+        diffs=diffs,
+        context=context,
+        evidence_envelope=envelope,
     )
 
     serialized = canonical_json(request.payload)
     assert request.purpose == "risk_hypothesis"
     assert set(request.payload) == {
-        "snapshot",
-        "diff_summaries",
-        "context_anchors",
-        "context_limits",
+        "snapshot_key",
+        "context_sha256",
+        "comparisons",
+        "evidence_envelope",
         "output_rules",
     }
+    assert request.payload["snapshot_key"] == snapshot.snapshot_key
+    assert request.payload["context_sha256"] == context.context_sha256
+    assert [item["comparison"] for item in request.payload["comparisons"]] == [
+        "author_change",
+        "merge_impact",
+        "main_branch_drift",
+    ]
     assert snapshot.snapshot_key in serialized
     assert context.context_sha256 in serialized
+    assert snapshot.merge_base_sha not in serialized
     assert "GROQ_API_KEY" not in serialized
     assert "GITHUB_TOKEN" not in serialized
     assert request.output_schema["additionalProperties"] is False
-    assert request.payload["output_rules"]["readable_hypothesis_rule"] == (
-        "Write explanation as one complete, readable paragraph stating what "
-        "changed, what could go wrong, the expected protection, why it was "
-        "suggested, and that it remains unconfirmed."
+    assert "Write each explanation as one readable" in request.system_prompt
+
+
+def test_risk_request_rejects_a_required_anchor_instead_of_slicing_it() -> None:
+    """A required whole anchor that cannot fit fails before any model call."""
+    snapshot = _snapshot()
+    source_text = "x" * 4_000
+    relations = (
+        "integration_change",
+        "author_change",
+        "base_drift_change",
     )
+    anchors = tuple(
+        ContextAnchor(
+            anchor_id=f"anchor-{relation}-{index}",
+            revision_role="candidate",
+            commit_sha=snapshot.candidate_sha,
+            blob_sha="4" * 40,
+            path=f"api/{relation}-{index}.java",
+            java_symbol="riskTarget",
+            start_line=1,
+            end_line=1,
+            text=f"{relation} {source_text}",
+            text_sha256=hashlib.sha256(
+                f"{relation} {source_text}".encode()
+            ).hexdigest(),
+            selection_reason="synthetic large frozen evidence",
+            score_components=(),
+            change_relation=relation,
+            truncated=False,
+        )
+        for index, relation in enumerate(
+            (*relations, *("repository_context",) * 10),
+        )
+    )
+    context = ContextBundle.from_content(
+        snapshot_key=snapshot.snapshot_key,
+        anchors=anchors,
+        selected_file_count=len(anchors),
+        selected_anchor_count=len(anchors),
+        selected_bytes=sum(len(anchor.text.encode("utf-8")) for anchor in anchors),
+        max_files=40,
+        max_anchors=80,
+        max_bytes=160_000,
+        max_anchor_lines=120,
+        max_blob_bytes=1_000_000,
+        max_search_identifiers=100,
+        max_hits_per_identifier=20,
+        primary_change_represented=True,
+    )
+
+    with pytest.raises(
+        ModelEvidenceBudgetError,
+        match="required anchor",
+    ):
+        build_risk_evidence(
+            snapshot=snapshot,
+            diffs=_diffs(snapshot),
+            context=context,
+            budget=ProviderRequestBudget(
+                provider="groq",
+                model="openai/gpt-oss-120b",
+                max_body_bytes=7_000,
+            ),
+        )
 
 
 def _model_response(
     snapshot: PullRequestSnapshot,
     context: ContextBundle,
+    evidence_envelope: ModelEvidenceEnvelope,
     outcome: str,
 ) -> dict[str, object]:
     """Return one schema-valid prerecorded model response."""
     response: dict[str, object] = {
         "snapshot_key": snapshot.snapshot_key,
         "context_sha256": context.context_sha256,
+        "evidence_envelope_sha256": evidence_envelope.envelope_sha256,
         "outcome": outcome,
         "hypotheses": [],
         "rationale": None,
@@ -285,12 +450,15 @@ def test_generate_risk_assessment_accepts_each_allowed_outcome(
 ) -> None:
     """Every permitted structured outcome remains an unconfirmed draft."""
     snapshot = _snapshot()
+    diffs = _diffs(snapshot)
     context = _context(snapshot)
+    evidence_envelope = _envelope(snapshot, context, diffs)
     gateway = ReplayGateway(
         {
             "risk_hypothesis": _model_response(
                 snapshot,
                 context,
+                evidence_envelope,
                 outcome,
             )
         }
@@ -298,8 +466,9 @@ def test_generate_risk_assessment_accepts_each_allowed_outcome(
 
     assessment, response = generate_risk_assessment(
         snapshot=snapshot,
-        diffs=_diffs(snapshot),
+        diffs=diffs,
         context=context,
+        evidence_envelope=evidence_envelope,
         gateway=gateway,
     )
 
@@ -312,3 +481,62 @@ def test_generate_risk_assessment_accepts_each_allowed_outcome(
         "hypothesis_id" not in hypothesis.model_dump(mode="json")
         for hypothesis in assessment.hypotheses
     )
+
+
+def test_invalid_risk_draft_retains_secret_free_model_failure_provenance() -> None:
+    """A schema-valid but incoherent proposal remains attributable for diagnosis."""
+    snapshot = _snapshot()
+    diffs = _diffs(snapshot)
+    context = _context(snapshot)
+    evidence_envelope = _envelope(snapshot, context, diffs)
+    response = _model_response(
+        snapshot,
+        context,
+        evidence_envelope,
+        "risks_proposed",
+    )
+    response["hypotheses"] = []
+    gateway = ReplayGateway({"risk_hypothesis": response})
+
+    with pytest.raises(ModelOutputInvalid) as error:
+        generate_risk_assessment(
+            snapshot=snapshot,
+            diffs=diffs,
+            context=context,
+            evidence_envelope=evidence_envelope,
+            gateway=gateway,
+        )
+
+    provenance = error.value.provenance
+    assert provenance is not None
+    assert provenance.provider == "replay"
+    assert provenance.purpose == "risk_hypothesis"
+    assert provenance.final_outcome == "invalid_output"
+    assert provenance.reason_code == "risk_assessment_invalid"
+    assert provenance.response_sha256 is not None
+    assert provenance.error_sha256 is not None
+    assert provenance.attempts == error.value.attempts
+
+
+def test_risk_response_must_echo_the_exact_evidence_envelope_hash() -> None:
+    """A valid-looking response cannot detach itself from model-visible evidence."""
+    snapshot = _snapshot()
+    diffs = _diffs(snapshot)
+    context = _context(snapshot)
+    evidence_envelope = _envelope(snapshot, context, diffs)
+    response = _model_response(
+        snapshot,
+        context,
+        evidence_envelope,
+        "insufficient_context_to_assess",
+    )
+    response["evidence_envelope_sha256"] = "f" * 64
+
+    with pytest.raises(ModelOutputInvalid, match="envelope hash"):
+        generate_risk_assessment(
+            snapshot=snapshot,
+            diffs=diffs,
+            context=context,
+            evidence_envelope=evidence_envelope,
+            gateway=ReplayGateway({"risk_hypothesis": response}),
+        )

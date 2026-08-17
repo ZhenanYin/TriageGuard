@@ -48,7 +48,7 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 - [x] Task 2 — Represent unchanged comparisons as canonical artifacts
 - [x] Task 3 — Centralize exact provider request sizing and policy
 - [x] Task 4 — Add the immutable model-evidence envelope
-- [ ] Task 5 — Migrate risk generation and validation to visible evidence
+- [x] Task 5 — Migrate risk generation and validation to visible evidence
 - [ ] Task 6 — Migrate testability and Gherkin to visible evidence
 - [ ] Task 7 — Add bounded frozen-evidence refinement at model boundaries
 - [ ] Task 8 — Unify model-stage execution, failure provenance, and recovery
@@ -75,6 +75,13 @@ canonical-order, exact-text, whole-anchor selection, stage-policy, and exact
 request-size regressions: 22 passed. The exact Task 4 commit passed all 792
 collected regressions; the combined working tree, including seven preserved
 diagnostic tests, passed all 799.
+
+Task 5 completed on 2026-08-17. Risk request, visible-only citation and
+identifier validation, durable envelope/response ordering, tamper recovery,
+and failure-provenance regressions: 36 passed. The combined working tree passed
+all 805 collected regressions. The offline OpenMRS-shaped risk request retained
+both mandatory whole anchors while staying below the unchanged 7,000-byte
+policy; no excerpt slicing or stage-specific wire estimator remains.
 
 ---
 

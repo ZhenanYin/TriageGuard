@@ -14,7 +14,7 @@ from triageguard.domain import (
     PullRequestSnapshot,
     SnapshotFreshness,
 )
-from triageguard.llm import ReplayGateway
+from triageguard.llm import ModelGatewayError, ReplayGateway
 from triageguard.research import ArtifactRecorder
 from triageguard.workflow.milestone_two import (
     MilestoneTwoDependencies,
@@ -192,6 +192,65 @@ def test_resume_rejects_tampered_prepared_evidence(tmp_path) -> None:
         / "prepared.json"
     )
     prepared_file.write_bytes(b'{"tampered": true}\n')
+
+    with pytest.raises(MilestoneTwoTransitionError, match="does not match its journal"):
+        resume_milestone_two_workflow(
+            run_handle=workflow.run_handle,
+            dependencies=dependencies,
+        )
+
+
+def test_resume_rejects_a_tampered_risk_evidence_envelope(tmp_path) -> None:
+    """Recovery cannot ground a response after its visibility boundary changes."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    diffs = (
+        _diff("author_diff", snapshot.merge_base_sha, snapshot.head_sha, "a" * 64),
+        _diff(
+            "integration_diff",
+            snapshot.base_sha,
+            snapshot.candidate_sha,
+            "b" * 64,
+        ),
+        _diff(
+            "base_drift_diff",
+            snapshot.merge_base_sha,
+            snapshot.base_sha,
+            "c" * 64,
+        ),
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-tampered-risk-envelope-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    workflow.prepare_pr("https://github.com/openmrs/openmrs-core/pull/900000002")
+
+    with pytest.raises(ModelGatewayError):
+        workflow.propose_risks()
+
+    envelope_file = (
+        recorder.locate_run(workflow.run_handle.run_id)
+        / "artifacts"
+        / "model_evidence"
+        / "risk_hypothesis.json"
+    )
+    envelope_file.write_bytes(b'{"tampered": true}\n')
 
     with pytest.raises(MilestoneTwoTransitionError, match="does not match its journal"):
         resume_milestone_two_workflow(

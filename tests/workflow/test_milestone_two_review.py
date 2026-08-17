@@ -69,6 +69,7 @@ def _risk_ready_workflow(
     snapshot = object()
     diffs = (object(), object(), object())
     context = object()
+    evidence_envelope = object()
     assessment = object()
     acquirer = _SnapshotAcquirer(snapshot, freshness_status)
 
@@ -91,6 +92,7 @@ def _risk_ready_workflow(
         snapshot: object,
         diffs: object,
         context: object,
+        evidence_envelope: object,
         gateway: object,
     ) -> tuple[object, object]:
         return object(), object()
@@ -100,8 +102,15 @@ def _risk_ready_workflow(
         draft: object,
         snapshot: object,
         context: object,
+        evidence_envelope: object,
     ) -> tuple[object, object]:
         return assessment, object()
+
+    monkeypatch.setattr(
+        milestone_two,
+        "build_risk_evidence",
+        lambda **_kwargs: SimpleNamespace(envelope=evidence_envelope),
+    )
 
     monkeypatch.setattr(
         milestone_two,

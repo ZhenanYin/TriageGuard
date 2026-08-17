@@ -90,6 +90,12 @@ def _gherkin_ready_workflow(
 
     monkeypatch.setattr(
         milestone_two,
+        "build_risk_evidence",
+        lambda **_kwargs: SimpleNamespace(envelope=object()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        milestone_two,
         "generate_risk_assessment",
         lambda **_kwargs: (object(), object()),
         raising=False,

@@ -43,13 +43,23 @@ from triageguard.domain import (
     TestabilityAssessment,
     TestabilityAssessmentDraft,
 )
+from triageguard.evidence import ModelEvidenceEnvelope, validate_envelope_binding
 from triageguard.hypotheses import (
+    RISK_OUTPUT_SCHEMA,
     RiskGroundingReport,
+    build_risk_evidence,
+    build_risk_request,
     create_human_review,
     generate_risk_assessment,
     validate_risk_assessment,
 )
-from triageguard.llm import ModelResponse, StructuredModelGateway
+from triageguard.llm import (
+    ModelFailureProvenance,
+    ModelGatewayError,
+    ModelResponse,
+    StructuredModelGateway,
+)
+from triageguard.llm.request_budget import ProviderRequestBudget
 from triageguard.provenance import canonical_json, canonical_sha256
 from triageguard.research import ArtifactRecorder, RunHandle, RunOwnership
 from triageguard.research.recorder import (
@@ -276,10 +286,12 @@ class MilestoneTwoWorkflow:
             self._run_handle = _run_handle
         self._state = _State.NEW
         self._prepared: PreparedPullRequest | None = None
+        self._risk_evidence_envelope: ModelEvidenceEnvelope | None = None
         self._risk_draft: RiskAssessmentDraft | None = None
         self._risk_response: ModelResponse | None = None
         self._risk_assessment: RiskAssessment | None = None
         self._risk_grounding_report: RiskGroundingReport | None = None
+        self._risk_failure: ModelFailureProvenance | None = None
         self._freshness: SnapshotFreshness | None = None
         self._human_reviewed_risk: HumanReviewedRisk | None = None
         self._testability_draft: TestabilityAssessmentDraft | None = None
@@ -307,6 +319,16 @@ class MilestoneTwoWorkflow:
     def risk_assessment(self) -> RiskAssessment | None:
         """Return the locally grounded assessment after successful proposal."""
         return self._risk_assessment
+
+    @property
+    def risk_evidence_envelope(self) -> ModelEvidenceEnvelope | None:
+        """Return the exact frozen evidence visible to risk generation."""
+        return self._risk_evidence_envelope
+
+    @property
+    def risk_failure(self) -> ModelFailureProvenance | None:
+        """Return the latest safe model-failure provenance for a retryable stage."""
+        return self._risk_failure
 
     @property
     def human_reviewed_risk(self) -> HumanReviewedRisk | None:
@@ -380,34 +402,62 @@ class MilestoneTwoWorkflow:
             )
 
         prepared = self._require_prepared("propose risks")
+        if self._risk_evidence_envelope is None:
+            envelope_result = build_risk_evidence(
+                snapshot=prepared.snapshot,
+                diffs=prepared.diffs,
+                context=prepared.context,
+                budget=ProviderRequestBudget.from_settings(self._settings),
+            )
+            evidence_envelope = envelope_result.envelope
+            if self._is_typed_prepared(prepared):
+                self._persist_risk_evidence_envelope(
+                    prepared=prepared,
+                    evidence_envelope=evidence_envelope,
+                )
+            self._risk_evidence_envelope = evidence_envelope
+        else:
+            evidence_envelope = self._risk_evidence_envelope
         if self._risk_draft is not None and self._risk_response is not None:
             draft = self._risk_draft
             response = self._risk_response
             if (
                 draft.snapshot_key != prepared.snapshot.snapshot_key
                 or draft.context_sha256 != prepared.context.context_sha256
+                or draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256
             ):
                 raise MilestoneTwoTransitionError(
                     "A saved risk response is not bound to the prepared evidence."
                 )
         else:
-            draft, response = generate_risk_assessment(
-                snapshot=prepared.snapshot,
-                diffs=prepared.diffs,
-                context=prepared.context,
-                gateway=self._gateway,
-            )
+            try:
+                draft, response = generate_risk_assessment(
+                    snapshot=prepared.snapshot,
+                    diffs=prepared.diffs,
+                    context=prepared.context,
+                    evidence_envelope=evidence_envelope,
+                    gateway=self._gateway,
+                )
+            except ModelGatewayError as error:
+                if error.provenance is not None:
+                    self._record_risk_failure(
+                        prepared=prepared,
+                        failure=error.provenance,
+                    )
+                raise
             if self._is_typed_prepared(prepared):
                 self._persist_risk_generation(
                     prepared=prepared,
                     draft=draft,
                     response=response,
                 )
+            self._risk_failure = None
 
         assessment, grounding_report = validate_risk_assessment(
             draft=draft,
             snapshot=prepared.snapshot,
             context=prepared.context,
+            evidence_envelope=evidence_envelope,
         )
         if assessment is None:
             raise MilestoneTwoTransitionError(
@@ -584,10 +634,12 @@ class MilestoneTwoWorkflow:
             diffs=prepared.diffs,
             context=refined_context,
         )
+        self._risk_evidence_envelope = None
         self._risk_draft = None
         self._risk_response = None
         self._risk_assessment = None
         self._risk_grounding_report = None
+        self._risk_failure = None
         self._human_reviewed_risk = None
         self._testability_draft = None
         self._testability_response = None
@@ -1087,6 +1139,25 @@ class MilestoneTwoWorkflow:
             reason_code="prepared_evidence_recorded",
         )
 
+    def _persist_risk_evidence_envelope(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        evidence_envelope: ModelEvidenceEnvelope,
+    ) -> None:
+        """Save the exact visibility boundary before invoking the risk model."""
+        self._persist_transition(
+            artifact_name="artifacts/model_evidence/risk_hypothesis.json",
+            event_type="workflow_risk_evidence_selected",
+            payload=evidence_envelope.model_dump(mode="json"),
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+                "evidence_envelope": evidence_envelope.envelope_sha256,
+            },
+            reason_code="risk_evidence_envelope_recorded",
+        )
+
     def _persist_risk_generation(
         self,
         *,
@@ -1095,19 +1166,94 @@ class MilestoneTwoWorkflow:
         response: ModelResponse,
     ) -> None:
         """Save the provider response before local grounding can advance state."""
+        if self._risk_evidence_envelope is None:
+            evidence_envelope = build_risk_evidence(
+                snapshot=prepared.snapshot,
+                diffs=prepared.diffs,
+                context=prepared.context,
+                budget=ProviderRequestBudget.from_settings(self._settings),
+            ).envelope
+            if draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256:
+                raise MilestoneTwoTransitionError(
+                    "Risk response does not bind the selected evidence envelope."
+                )
+            self._persist_risk_evidence_envelope(
+                prepared=prepared,
+                evidence_envelope=evidence_envelope,
+            )
+            self._risk_evidence_envelope = evidence_envelope
+        elif (
+            draft.evidence_envelope_sha256
+            != self._risk_evidence_envelope.envelope_sha256
+        ):
+            raise MilestoneTwoTransitionError(
+                "Risk response does not bind the selected evidence envelope."
+            )
         payload = {
             "draft": draft.model_dump(mode="json"),
             "response": response.model_dump(mode="json"),
         }
         self._persist_transition(
-            artifact_name="artifacts/workflow/risk_generation.json",
+            artifact_name="artifacts/model_responses/risk_hypothesis.json",
             event_type="workflow_risk_generation",
             payload=payload,
             input_hashes={
                 "snapshot": prepared.snapshot.snapshot_key,
                 "context": prepared.context.context_sha256,
+                "evidence_envelope": draft.evidence_envelope_sha256,
             },
             reason_code="risk_response_recorded",
+        )
+
+    def _record_risk_failure(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        failure: ModelFailureProvenance,
+    ) -> None:
+        """Persist the first safe failure for this retryable model stage."""
+        if self._risk_failure is not None:
+            return
+        if self._is_typed_prepared(prepared):
+            self._persist_risk_failure(prepared=prepared, failure=failure)
+        self._risk_failure = failure
+
+    def _persist_risk_failure(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        failure: ModelFailureProvenance,
+    ) -> None:
+        """Save safe provider metadata without retaining request or error content."""
+        if failure.purpose != "risk_hypothesis":
+            raise MilestoneTwoTransitionError(
+                "Risk-failure provenance does not belong to the risk-proposal stage."
+            )
+        payload = {
+            "snapshot_key": prepared.snapshot.snapshot_key,
+            "context_sha256": prepared.context.context_sha256,
+            "evidence_envelope_sha256": (
+                self._risk_evidence_envelope.envelope_sha256
+                if self._risk_evidence_envelope is not None
+                else None
+            ),
+            "failure": failure.model_dump(mode="json"),
+        }
+        self._persist_transition(
+            artifact_name="artifacts/workflow/risk_generation_failure.json",
+            event_type="workflow_risk_generation_failure",
+            payload=payload,
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+                "evidence_envelope": (
+                    self._risk_evidence_envelope.envelope_sha256
+                    if self._risk_evidence_envelope is not None
+                    else "0" * 64
+                ),
+                "request": failure.request_sha256,
+            },
+            reason_code=failure.reason_code,
         )
 
     def _persist_human_review(
@@ -1573,6 +1719,42 @@ class MilestoneTwoWorkflow:
         """Rebuild only verified completed or recoverable durable workflow stages."""
         terminal_record = self._load_terminal_record()
         if terminal_record is not None:
+            terminal_assessment = terminal_record.risk_assessment
+            if terminal_assessment is not None:
+                envelope_item = self._load_durable_artifact(
+                    "artifacts/model_evidence/risk_hypothesis.json"
+                )
+                if envelope_item is None:
+                    raise MilestoneTwoTransitionError(
+                        "The terminal risk assessment is missing its evidence envelope."
+                    )
+                envelope_payload, _envelope_event = envelope_item
+                try:
+                    evidence_envelope = ModelEvidenceEnvelope.model_validate(
+                        envelope_payload
+                    )
+                    evidence_envelope = validate_envelope_binding(
+                        envelope=evidence_envelope,
+                        stage="risk_hypothesis",
+                        context=terminal_assessment.context_bundle,
+                        comparison_bindings=evidence_envelope.comparison_bindings,
+                        input_bindings=(),
+                        output_schema_sha256=canonical_sha256(RISK_OUTPUT_SCHEMA),
+                        max_request_body_bytes=self._settings.max_model_request_bytes,
+                    )
+                    if (
+                        evidence_envelope.selection_policy_version != "risk-evidence-v1"
+                        or evidence_envelope.envelope_sha256
+                        != terminal_assessment.evidence_envelope_sha256
+                    ):
+                        raise ValueError(
+                            "terminal assessment does not bind the risk envelope"
+                        )
+                except (TypeError, ValueError) as error:
+                    raise MilestoneTwoTransitionError(
+                        "The terminal risk evidence envelope is invalid."
+                    ) from error
+                self._risk_evidence_envelope = evidence_envelope
             self._started_at = terminal_record.started_at
             self._terminal_record = terminal_record
             self._freshness = terminal_record.freshness
@@ -1629,10 +1811,74 @@ class MilestoneTwoWorkflow:
         self._prepared = prepared
         self._state = _State.PREPARED
 
-        risk_item = self._load_durable_artifact(
-            "artifacts/workflow/risk_generation.json"
+        envelope_item = self._load_durable_artifact(
+            "artifacts/model_evidence/risk_hypothesis.json"
         )
+        risk_item = self._load_durable_artifact(
+            "artifacts/model_responses/risk_hypothesis.json"
+        )
+        failure_item = self._load_durable_artifact(
+            "artifacts/workflow/risk_generation_failure.json"
+        )
+        if envelope_item is None:
+            if risk_item is not None or failure_item is not None:
+                raise MilestoneTwoTransitionError(
+                    "The saved risk stage is missing its evidence envelope."
+                )
+            return
+
+        envelope_payload, _envelope_event = envelope_item
+        try:
+            evidence_envelope = ModelEvidenceEnvelope.model_validate(envelope_payload)
+            build_risk_request(
+                snapshot=prepared.snapshot,
+                diffs=prepared.diffs,
+                context=prepared.context,
+                evidence_envelope=evidence_envelope,
+            )
+            if (
+                evidence_envelope.max_request_body_bytes
+                != self._settings.max_model_request_bytes
+            ):
+                raise ValueError("saved envelope uses a different request budget")
+        except (TypeError, ValueError) as error:
+            raise MilestoneTwoTransitionError(
+                "The saved risk evidence envelope is invalid."
+            ) from error
+        self._risk_evidence_envelope = evidence_envelope
+
         if risk_item is None:
+            if failure_item is None:
+                return
+            failure_payload, _failure_event = failure_item
+            try:
+                saved_snapshot_key = failure_payload["snapshot_key"]
+                saved_context_sha256 = failure_payload["context_sha256"]
+                saved_envelope_sha256 = failure_payload["evidence_envelope_sha256"]
+                saved_failure = failure_payload["failure"]
+                if (
+                    not isinstance(saved_snapshot_key, str)
+                    or not isinstance(saved_context_sha256, str)
+                    or not isinstance(saved_envelope_sha256, str)
+                    or not isinstance(saved_failure, dict)
+                ):
+                    raise TypeError("risk-failure payload structure is invalid")
+                failure = ModelFailureProvenance.model_validate(saved_failure)
+            except (KeyError, TypeError, ValueError) as error:
+                raise MilestoneTwoTransitionError(
+                    "The saved risk-failure provenance is invalid."
+                ) from error
+
+            if (
+                saved_snapshot_key != prepared.snapshot.snapshot_key
+                or saved_context_sha256 != prepared.context.context_sha256
+                or saved_envelope_sha256 != evidence_envelope.envelope_sha256
+                or failure.purpose != "risk_hypothesis"
+            ):
+                raise MilestoneTwoTransitionError(
+                    "The saved risk-failure provenance is not bound to prepared evidence."
+                )
+            self._risk_failure = failure
             return
 
         risk_payload, _risk_event = risk_item
@@ -1653,6 +1899,8 @@ class MilestoneTwoWorkflow:
         if (
             draft.snapshot_key != prepared.snapshot.snapshot_key
             or draft.context_sha256 != prepared.context.context_sha256
+            or draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256
+            or response.data != draft.model_dump(mode="json")
         ):
             raise MilestoneTwoTransitionError(
                 "The saved risk response is not bound to prepared evidence."
@@ -1661,6 +1909,7 @@ class MilestoneTwoWorkflow:
             draft=draft,
             snapshot=prepared.snapshot,
             context=prepared.context,
+            evidence_envelope=evidence_envelope,
         )
         if assessment is None:
             raise MilestoneTwoTransitionError(

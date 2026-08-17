@@ -15,7 +15,12 @@ from triageguard.domain import (
     PullRequestSnapshot,
     SnapshotFreshness,
 )
-from triageguard.llm import ModelRequest, ModelResponse, ReplayGateway
+from triageguard.llm import (
+    ModelGatewayError,
+    ModelRequest,
+    ModelResponse,
+    ReplayGateway,
+)
 from triageguard.research import ArtifactRecorder
 from triageguard.workflow.milestone_two import (
     MilestoneTwoDependencies,
@@ -29,12 +34,16 @@ class _CountingGateway:
     """Count each model request while using a fixed replay response."""
 
     def __init__(self, response: dict[str, object]) -> None:
-        self._replay = ReplayGateway({"risk_hypothesis": response})
+        self._response = response
         self.call_count = 0
 
     def generate(self, request: ModelRequest) -> ModelResponse:
         self.call_count += 1
-        return self._replay.generate(request)
+        response = dict(self._response)
+        envelope = request.payload["evidence_envelope"]
+        assert isinstance(envelope, dict)
+        response["evidence_envelope_sha256"] = envelope["envelope_sha256"]
+        return ReplayGateway({"risk_hypothesis": response}).generate(request)
 
 
 class _InterruptAfterRiskArtifactRecorder(ArtifactRecorder):
@@ -48,7 +57,7 @@ class _InterruptAfterRiskArtifactRecorder(ArtifactRecorder):
         result = super().write_artifact(handle, name, content, provenance)
         if (
             self.interrupt_after_risk_response
-            and name == "artifacts/workflow/risk_generation.json"
+            and name == "artifacts/model_responses/risk_hypothesis.json"
         ):
             self.interrupt_after_risk_response = False
             raise OSError("simulated interruption after durable model response")
@@ -192,6 +201,7 @@ def _risk_response(
     return {
         "snapshot_key": snapshot.snapshot_key,
         "context_sha256": context.context_sha256,
+        "evidence_envelope_sha256": "0" * 64,
         "outcome": "insufficient_context_to_assess",
         "hypotheses": [],
         "rationale": None,
@@ -261,6 +271,22 @@ def test_resume_reuses_a_durable_risk_response_without_another_model_call(
         first.propose_risks()
 
     assert gateway.call_count == 1
+    saved_envelope = json.loads(
+        recorder.read_artifact(
+            first.run_handle,
+            "artifacts/model_evidence/risk_hypothesis.json",
+        )
+    )
+    saved_response = json.loads(
+        recorder.read_artifact(
+            first.run_handle,
+            "artifacts/model_responses/risk_hypothesis.json",
+        )
+    )
+    assert (
+        saved_response["draft"]["evidence_envelope_sha256"]
+        == (saved_envelope["envelope_sha256"])
+    )
 
     resumed = resume_milestone_two_workflow(
         run_handle=first.run_handle,
@@ -271,6 +297,78 @@ def test_resume_reuses_a_durable_risk_response_without_another_model_call(
     assert assessment is not None
     assert assessment.outcome == "insufficient_context_to_assess"
     assert gateway.call_count == 1
+
+
+def test_risk_generation_failure_is_saved_and_survives_a_restart(tmp_path) -> None:
+    """A failed model call must leave a safe, retryable diagnostic record."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    diffs = (
+        _diff(
+            kind="author_diff",
+            old_revision=snapshot.merge_base_sha,
+            new_revision=snapshot.head_sha,
+            digest="a" * 64,
+        ),
+        _diff(
+            kind="integration_diff",
+            old_revision=snapshot.base_sha,
+            new_revision=snapshot.candidate_sha,
+            digest="b" * 64,
+        ),
+        _diff(
+            kind="base_drift_diff",
+            old_revision=snapshot.merge_base_sha,
+            new_revision=snapshot.base_sha,
+            digest="c" * 64,
+        ),
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-risk-failure-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    workflow.prepare_pr("https://github.com/openmrs/openmrs-core/pull/900000001")
+
+    with pytest.raises(ModelGatewayError) as error:
+        workflow.propose_risks()
+
+    provenance = error.value.provenance
+    assert provenance is not None
+    assert workflow.risk_failure == provenance
+    saved = json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/workflow/risk_generation_failure.json",
+        )
+    )
+    assert saved["snapshot_key"] == snapshot.snapshot_key
+    assert saved["context_sha256"] == context.context_sha256
+    assert saved["failure"]["reason_code"] == "replay_response_missing"
+    assert "no replay response" not in json.dumps(saved)
+
+    resumed = resume_milestone_two_workflow(
+        run_handle=workflow.run_handle,
+        dependencies=dependencies,
+    )
+
+    assert resumed.risk_assessment is None
+    assert resumed.risk_failure == provenance
 
 
 def test_nonrisk_terminal_measurements_bind_every_planned_stage(tmp_path) -> None:

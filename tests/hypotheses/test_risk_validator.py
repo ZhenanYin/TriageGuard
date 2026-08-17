@@ -13,9 +13,18 @@ from triageguard.domain.pr_analysis import (
     RiskAssessmentDraft,
     RiskHypothesisDraft,
 )
+from triageguard.evidence import (
+    EvidenceArtifactBinding,
+    ModelEvidenceEnvelope,
+    OmittedEvidenceAnchor,
+    VisibleEvidenceAnchor,
+)
+from triageguard.hypotheses.generator import RISK_OUTPUT_SCHEMA
 from triageguard.hypotheses.validator import (
     create_human_review,
-    validate_risk_assessment,
+)
+from triageguard.hypotheses.validator import (
+    validate_risk_assessment as _validate_risk_assessment,
 )
 from triageguard.provenance import canonical_sha256
 
@@ -78,6 +87,68 @@ def _context(snapshot: PullRequestSnapshot) -> ContextBundle:
         max_search_identifiers=100,
         max_hits_per_identifier=20,
         primary_change_represented=True,
+    )
+
+
+def _envelope(
+    context: ContextBundle,
+    *,
+    visible_anchor_ids: tuple[str, ...] | None = None,
+) -> ModelEvidenceEnvelope:
+    """Create the immutable model-visible partition used by validator tests."""
+    visible_ids = set(
+        visible_anchor_ids
+        if visible_anchor_ids is not None
+        else (anchor.anchor_id for anchor in context.anchors)
+    )
+    return ModelEvidenceEnvelope.from_content(
+        stage="risk_hypothesis",
+        snapshot_key=context.snapshot_key,
+        context_sha256=context.context_sha256,
+        comparison_bindings=tuple(
+            EvidenceArtifactBinding(name=name, sha256=digest)
+            for name, digest in (
+                ("author_diff", "a" * 64),
+                ("base_drift_diff", "b" * 64),
+                ("integration_diff", "c" * 64),
+            )
+        ),
+        input_bindings=(),
+        visible_anchors=tuple(
+            VisibleEvidenceAnchor.from_context_anchor(anchor).model_copy(
+                update={"selection_reason": "required_by_stage"}
+            )
+            for anchor in context.anchors
+            if anchor.anchor_id in visible_ids
+        ),
+        omitted_anchors=tuple(
+            OmittedEvidenceAnchor(
+                anchor_id=anchor.anchor_id,
+                reason="request_budget",
+            )
+            for anchor in context.anchors
+            if anchor.anchor_id not in visible_ids
+        ),
+        catalog_anchor_ids=tuple(anchor.anchor_id for anchor in context.anchors),
+        max_request_body_bytes=7_000,
+        selection_policy_version="risk-evidence-v1",
+        output_schema_sha256=canonical_sha256(RISK_OUTPUT_SCHEMA),
+    )
+
+
+def validate_risk_assessment(
+    *,
+    draft: RiskAssessmentDraft,
+    snapshot: PullRequestSnapshot,
+    context: ContextBundle,
+    evidence_envelope: ModelEvidenceEnvelope | None = None,
+):
+    """Keep fixtures concise while every validation uses an explicit envelope."""
+    return _validate_risk_assessment(
+        draft=draft,
+        snapshot=snapshot,
+        context=context,
+        evidence_envelope=evidence_envelope or _envelope(context),
     )
 
 
@@ -153,10 +224,100 @@ def _risk_draft(
     return RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_envelope(context).envelope_sha256,
         outcome="risks_proposed",
         hypotheses=(hypothesis,),
         generated_at=datetime(2026, 8, 12, tzinfo=UTC),
     )
+
+
+def test_validator_rejects_an_anchor_that_exists_but_was_hidden_from_the_model() -> (
+    None
+):
+    """Frozen-but-omitted evidence cannot retroactively legitimize a model claim."""
+    snapshot = _snapshot()
+    visible = _context(snapshot).anchors[0]
+    hidden_text = "void hiddenAuthorizationBypass() {}\n"
+    hidden = ContextAnchor(
+        anchor_id="anchor-hidden",
+        revision_role="candidate",
+        commit_sha=snapshot.candidate_sha,
+        blob_sha="5" * 40,
+        path="api/HiddenService.java",
+        java_symbol="hiddenAuthorizationBypass",
+        start_line=1,
+        end_line=1,
+        text=hidden_text,
+        text_sha256=hashlib.sha256(hidden_text.encode()).hexdigest(),
+        selection_reason="repository context",
+        score_components=(),
+        change_relation="repository_context",
+        truncated=False,
+    )
+    context = ContextBundle.from_content(
+        snapshot_key=snapshot.snapshot_key,
+        anchors=(visible, hidden),
+        selected_file_count=2,
+        selected_anchor_count=2,
+        selected_bytes=len(visible.text.encode()) + len(hidden_text.encode()),
+        max_files=40,
+        max_anchors=80,
+        max_bytes=160_000,
+        max_anchor_lines=120,
+        max_blob_bytes=1_000_000,
+        max_search_identifiers=100,
+        max_hits_per_identifier=20,
+        primary_change_represented=True,
+    )
+    envelope = _envelope(context, visible_anchor_ids=(visible.anchor_id,))
+    draft = _risk_draft(snapshot, context)
+    hypothesis = draft.hypotheses[0]
+    hidden_bindings = tuple(
+        binding.model_copy(update={"anchor_ids": (hidden.anchor_id,)})
+        for binding in hypothesis.evidence_bindings
+    )
+    hidden_hypothesis = hypothesis.model_copy(
+        update={
+            "code_identifiers": ("hiddenAuthorizationBypass",),
+            "evidence_bindings": hidden_bindings,
+        }
+    )
+    hidden_draft = draft.model_copy(
+        update={
+            "evidence_envelope_sha256": envelope.envelope_sha256,
+            "hypotheses": (hidden_hypothesis,),
+        }
+    )
+
+    assessment, report = validate_risk_assessment(
+        draft=hidden_draft,
+        snapshot=snapshot,
+        context=context,
+        evidence_envelope=envelope,
+    )
+
+    assert assessment is None
+    assert "unknown_evidence_anchor" in report.reason_codes
+
+
+def test_validator_rejects_a_tampered_evidence_envelope_before_grounding() -> None:
+    """Changing envelope content without recomputing its identity fails closed."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    envelope = _envelope(context)
+    tampered = envelope.model_copy(
+        update={"max_request_body_bytes": envelope.max_request_body_bytes + 1}
+    )
+
+    assessment, report = validate_risk_assessment(
+        draft=_risk_draft(snapshot, context),
+        snapshot=snapshot,
+        context=context,
+        evidence_envelope=tampered,
+    )
+
+    assert assessment is None
+    assert report.reason_codes == ("invalid_evidence_envelope",)
 
 
 def test_hallucinated_anchor_is_rejected() -> None:
@@ -359,6 +520,7 @@ def test_no_risk_outcome_rejects_an_unknown_supporting_anchor() -> None:
     draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_envelope(context).envelope_sha256,
         outcome="no_meaningful_security_risk_found",
         rationale=(
             "The bounded evidence does not show a specific testable security-risk "
@@ -477,6 +639,7 @@ def test_valid_no_risk_outcome_remains_bound_to_integration_evidence() -> None:
     draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_envelope(context).envelope_sha256,
         outcome="no_meaningful_security_risk_found",
         rationale=(
             "The bounded evidence does not show a specific testable security-risk "
@@ -509,6 +672,7 @@ def test_valid_insufficient_context_outcome_is_retained() -> None:
     draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_envelope(context).envelope_sha256,
         outcome="insufficient_context_to_assess",
         reason_code="analysis_limit_exceeded",
         missing_evidence=(

@@ -41,10 +41,14 @@ from triageguard.domain import (
     TestabilityBinding as FrozenTestabilityBinding,
 )
 from triageguard.hypotheses import (
+    build_risk_evidence,
     create_human_review,
-    validate_risk_assessment,
+)
+from triageguard.hypotheses import (
+    validate_risk_assessment as _validate_risk_assessment,
 )
 from triageguard.llm import ModelAttempt, ModelResponse, ReplayGateway
+from triageguard.llm.request_budget import ProviderRequestBudget
 from triageguard.provenance import canonical_sha256
 from triageguard.research import ArtifactRecorder
 from triageguard.workflow import milestone_two
@@ -184,6 +188,38 @@ def _diffs(
             patch_sha256=hashlib.sha256(b"").hexdigest(),
             artifact_sha256="c" * 64,
         ),
+    )
+
+
+def _risk_envelope(
+    snapshot: PullRequestSnapshot,
+    context: ContextBundle,
+):
+    """Build the exact model-visible risk evidence used by durable fixtures."""
+    return build_risk_evidence(
+        snapshot=snapshot,
+        diffs=_diffs(snapshot),
+        context=context,
+        budget=ProviderRequestBudget(
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            max_body_bytes=7_000,
+        ),
+    ).envelope
+
+
+def validate_risk_assessment(
+    *,
+    draft: RiskAssessmentDraft,
+    snapshot: PullRequestSnapshot,
+    context: ContextBundle,
+):
+    """Validate durable fixtures against their exact risk envelope."""
+    return _validate_risk_assessment(
+        draft=draft,
+        snapshot=snapshot,
+        context=context,
+        evidence_envelope=_risk_envelope(snapshot, context),
     )
 
 
@@ -583,6 +619,7 @@ def _assessment(
     draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_risk_envelope(snapshot, context).envelope_sha256,
         outcome="risks_proposed",
         hypotheses=(_human_review(snapshot).reviewed_risk,),
         generated_at=datetime(2026, 8, 15, tzinfo=UTC),
@@ -652,6 +689,7 @@ def test_resume_restores_review_and_gherkin_without_another_model_call(
     risk_draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_risk_envelope(snapshot, context).envelope_sha256,
         outcome="risks_proposed",
         hypotheses=(_human_review(snapshot).reviewed_risk,),
         generated_at=datetime(2026, 8, 15, tzinfo=UTC),
@@ -763,6 +801,7 @@ def test_resume_restores_a_durable_validated_gherkin_edit(tmp_path) -> None:
     risk_draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_risk_envelope(snapshot, context).envelope_sha256,
         outcome="risks_proposed",
         hypotheses=(_human_review(snapshot).reviewed_risk,),
         generated_at=datetime(2026, 8, 15, tzinfo=UTC),
@@ -950,6 +989,7 @@ def test_resume_restores_the_durable_testability_assessment(tmp_path) -> None:
     risk_draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_risk_envelope(snapshot, context).envelope_sha256,
         outcome="risks_proposed",
         hypotheses=(_human_review(snapshot).reviewed_risk,),
         generated_at=datetime(2026, 8, 15, tzinfo=UTC),
@@ -1044,6 +1084,7 @@ def test_resume_restores_an_exhausted_frozen_evidence_search(tmp_path) -> None:
     risk_draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_risk_envelope(snapshot, context).envelope_sha256,
         outcome="risks_proposed",
         hypotheses=(_human_review(snapshot).reviewed_risk,),
         generated_at=datetime(2026, 8, 15, tzinfo=UTC),
@@ -1155,6 +1196,7 @@ def test_resume_restores_a_gherkin_edit_that_needs_frozen_evidence(
     risk_draft = RiskAssessmentDraft(
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_risk_envelope(snapshot, context).envelope_sha256,
         outcome="risks_proposed",
         hypotheses=(_human_review(snapshot).reviewed_risk,),
         generated_at=datetime(2026, 8, 15, tzinfo=UTC),

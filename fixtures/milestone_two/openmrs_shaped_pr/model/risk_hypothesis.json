@@ -1,6 +1,7 @@
 {
   "insufficient_context_to_assess": {
     "context_sha256": "__CONTEXT_SHA256__",
+    "evidence_envelope_sha256": "__EVIDENCE_ENVELOPE_SHA256__",
     "coverage_limitations": [],
     "generated_at": "2026-08-15T00:00:00Z",
     "hypotheses": [],
@@ -19,6 +20,7 @@
   },
   "no_meaningful_security_risk_found": {
     "context_sha256": "__CONTEXT_SHA256__",
+    "evidence_envelope_sha256": "__EVIDENCE_ENVELOPE_SHA256__",
     "coverage_limitations": [
       "This is not proof of safety because the evidence is bounded."
     ],
@@ -39,6 +41,7 @@
   },
   "risks_proposed": {
     "context_sha256": "__CONTEXT_SHA256__",
+    "evidence_envelope_sha256": "__EVIDENCE_ENVELOPE_SHA256__",
     "coverage_limitations": [],
     "generated_at": "2026-08-15T00:00:00Z",
     "hypotheses": [

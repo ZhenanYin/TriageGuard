@@ -1,5 +1,7 @@
 """Tests for risk-proposal orchestration in the Milestone 2 workflow."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from triageguard.analysis.context import ContextLimits
@@ -89,6 +91,7 @@ def test_propose_risks_runs_generation_then_local_grounding(
     draft = object()
     response = object()
     assessment = object()
+    evidence_envelope = object()
     calls: list[str] = []
 
     def fake_generate_risk_assessment(
@@ -96,11 +99,13 @@ def test_propose_risks_runs_generation_then_local_grounding(
         snapshot: object,
         diffs: object,
         context: object,
+        evidence_envelope: object,
         gateway: object,
     ) -> tuple[object, object]:
         assert snapshot is expected_snapshot
         assert diffs is expected_diffs
         assert context is expected_context
+        assert evidence_envelope is expected_evidence_envelope
         assert gateway is workflow._gateway
         calls.append("generate")
         return draft, response
@@ -110,10 +115,12 @@ def test_propose_risks_runs_generation_then_local_grounding(
         draft: object,
         snapshot: object,
         context: object,
+        evidence_envelope: object,
     ) -> tuple[object, object]:
         assert draft is expected_draft
         assert snapshot is expected_snapshot
         assert context is expected_context
+        assert evidence_envelope is expected_evidence_envelope
         calls.append("validate")
         return assessment, object()
 
@@ -121,6 +128,13 @@ def test_propose_risks_runs_generation_then_local_grounding(
     expected_diffs = diffs
     expected_context = context
     expected_draft = draft
+    expected_evidence_envelope = evidence_envelope
+
+    monkeypatch.setattr(
+        milestone_two,
+        "build_risk_evidence",
+        lambda **_kwargs: SimpleNamespace(envelope=evidence_envelope),
+    )
 
     monkeypatch.setattr(
         milestone_two,
@@ -145,12 +159,14 @@ def test_propose_risks_rejects_an_ungrounded_model_draft(
 ) -> None:
     """An invalid model proposal must not become a reviewable risk assessment."""
     workflow, _snapshot, _diffs, _context = _prepared_workflow(tmp_path)
+    evidence_envelope = object()
 
     def fake_generate_risk_assessment(
         *,
         snapshot: object,
         diffs: object,
         context: object,
+        evidence_envelope: object,
         gateway: object,
     ) -> tuple[object, object]:
         return object(), object()
@@ -160,8 +176,15 @@ def test_propose_risks_rejects_an_ungrounded_model_draft(
         draft: object,
         snapshot: object,
         context: object,
+        evidence_envelope: object,
     ) -> tuple[None, object]:
         return None, object()
+
+    monkeypatch.setattr(
+        milestone_two,
+        "build_risk_evidence",
+        lambda **_kwargs: SimpleNamespace(envelope=evidence_envelope),
+    )
 
     monkeypatch.setattr(
         milestone_two,

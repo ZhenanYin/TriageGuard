@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import Field, StrictInt, StrictStr, model_validator
 
 from triageguard.domain.models import ResearchArtifact
-from triageguard.domain.pr_analysis import ContextAnchor, Sha256
+from triageguard.domain.pr_analysis import ContextAnchor, ContextBundle, Sha256
 from triageguard.provenance import canonical_sha256
 
 ModelEvidenceStage = Literal[
@@ -194,3 +194,57 @@ class ModelEvidenceEnvelope(ResearchArtifact):
         return cls.model_validate(
             {**normalized, "envelope_sha256": canonical_sha256(content)}
         )
+
+
+def validate_envelope_binding(
+    *,
+    envelope: ModelEvidenceEnvelope,
+    stage: ModelEvidenceStage,
+    context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    input_bindings: tuple[EvidenceArtifactBinding, ...],
+    output_schema_sha256: Sha256,
+    max_request_body_bytes: int | None = None,
+) -> ModelEvidenceEnvelope:
+    """Revalidate an envelope and bind every visible byte to frozen context."""
+    normalized = ModelEvidenceEnvelope.model_validate(envelope.model_dump(mode="json"))
+    expected_comparisons = tuple(
+        sorted(comparison_bindings, key=lambda binding: binding.name)
+    )
+    expected_inputs = tuple(sorted(input_bindings, key=lambda binding: binding.name))
+    if normalized.stage != stage:
+        raise ValueError("evidence envelope stage does not match the model operation")
+    if (
+        normalized.snapshot_key != context.snapshot_key
+        or normalized.context_sha256 != context.context_sha256
+    ):
+        raise ValueError("evidence envelope does not bind the frozen context")
+    if normalized.comparison_bindings != expected_comparisons:
+        raise ValueError("evidence envelope does not bind the frozen comparisons")
+    if normalized.input_bindings != expected_inputs:
+        raise ValueError("evidence envelope does not bind the declared inputs")
+    if normalized.output_schema_sha256 != output_schema_sha256:
+        raise ValueError("evidence envelope does not bind the output schema")
+    if (
+        max_request_body_bytes is not None
+        and normalized.max_request_body_bytes != max_request_body_bytes
+    ):
+        raise ValueError("evidence envelope does not bind the request budget")
+
+    catalog = {anchor.anchor_id: anchor for anchor in context.anchors}
+    if normalized.catalog_anchor_ids != tuple(sorted(catalog)):
+        raise ValueError("evidence envelope catalog does not match frozen context")
+    for visible in normalized.visible_anchors:
+        source = catalog.get(visible.anchor_id)
+        if source is None or (
+            visible.revision_role != source.revision_role
+            or visible.path != source.path
+            or visible.java_symbol != source.java_symbol
+            or visible.start_line != source.start_line
+            or visible.end_line != source.end_line
+            or visible.change_relation != source.change_relation
+            or visible.visible_text != source.text
+            or visible.source_text_sha256 != source.text_sha256
+        ):
+            raise ValueError("visible evidence anchor does not match its frozen source")
+    return normalized

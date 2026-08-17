@@ -22,6 +22,12 @@ from triageguard.domain.pr_analysis import (
     RiskHypothesis,
     RiskHypothesisDraft,
 )
+from triageguard.evidence import (
+    ModelEvidenceEnvelope,
+    VisibleEvidenceAnchor,
+    validate_envelope_binding,
+)
+from triageguard.hypotheses.generator import RISK_OUTPUT_SCHEMA
 from triageguard.provenance import canonical_json, canonical_sha256
 
 REQUIRED_CLAIM_FIELDS = frozenset(
@@ -57,6 +63,8 @@ FORBIDDEN_CLAIM_PATTERNS = (
     ),
     re.compile(r"\b(?:is|confirmed as)\s+safe\b", re.IGNORECASE),
 )
+
+EvidenceAnchor = ContextAnchor | VisibleEvidenceAnchor
 
 
 @dataclass(frozen=True)
@@ -105,7 +113,7 @@ def _has_forbidden_claim(hypothesis: RiskHypothesisDraft) -> bool:
 
 def _validate_claim_bindings(
     hypothesis: RiskHypothesis,
-    anchors: dict[str, ContextAnchor],
+    anchors: dict[str, EvidenceAnchor],
     reason_codes: list[str],
 ) -> None:
     """Check all citations, integration evidence, and code identifiers locally."""
@@ -151,9 +159,16 @@ def _validate_claim_bindings(
 
     for identifier in hypothesis.code_identifiers:
         if not any(
-            identifier in anchors[anchor_id].text for anchor_id in known_citations
+            identifier in _anchor_text(anchors[anchor_id])
+            for anchor_id in known_citations
         ):
             _add_reason(reason_codes, "identifier_not_in_bound_excerpt")
+
+
+def _anchor_text(anchor: EvidenceAnchor) -> str:
+    if isinstance(anchor, VisibleEvidenceAnchor):
+        return anchor.visible_text
+    return anchor.text
 
 
 def _grounding_report(
@@ -161,7 +176,8 @@ def _grounding_report(
     hypothesis: RiskHypothesis,
     snapshot: PullRequestSnapshot,
     context: ContextBundle,
-    anchors: dict[str, ContextAnchor],
+    anchors: dict[str, EvidenceAnchor],
+    evidence_envelope_sha256: str,
 ) -> GroundingReport:
     """Create the immutable local attestation for one fully grounded risk."""
     cited_anchor_ids = tuple(hypothesis.citation_anchor_ids)
@@ -171,7 +187,7 @@ def _grounding_report(
             anchor_ids=tuple(
                 anchor_id
                 for anchor_id in cited_anchor_ids
-                if identifier in anchors[anchor_id].text
+                if identifier in _anchor_text(anchors[anchor_id])
             ),
         )
         for identifier in hypothesis.code_identifiers
@@ -180,6 +196,7 @@ def _grounding_report(
         producer="local_grounding_validator",
         snapshot_key=snapshot.snapshot_key,
         context_sha256=context.context_sha256,
+        evidence_envelope_sha256=evidence_envelope_sha256,
         hypothesis_id=hypothesis.hypothesis_id,
         hypothesis_sha256=canonical_sha256(hypothesis.model_dump(mode="json")),
         cited_anchor_ids=cited_anchor_ids,
@@ -192,6 +209,7 @@ def validate_risk_assessment(
     draft: RiskAssessmentDraft,
     snapshot: PullRequestSnapshot,
     context: ContextBundle,
+    evidence_envelope: ModelEvidenceEnvelope,
 ) -> tuple[RiskAssessment | None, RiskGroundingReport]:
     """Validate a draft against one exact frozen snapshot and context bundle."""
     reason_codes: list[str] = []
@@ -217,6 +235,31 @@ def validate_risk_assessment(
         return None, report
 
     try:
+        evidence_envelope = validate_envelope_binding(
+            envelope=evidence_envelope,
+            stage="risk_hypothesis",
+            context=context,
+            comparison_bindings=evidence_envelope.comparison_bindings,
+            input_bindings=(),
+            output_schema_sha256=canonical_sha256(RISK_OUTPUT_SCHEMA),
+        )
+        if evidence_envelope.selection_policy_version != "risk-evidence-v1":
+            raise ValueError("risk evidence selection policy is unsupported")
+        if {binding.name for binding in evidence_envelope.comparison_bindings} != {
+            "author_diff",
+            "integration_diff",
+            "base_drift_diff",
+        }:
+            raise ValueError("risk evidence requires all three comparisons")
+    except (TypeError, ValidationError, ValueError):
+        report = RiskGroundingReport(
+            approved=False,
+            reason_codes=("invalid_evidence_envelope",),
+            validated_hypothesis_ids=(),
+        )
+        return None, report
+
+    try:
         normalized_draft = RiskAssessmentDraft.model_validate(
             draft.model_dump(mode="json")
         )
@@ -232,12 +275,14 @@ def validate_risk_assessment(
         _add_reason(reason_codes, "draft_snapshot_mismatch")
     if normalized_draft.context_sha256 != context.context_sha256:
         _add_reason(reason_codes, "draft_context_mismatch")
+    if normalized_draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256:
+        _add_reason(reason_codes, "draft_evidence_envelope_mismatch")
     if context.snapshot_key != snapshot.snapshot_key:
         _add_reason(reason_codes, "context_snapshot_mismatch")
     if not context.primary_change_represented:
         _add_reason(reason_codes, "primary_change_not_represented")
 
-    anchors = {anchor.anchor_id: anchor for anchor in context.anchors}
+    anchors = {anchor.anchor_id: anchor for anchor in evidence_envelope.visible_anchors}
 
     validated_hypotheses: list[RiskHypothesis] = []
     grounding_reports: list[GroundingReport] = []
@@ -264,6 +309,7 @@ def validate_risk_assessment(
                         snapshot=snapshot,
                         context=context,
                         anchors=anchors,
+                        evidence_envelope_sha256=evidence_envelope.envelope_sha256,
                     )
                 )
 
@@ -345,6 +391,7 @@ def _reviewed_grounding_report(
         producer="local_grounding_validator",
         snapshot_key=assessment.snapshot_key,
         context_sha256=assessment.context_sha256,
+        evidence_envelope_sha256=assessment.evidence_envelope_sha256,
         hypothesis_id=hypothesis.hypothesis_id,
         hypothesis_sha256=reviewed_content_sha256,
         cited_anchor_ids=cited_anchor_ids,

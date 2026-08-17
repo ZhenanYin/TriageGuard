@@ -10,6 +10,7 @@ from triageguard.evidence.model_envelope import (
     ModelEvidenceStage,
     OmittedEvidenceAnchor,
     VisibleEvidenceAnchor,
+    validate_envelope_binding,
 )
 from triageguard.evidence.selection import (
     EnvelopeBuildResult,
@@ -28,4 +29,5 @@ __all__ = [
     "UnsupportedRiskContractError",
     "VisibleEvidenceAnchor",
     "classify_differential",
+    "validate_envelope_binding",
 ]
