@@ -729,7 +729,15 @@ def _repository_context_anchors(
                 "A source blob exceeded the configured byte limit.",
             )
 
-        index = extractor.extract(entry.path, source)
+        if not any(identifier.encode("utf-8") in source for identifier in identifiers):
+            continue
+
+        try:
+            index = extractor.extract(entry.path, source)
+        except ContextBuildError as error:
+            if error.reason_code == "java_parse_failed":
+                continue
+            raise
         shared_identifiers = [
             identifier
             for identifier in identifiers

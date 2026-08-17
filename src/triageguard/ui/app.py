@@ -7,7 +7,9 @@ from uuid import uuid4
 
 from triageguard.analysis import (
     ContextBuilder,
+    ContextBuildError,
     DiffBuilder,
+    DiffBuildError,
     FrozenContextRefiner,
     SnapshotAcquirer,
 )
@@ -37,8 +39,8 @@ _SUPPORTED_PR_URL = "https://github.com/openmrs/openmrs-core/pull/900000001"
 
 
 def _preparation_error_message(error: Exception) -> str:
-    """Return a typed snapshot reason without exposing implementation details."""
-    if isinstance(error, SnapshotAcquisitionError):
+    """Return a typed preparation reason without exposing implementation details."""
+    if isinstance(error, (ContextBuildError, DiffBuildError, SnapshotAcquisitionError)):
         return f"Preparation stopped ({error.reason_code}): {error.safe_message}"
     return "The pull request could not be prepared for review."
 

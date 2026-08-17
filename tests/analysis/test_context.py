@@ -554,6 +554,63 @@ def test_context_builder_adds_scored_repository_context_for_an_exact_identifier(
     ]
 
 
+def test_context_builder_skips_an_unparseable_unrelated_repository_file() -> None:
+    """Optional repository context cannot block primary merge evidence."""
+    snapshot = _snapshot()
+    primary_source = (
+        b"package org.openmrs.api;\n"
+        b"class PatientService {\n"
+        b"    void purgePatient() {\n"
+        b"        dao.deletePatient();\n"
+        b"    }\n"
+        b"}\n"
+    )
+    malformed_unrelated_source = b"class Legacy { void incompatible( {}\n"
+
+    class FakeStore:
+        def list_tree(self, commit_sha: str) -> tuple[GitTreeEntry, ...]:
+            assert commit_sha == snapshot.candidate_sha
+            return (
+                GitTreeEntry(
+                    mode="100644",
+                    object_type="blob",
+                    object_sha="4" * 40,
+                    path="api/PatientService.java",
+                ),
+                GitTreeEntry(
+                    mode="100644",
+                    object_type="blob",
+                    object_sha="5" * 40,
+                    path="legacy/UnsupportedSyntax.java",
+                ),
+            )
+
+        def read_blob(self, blob_sha: str, *, max_bytes: int) -> bytes:
+            return {
+                "4" * 40: primary_source,
+                "5" * 40: malformed_unrelated_source,
+            }[blob_sha]
+
+    limits = ContextLimits(
+        max_files=2,
+        max_anchors=2,
+        max_total_bytes=2_000,
+        max_anchor_lines=10,
+        max_blob_bytes=1_000,
+        max_search_identifiers=10,
+        max_hits_per_identifier=5,
+    )
+
+    bundle = ContextBuilder().build(
+        snapshot=snapshot,
+        diffs=_diffs(snapshot),
+        store=FakeStore(),
+        limits=limits,
+    )
+
+    assert [anchor.path for anchor in bundle.anchors] == ["api/PatientService.java"]
+
+
 def test_context_builder_rejects_a_diff_that_is_not_bound_to_the_snapshot() -> None:
     """Evidence from a different revision pair must never enter this run."""
     snapshot = _snapshot()

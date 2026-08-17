@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from triageguard.analysis.context import ContextBuildError
+from triageguard.analysis.diffs import DiffBuildError
 from triageguard.analysis.snapshot import SnapshotAcquisitionError
 from triageguard.config import Settings
 from triageguard.domain import EnvironmentKind
@@ -23,17 +25,47 @@ from triageguard.workflow.milestone_two_replay import (
 SUPPORTED_PR_URL = "https://github.com/openmrs/openmrs-core/pull/900000001"
 
 
-def test_preparation_error_message_exposes_only_safe_snapshot_details() -> None:
-    """The live UI explains a typed snapshot failure without a traceback."""
-    error = SnapshotAcquisitionError(
-        "merge_conflict",
-        "GitHub reported that the pull request cannot be merged.",
-    )
-
-    assert milestone_two_app._preparation_error_message(error) == (
-        "Preparation stopped (merge_conflict): GitHub reported that the pull "
-        "request cannot be merged."
-    )
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    (
+        (
+            SnapshotAcquisitionError(
+                "merge_conflict",
+                "GitHub reported that the pull request cannot be merged.",
+            ),
+            (
+                "Preparation stopped (merge_conflict): GitHub reported that the "
+                "pull request cannot be merged."
+            ),
+        ),
+        (
+            DiffBuildError(
+                "diff_parse_failed",
+                "The frozen Git diff could not be parsed.",
+            ),
+            (
+                "Preparation stopped (diff_parse_failed): The frozen Git diff "
+                "could not be parsed."
+            ),
+        ),
+        (
+            ContextBuildError(
+                "java_parse_failed",
+                "A related Java source could not be parsed.",
+            ),
+            (
+                "Preparation stopped (java_parse_failed): A related Java source "
+                "could not be parsed."
+            ),
+        ),
+    ),
+)
+def test_preparation_error_message_exposes_only_safe_typed_details(
+    error: Exception,
+    expected: str,
+) -> None:
+    """The live UI explains a typed preparation failure without a traceback."""
+    assert milestone_two_app._preparation_error_message(error) == expected
     assert milestone_two_app._preparation_error_message(RuntimeError("internal")) == (
         "The pull request could not be prepared for review."
     )
