@@ -243,7 +243,7 @@ def test_object_store_finds_one_exact_merge_base(
 def test_object_store_fetches_only_the_base_and_two_pr_refs(
     tmp_path: Path,
 ) -> None:
-    """The local store fetches only the three refs needed for one frozen PR."""
+    """The local store fetches the base branch and two pull-request refs."""
 
     class RecordingRunner:
         def __init__(self) -> None:
@@ -279,6 +279,49 @@ def test_object_store_fetches_only_the_base_and_two_pr_refs(
                 "refs/pull/7312/merge:refs/triageguard/candidate",
             ],
             180.0,
+        )
+    ]
+
+
+def test_object_store_reads_current_remote_base_and_merge_preview(
+    tmp_path: Path,
+) -> None:
+    """A recheck reads the two public Git refs that define B and C."""
+
+    class RecordingRunner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[str], float]] = []
+
+        def run(
+            self,
+            arguments: list[str],
+            cwd: Path | None = None,
+            *,
+            timeout_seconds: float = 60.0,
+        ) -> bytes:
+            self.calls.append((arguments, timeout_seconds))
+            return (
+                (b"b" * 40)
+                + b"\trefs/heads/main\n"
+                + (b"d" * 40)
+                + b"\trefs/pull/7312/merge\n"
+            )
+
+    runner = RecordingRunner()
+    store_path = tmp_path / "analysis-store"
+    store = GitObjectStore(store_path, runner=runner)
+
+    assert store.remote_snapshot_refs("main", 7312) == ("b" * 40, "d" * 40)
+    assert runner.calls == [
+        (
+            [
+                "ls-remote",
+                "--exit-code",
+                "https://github.com/openmrs/openmrs-core.git",
+                "refs/heads/main",
+                "refs/pull/7312/merge",
+            ],
+            60.0,
         )
     ]
 

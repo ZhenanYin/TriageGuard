@@ -151,6 +151,18 @@ class _FixtureGitObjectStore(GitObjectStore):
             )
         self._loaded = True
 
+    def remote_snapshot_refs(
+        self,
+        base_branch: str,
+        pull_number: int,
+    ) -> tuple[str, str]:
+        """Return fixture B/C identities without reading a live Git remote."""
+        if base_branch != "main":
+            raise ValueError("The synthetic fixture supports only the main branch.")
+        if pull_number != _FIXTURE_PULL_NUMBER:
+            raise ValueError("The synthetic fixture supports one reserved pull number.")
+        return self._base_sha, self._candidate_sha
+
 
 class _TemplateReplayGateway:
     """Bind replay templates to this exact workflow request before validation."""

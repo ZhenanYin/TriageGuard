@@ -11,6 +11,7 @@ from triageguard.analysis import (
     FrozenContextRefiner,
     SnapshotAcquirer,
 )
+from triageguard.analysis.snapshot import SnapshotAcquisitionError
 from triageguard.config import PublicSettings, Settings
 from triageguard.llm import GroqStructuredGateway
 from triageguard.research import ArtifactRecorder
@@ -33,6 +34,13 @@ from triageguard.workflow.milestone_two_replay import (
 
 _SESSION_STATE_KEY = "triageguard_milestone_two_state"
 _SUPPORTED_PR_URL = "https://github.com/openmrs/openmrs-core/pull/900000001"
+
+
+def _preparation_error_message(error: Exception) -> str:
+    """Return a typed snapshot reason without exposing implementation details."""
+    if isinstance(error, SnapshotAcquisitionError):
+        return f"Preparation stopped ({error.reason_code}): {error.safe_message}"
+    return "The pull request could not be prepared for review."
 
 
 def create_milestone_two_app_state(settings: Settings) -> MilestoneTwoAppState:
@@ -219,8 +227,8 @@ def _render_choose_pull_request(st: Any, state: MilestoneTwoAppState) -> None:
         try:
             with st.spinner("Freezing the pull request and its code context..."):
                 state.analyze_pr(pr_url)
-        except Exception:  # noqa: BLE001 - safe boundary for URL/Git/model errors
-            st.error("The pull request could not be prepared for review.")
+        except Exception as error:  # noqa: BLE001 - safe boundary for URL/Git/model errors
+            st.error(_preparation_error_message(error))
         else:
             st.success("Pull request frozen. You can now inspect the change.")
 

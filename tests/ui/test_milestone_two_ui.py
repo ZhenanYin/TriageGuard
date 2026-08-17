@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from triageguard.analysis.snapshot import SnapshotAcquisitionError
 from triageguard.config import Settings
 from triageguard.domain import EnvironmentKind
 from triageguard.ui import app as milestone_two_app
@@ -19,6 +20,22 @@ from triageguard.workflow.milestone_two_replay import (
 )
 
 SUPPORTED_PR_URL = "https://github.com/openmrs/openmrs-core/pull/900000001"
+
+
+def test_preparation_error_message_exposes_only_safe_snapshot_details() -> None:
+    """The live UI explains a typed snapshot failure without a traceback."""
+    error = SnapshotAcquisitionError(
+        "merge_conflict",
+        "GitHub reported that the pull request cannot be merged.",
+    )
+
+    assert milestone_two_app._preparation_error_message(error) == (
+        "Preparation stopped (merge_conflict): GitHub reported that the pull "
+        "request cannot be merged."
+    )
+    assert milestone_two_app._preparation_error_message(RuntimeError("internal")) == (
+        "The pull request could not be prepared for review."
+    )
 
 
 def _app_state(

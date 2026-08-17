@@ -20,6 +20,18 @@ _ALLOWED_LOCAL_REFS = frozenset(
 )
 
 
+def _validate_base_branch(base_branch: str) -> None:
+    """Reject branch syntax that could widen an allowlisted Git refspec."""
+    if (
+        not isinstance(base_branch, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", base_branch)
+        or ".." in base_branch
+        or "//" in base_branch
+        or base_branch.endswith(("/", "."))
+    ):
+        raise ValueError("base branch must be a safe Git branch name")
+
+
 class GitCommandError(RuntimeError):
     """A safe local-Git failure without copied command output."""
 
@@ -281,14 +293,7 @@ class GitObjectStore:
 
     def fetch_snapshot(self, base_branch: str, pull_number: int) -> None:
         """Fetch only the frozen base, PR head, and GitHub merge candidate refs."""
-        if (
-            not isinstance(base_branch, str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", base_branch)
-            or ".." in base_branch
-            or "//" in base_branch
-            or base_branch.endswith(("/", "."))
-        ):
-            raise ValueError("base branch must be a safe Git branch name")
+        _validate_base_branch(base_branch)
         if isinstance(pull_number, bool) or not isinstance(pull_number, int):
             raise TypeError("pull request number must be an integer")
         if pull_number <= 0:
@@ -308,6 +313,56 @@ class GitObjectStore:
             ],
             timeout_seconds=180.0,
         )
+
+    def remote_snapshot_refs(
+        self,
+        base_branch: str,
+        pull_number: int,
+    ) -> tuple[str, str]:
+        """Read current GitHub base and merge-preview SHAs without altering storage."""
+        _validate_base_branch(base_branch)
+        if isinstance(pull_number, bool) or not isinstance(pull_number, int):
+            raise TypeError("pull request number must be an integer")
+        if pull_number <= 0:
+            raise ValueError("pull request number must be positive")
+
+        base_ref = f"refs/heads/{base_branch}"
+        candidate_ref = f"refs/pull/{pull_number}/merge"
+        output = self._runner.run(
+            [
+                "ls-remote",
+                "--exit-code",
+                "https://github.com/openmrs/openmrs-core.git",
+                base_ref,
+                candidate_ref,
+            ]
+        )
+
+        try:
+            lines = output.decode("ascii").splitlines()
+        except UnicodeDecodeError as error:
+            raise GitCommandError(
+                "git_command_invalid_output",
+                "Git command did not return ASCII snapshot-ref SHAs.",
+            ) from error
+
+        commits: dict[str, str] = {}
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) != 2 or _FULL_COMMIT_SHA.fullmatch(parts[0]) is None:
+                raise GitCommandError(
+                    "git_command_invalid_output",
+                    "Git command did not return exact snapshot-ref SHAs.",
+                )
+            commits[parts[1]] = parts[0]
+
+        if set(commits) != {base_ref, candidate_ref}:
+            raise GitCommandError(
+                "git_command_invalid_output",
+                "Git command did not return both exact snapshot refs.",
+            )
+
+        return commits[base_ref], commits[candidate_ref]
 
     def read_blob(self, blob_sha: str, *, max_bytes: int) -> bytes:
         """Read one exact blob only after enforcing its configured byte limit."""

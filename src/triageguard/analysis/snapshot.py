@@ -102,8 +102,12 @@ class SnapshotAcquirer:
                 observed_candidate_sha=None,
             )
 
-        candidate_sha = pull.merge_commit_sha
-        if candidate_sha is None:
+        try:
+            base_sha, candidate_sha = self._store.remote_snapshot_refs(
+                snapshot.base_branch,
+                snapshot.pull_number,
+            )
+        except GitCommandError:
             return SnapshotFreshness(
                 snapshot_key=snapshot.snapshot_key,
                 status="unknown",
@@ -118,7 +122,7 @@ class SnapshotAcquirer:
             repository.default_branch == snapshot.default_branch
             and pull.state == "open"
             and pull.base_branch == snapshot.base_branch
-            and pull.base_sha == snapshot.base_sha
+            and base_sha == snapshot.base_sha
             and pull.head_sha == snapshot.head_sha
             and pull.mergeable is True
             and candidate_sha == snapshot.candidate_sha
@@ -129,7 +133,7 @@ class SnapshotAcquirer:
             status="current" if is_current else "stale",
             reason_code="snapshot_current" if is_current else "snapshot_changed",
             checked_at=checked_at,
-            observed_base_sha=pull.base_sha,
+            observed_base_sha=base_sha,
             observed_head_sha=pull.head_sha,
             observed_candidate_sha=candidate_sha,
         )
@@ -194,11 +198,6 @@ class SnapshotAcquirer:
                 "merge_conflict",
                 "GitHub reported that the pull request cannot be merged.",
             )
-        if pull.merge_commit_sha is None:
-            raise SnapshotAcquisitionError(
-                "candidate_ref_missing",
-                "GitHub did not provide a merge candidate for the pull request.",
-            )
 
     def _validate_git_relationships(
         self,
@@ -210,10 +209,8 @@ class SnapshotAcquirer:
         head_sha = self._store.resolve_commit("refs/triageguard/head")
         candidate_sha = self._store.resolve_commit("refs/triageguard/candidate")
 
-        if (
-            base_sha != pull.base_sha
-            or head_sha != pull.head_sha
-            or candidate_sha != pull.merge_commit_sha
+        if head_sha != pull.head_sha or (
+            pull.merge_commit_sha is not None and candidate_sha != pull.merge_commit_sha
         ):
             raise SnapshotAcquisitionError(
                 "snapshot_changed_during_acquisition",
@@ -283,10 +280,12 @@ class SnapshotAcquirer:
             or second.state != "open"
             or second.base_branch != default_branch
             or second.base_branch != first.base_branch
-            or second.base_sha != first.base_sha
             or second.head_sha != first.head_sha
             or second.mergeable is not True
-            or second.merge_commit_sha != first.merge_commit_sha
+            or (
+                first.merge_commit_sha is not None
+                and second.merge_commit_sha != first.merge_commit_sha
+            )
         ):
             raise SnapshotAcquisitionError(
                 "snapshot_changed_during_acquisition",
