@@ -1,7 +1,6 @@
 # Deep Vertical Assurance Chain Design
 
-**Status:** Approved project direction as of 2026-08-17; the written details are
-awaiting final review before implementation planning.
+**Status:** Approved governing design as of 2026-08-17.
 
 **Supersedes for future planning:** The earlier Milestone 2 evidence-refinement
 plan remains an implementation record, but its endpoint at approved Gherkin is
