@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from triageguard.config import PublicSettings
 from triageguard.contracts import GherkinValidationReport
 from triageguard.domain import (
-    ContextRefinement,
+    EvidenceRefinementResult,
     GherkinCandidate,
     HumanReviewedRisk,
     MilestoneTwoRunRecord,
@@ -43,7 +43,7 @@ class MilestoneTwoAppState:
     testability_assessment: TestabilityAssessment | None = None
     gherkin_candidate: GherkinCandidate | None = None
     gherkin_validation_report: GherkinValidationReport | None = None
-    latest_context_refinement: ContextRefinement | None = None
+    latest_context_refinement: EvidenceRefinementResult | None = None
     edited_gherkin: str = ""
     terminal_record: MilestoneTwoRunRecord | None = None
     workflow_factory: Callable[[], MilestoneTwoWorkflow] | None = field(
@@ -236,14 +236,20 @@ class MilestoneTwoAppState:
         self.edited_gherkin = self.gherkin_candidate.gherkin_text
         return self.gherkin_candidate
 
-    def refine_frozen_evidence(self) -> ContextRefinement:
+    def refine_frozen_evidence(self) -> EvidenceRefinementResult:
         """Search only the already frozen snapshots for a named evidence gap."""
-        if (
-            self.testability_assessment is None
-            or self.testability_assessment.decision != "needs_more_frozen_evidence"
-        ):
+        risk_needs_evidence = (
+            self.risk_assessment is not None
+            and self.risk_assessment.outcome == "insufficient_context_to_assess"
+        )
+        testability_needs_evidence = (
+            self.testability_assessment is not None
+            and self.testability_assessment.decision == "needs_more_frozen_evidence"
+        )
+        if not risk_needs_evidence and not testability_needs_evidence:
             raise PresentationTransitionError(
-                "a testability decision needing frozen evidence is required first."
+                "a risk or testability decision needing frozen evidence is "
+                "required first."
             )
         refinement = self.workflow.refine_frozen_evidence()
         self.latest_context_refinement = refinement
@@ -330,7 +336,7 @@ class MilestoneTwoAppState:
         return self.terminal_record
 
     def finish_without_risk(self) -> MilestoneTwoRunRecord:
-        """Seal only the two model outcomes that explicitly stop before Gherkin."""
+        """Seal a no-risk result or an exhausted bounded-evidence abstention."""
         assessment = self._require_assessment("finish without risk")
         if assessment.outcome == "risks_proposed":
             raise PresentationTransitionError(
@@ -341,7 +347,17 @@ class MilestoneTwoAppState:
                 "the workflow has already reached a terminal result."
             )
 
-        self.terminal_record = self.workflow.finish_without_risk()
+        if assessment.outcome == "insufficient_context_to_assess":
+            latest = self.latest_context_refinement
+            if latest is None or not latest.exhausted:
+                raise PresentationTransitionError(
+                    "refine the frozen evidence until the bounded search is exhausted."
+                )
+            self.terminal_record = (
+                self.workflow.finish_with_insufficient_frozen_evidence()
+            )
+        else:
+            self.terminal_record = self.workflow.finish_without_risk()
         return self.terminal_record
 
     def scenario_view(self) -> dict[str, object]:

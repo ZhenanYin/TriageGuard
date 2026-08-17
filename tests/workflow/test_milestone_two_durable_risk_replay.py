@@ -210,7 +210,39 @@ def _risk_response(
         "coverage_limitations": [],
         "reason_code": "analysis_limit_exceeded",
         "missing_evidence": ["The authorization configuration is not present."],
-        "needed_evidence": ["The applicable authorization configuration."],
+        "evidence_needs": [
+            {
+                "need_id": "need-require-privilege",
+                "category": "authorization",
+                "search_terms": ["requirePrivilege"],
+                "explanation": "Find the exact frozen authorization decision.",
+                "supporting_anchor_ids": ["anchor-integration"],
+            }
+        ],
+        "generated_at": "2026-08-15T00:00:00Z",
+    }
+
+
+def _no_risk_response(
+    snapshot: PullRequestSnapshot,
+    context: ContextBundle,
+) -> dict[str, object]:
+    """Return a schema-valid bounded no-risk response for terminal tests."""
+    return {
+        "snapshot_key": snapshot.snapshot_key,
+        "context_sha256": context.context_sha256,
+        "evidence_envelope_sha256": "0" * 64,
+        "outcome": "no_meaningful_security_risk_found",
+        "hypotheses": [],
+        "rationale": "The bounded evidence has no specific testable risk.",
+        "security_relevant_areas": ["Patient deletion service behavior."],
+        "supporting_anchor_ids": ["anchor-integration"],
+        "coverage_limitations": [
+            "This is not proof of safety because the evidence is bounded."
+        ],
+        "reason_code": None,
+        "missing_evidence": [],
+        "evidence_needs": [],
         "generated_at": "2026-08-15T00:00:00Z",
     }
 
@@ -396,7 +428,7 @@ def test_nonrisk_terminal_measurements_bind_every_planned_stage(tmp_path) -> Non
         ),
     )
     recorder = ArtifactRecorder(tmp_path)
-    gateway = _CountingGateway(_risk_response(snapshot, context))
+    gateway = _CountingGateway(_no_risk_response(snapshot, context))
     dependencies = MilestoneTwoDependencies(
         settings=Settings(
             environment_kind=EnvironmentKind.REAL_PR_ANALYSIS,
@@ -430,8 +462,8 @@ def test_nonrisk_terminal_measurements_bind_every_planned_stage(tmp_path) -> Non
         )
     )
 
-    assert record.status.value == "insufficient_context_to_assess"
-    assert assessment.outcome == "insufficient_context_to_assess"
+    assert record.status.value == "no_meaningful_security_risk_found"
+    assert assessment.outcome == "no_meaningful_security_risk_found"
     assert set(measurements) == {
         "acquisition",
         "diffs",
@@ -451,7 +483,7 @@ def test_nonrisk_terminal_measurements_bind_every_planned_stage(tmp_path) -> Non
     assert measurements["staleness"]["status"] == "current"
     assert (
         measurements["end_to_end"]["terminal_status"]
-        == "insufficient_context_to_assess"
+        == "no_meaningful_security_risk_found"
     )
 
 
@@ -480,7 +512,7 @@ def test_resume_reloads_a_finalized_nonrisk_record(tmp_path) -> None:
         ),
     )
     recorder = ArtifactRecorder(tmp_path)
-    gateway = _CountingGateway(_risk_response(snapshot, context))
+    gateway = _CountingGateway(_no_risk_response(snapshot, context))
     dependencies = MilestoneTwoDependencies(
         settings=Settings(
             environment_kind=EnvironmentKind.REAL_PR_ANALYSIS,

@@ -699,29 +699,61 @@ def _render_nonrisk_outcome(
     view: dict[str, object],
     freshness: str,
 ) -> None:
-    """Let a human finalize only the two explicit non-risk workflow outcomes."""
+    """Finalize no-risk or exhaust bounded refinement before abstaining."""
     if view["outcome"] == "no_meaningful_security_risk_found":
         st.info(str(view["rationale"]))
         st.write("Limitations:")
         for limitation in view["coverage_limitations"]:
             st.write(f"• {limitation}")
-    else:
-        st.warning("The bounded evidence was insufficient to assess this change.")
-        st.write("Needed evidence:")
-        for item in view["needed_evidence"]:
-            st.write(f"• {item}")
+        if st.button(
+            "Finish without a scenario",
+            disabled=freshness != "current",
+            type="primary",
+        ):
+            try:
+                state.finish_without_risk()
+            except Exception:  # noqa: BLE001 - terminal details stay private
+                st.error("This review could not be finalized.")
+            else:
+                st.success("Review finalized without a proposed scenario.")
+        return
+
+    st.warning("The bounded evidence was insufficient to assess this change.")
+    st.write("Needed evidence:")
+    for item in view["needed_evidence"]:
+        st.write(f"• {item}")
+
+    refinement = state.latest_context_refinement
+    if refinement is not None and refinement.exhausted:
+        st.error(
+            "No further relevant frozen code was found. This does not mean the "
+            "pull request is safe."
+        )
+        if st.button(
+            "Finish with insufficient frozen code evidence",
+            disabled=freshness != "current",
+            type="primary",
+        ):
+            try:
+                state.finish_without_risk()
+            except Exception:  # noqa: BLE001 - terminal details stay private
+                st.error("This review could not be finalized.")
+            else:
+                st.warning("Review finalized with insufficient frozen evidence.")
+        return
 
     if st.button(
-        "Finish without a scenario",
+        "Find more frozen code evidence",
         disabled=freshness != "current",
         type="primary",
     ):
         try:
-            state.finish_without_risk()
-        except Exception:  # noqa: BLE001 - terminal error details stay private
-            st.error("This review could not be finalized.")
+            with st.spinner("Searching only the saved code photographs..."):
+                state.refine_frozen_evidence()
+        except Exception:  # noqa: BLE001 - no fresh-evidence fallback
+            st.error("More frozen code evidence could not be checked.")
         else:
-            st.success("Review finalized without a proposed scenario.")
+            st.rerun()
 
 
 def _render_navigation(

@@ -17,9 +17,9 @@ from triageguard.domain import (
     ClaimEvidenceBinding,
     ContextAnchor,
     ContextBundle,
-    ContextRefinement,
     DiffArtifact,
     EnvironmentKind,
+    EvidenceRefinementResult,
     FrozenEvidenceNeed,
     GherkinCandidate,
     GherkinCandidateDraft,
@@ -1220,14 +1220,16 @@ def test_resume_restores_an_exhausted_frozen_evidence_search(tmp_path) -> None:
         context,
     )
     freshness = _SnapshotAcquirer().recheck(snapshot)
-    refinement = ContextRefinement.from_content(
-        snapshot_key=snapshot.snapshot_key,
+    need = testability_assessment.evidence_needs[0]
+    refinement = EvidenceRefinementResult.from_content(
         parent_context_sha256=context.context_sha256,
-        refined_context_sha256=context.context_sha256,
-        evidence_need_ids=(testability_assessment.evidence_needs[0].need_id,),
+        successor_context_sha256=context.context_sha256,
+        requested_need_sha256=canonical_sha256([need.model_dump(mode="json")]),
+        priority_anchor_ids=(),
         added_anchor_ids=(),
+        round_number=1,
         exhausted=True,
-        created_at=datetime(2026, 8, 15, tzinfo=UTC),
+        reason_code="frozen_evidence_exhausted",
     )
     recorder = ArtifactRecorder(tmp_path)
     dependencies = MilestoneTwoDependencies(
@@ -1273,10 +1275,10 @@ def test_resume_restores_an_exhausted_frozen_evidence_search(tmp_path) -> None:
         ),
         freshness=freshness,
     )
-    first._persist_exhausted_context_refinement(
+    first._persist_evidence_refinement(
         prepared=prepared,
-        human_review=review,
-        assessment=testability_assessment,
+        needs=(need,),
+        successor_context=context,
         refinement=refinement,
         freshness=freshness,
     )

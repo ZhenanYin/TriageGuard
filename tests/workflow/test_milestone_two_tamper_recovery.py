@@ -11,10 +11,18 @@ from triageguard.domain import (
     ContextBundle,
     DiffArtifact,
     EnvironmentKind,
+    EvidenceRefinementResult,
+    FrozenEvidenceNeed,
     PullRequestSnapshot,
     SnapshotFreshness,
 )
-from triageguard.llm import ModelGatewayError, ReplayGateway
+from triageguard.llm import (
+    ModelGatewayError,
+    ModelRequest,
+    ModelResponse,
+    ReplayGateway,
+)
+from triageguard.provenance import canonical_sha256
 from triageguard.research import ArtifactRecorder
 from triageguard.workflow.milestone_two import (
     MilestoneTwoDependencies,
@@ -66,6 +74,39 @@ class _ContextBuilder:
 
     def build(self, **kwargs: object) -> ContextBundle:
         return self._context
+
+
+class _NoRiskGateway:
+    """Return one bounded no-risk result bound to the request envelope."""
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        snapshot_key = request.payload["snapshot_key"]
+        context_sha256 = request.payload["context_sha256"]
+        envelope = request.payload["evidence_envelope"]
+        assert isinstance(snapshot_key, str)
+        assert isinstance(context_sha256, str)
+        assert isinstance(envelope, dict)
+        return ReplayGateway(
+            {
+                "risk_hypothesis": {
+                    "snapshot_key": snapshot_key,
+                    "context_sha256": context_sha256,
+                    "evidence_envelope_sha256": envelope["envelope_sha256"],
+                    "outcome": "no_meaningful_security_risk_found",
+                    "hypotheses": [],
+                    "rationale": "No specific bounded risk remained after refinement.",
+                    "security_relevant_areas": ["Authorization behavior."],
+                    "supporting_anchor_ids": ["anchor-integration"],
+                    "coverage_limitations": [
+                        "This bounded result is not proof of safety."
+                    ],
+                    "reason_code": None,
+                    "missing_evidence": [],
+                    "evidence_needs": [],
+                    "generated_at": "2026-08-15T00:00:00Z",
+                }
+            }
+        ).generate(request)
 
 
 def _snapshot() -> PullRequestSnapshot:
@@ -141,6 +182,363 @@ def _context(snapshot: PullRequestSnapshot) -> ContextBundle:
         max_hits_per_identifier=20,
         primary_change_represented=True,
     )
+
+
+def _successor_context(
+    snapshot: PullRequestSnapshot,
+    context: ContextBundle,
+) -> ContextBundle:
+    """Add one deterministic repository-context anchor to the frozen catalog."""
+    text = "boolean hasPrivilege(String privilege) { return true; }"
+    anchor = ContextAnchor(
+        anchor_id="anchor-hidden-authorization",
+        revision_role="candidate",
+        commit_sha=snapshot.candidate_sha,
+        blob_sha="b" * 40,
+        path="api/src/main/java/org/openmrs/AuthorizationContext.java",
+        java_symbol="hasPrivilege",
+        start_line=20,
+        end_line=20,
+        text=text,
+        text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+        selection_reason="bounded frozen-evidence refinement",
+        score_components=(),
+        change_relation="repository_context",
+        truncated=False,
+    )
+    return ContextBundle.from_content(
+        snapshot_key=snapshot.snapshot_key,
+        anchors=(*context.anchors, anchor),
+        selected_file_count=2,
+        selected_anchor_count=2,
+        selected_bytes=context.selected_bytes + len(text.encode()),
+        max_files=context.max_files,
+        max_anchors=context.max_anchors,
+        max_bytes=context.max_bytes,
+        max_anchor_lines=context.max_anchor_lines,
+        max_blob_bytes=context.max_blob_bytes,
+        max_search_identifiers=context.max_search_identifiers,
+        max_hits_per_identifier=context.max_hits_per_identifier,
+        primary_change_represented=True,
+    )
+
+
+def test_resume_replays_a_saved_refinement_before_loading_the_next_model_round(
+    tmp_path,
+) -> None:
+    """Ignoring the refinement chain on restart must restore the stale context."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    successor = _successor_context(snapshot, context)
+    diffs = (
+        _diff("author_diff", snapshot.merge_base_sha, snapshot.head_sha, "a" * 64),
+        _diff(
+            "integration_diff",
+            snapshot.base_sha,
+            snapshot.candidate_sha,
+            "b" * 64,
+        ),
+        _diff(
+            "base_drift_diff",
+            snapshot.merge_base_sha,
+            snapshot.base_sha,
+            "c" * 64,
+        ),
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-refinement-recovery-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    prepared = workflow.prepare_pr(snapshot.pull_url)
+    need = FrozenEvidenceNeed(
+        need_id="need-has-privilege",
+        category="authorization",
+        search_terms=("hasPrivilege",),
+        explanation="Find the exact frozen authorization decision.",
+        supporting_anchor_ids=("anchor-integration",),
+    )
+    refinement = EvidenceRefinementResult.from_content(
+        parent_context_sha256=context.context_sha256,
+        successor_context_sha256=successor.context_sha256,
+        requested_need_sha256=canonical_sha256([need.model_dump(mode="json")]),
+        priority_anchor_ids=(),
+        added_anchor_ids=("anchor-hidden-authorization",),
+        round_number=1,
+        exhausted=False,
+        reason_code="frozen_context_extended",
+    )
+    workflow._persist_evidence_refinement(
+        prepared=prepared,
+        needs=(need,),
+        successor_context=successor,
+        refinement=refinement,
+        freshness=dependencies.snapshot_acquirer.recheck(snapshot),
+    )
+
+    resumed = resume_milestone_two_workflow(
+        run_handle=workflow.run_handle,
+        dependencies=dependencies,
+    )
+
+    assert resumed.prepared_pull_request is not None
+    assert resumed.prepared_pull_request.context == successor
+    assert resumed.context_refinements == (refinement,)
+    assert resumed._refinement_priority_anchor_ids == ("anchor-hidden-authorization",)
+
+
+def test_persistence_rejects_a_false_added_anchor_inventory(tmp_path) -> None:
+    """A resolver cannot claim anchors that are absent from its successor context."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    successor = _successor_context(snapshot, context)
+    diffs = (
+        _diff("author_diff", snapshot.merge_base_sha, snapshot.head_sha, "a" * 64),
+        _diff(
+            "integration_diff",
+            snapshot.base_sha,
+            snapshot.candidate_sha,
+            "b" * 64,
+        ),
+        _diff(
+            "base_drift_diff",
+            snapshot.merge_base_sha,
+            snapshot.base_sha,
+            "c" * 64,
+        ),
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-false-anchor-inventory-run",
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=ArtifactRecorder(tmp_path),
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    prepared = workflow.prepare_pr(snapshot.pull_url)
+    need = FrozenEvidenceNeed(
+        need_id="need-has-privilege",
+        category="authorization",
+        search_terms=("hasPrivilege",),
+        explanation="Find the exact frozen authorization decision.",
+        supporting_anchor_ids=("anchor-integration",),
+    )
+    refinement = EvidenceRefinementResult.from_content(
+        parent_context_sha256=context.context_sha256,
+        successor_context_sha256=successor.context_sha256,
+        requested_need_sha256=canonical_sha256([need.model_dump(mode="json")]),
+        priority_anchor_ids=(),
+        added_anchor_ids=("anchor-fabricated",),
+        round_number=1,
+        exhausted=False,
+        reason_code="frozen_context_extended",
+    )
+
+    with pytest.raises(MilestoneTwoTransitionError, match="not bound"):
+        workflow._persist_evidence_refinement(
+            prepared=prepared,
+            needs=(need,),
+            successor_context=successor,
+            refinement=refinement,
+            freshness=workflow._snapshot_acquirer.recheck(snapshot),
+        )
+
+
+def test_resume_reloads_a_terminal_record_from_the_refined_round(tmp_path) -> None:
+    """Terminal recovery must locate envelopes saved after a successful refinement."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    successor = _successor_context(snapshot, context)
+    diffs = (
+        _diff("author_diff", snapshot.merge_base_sha, snapshot.head_sha, "a" * 64),
+        _diff(
+            "integration_diff",
+            snapshot.base_sha,
+            snapshot.candidate_sha,
+            "b" * 64,
+        ),
+        _diff(
+            "base_drift_diff",
+            snapshot.merge_base_sha,
+            snapshot.base_sha,
+            "c" * 64,
+        ),
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=_NoRiskGateway(),
+    )
+    first = MilestoneTwoWorkflow(
+        run_id="m2-refined-terminal-recovery-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    prepared = first.prepare_pr(snapshot.pull_url)
+    need = FrozenEvidenceNeed(
+        need_id="need-has-privilege",
+        category="authorization",
+        search_terms=("hasPrivilege",),
+        explanation="Find the exact frozen authorization decision.",
+        supporting_anchor_ids=("anchor-integration",),
+    )
+    refinement = EvidenceRefinementResult.from_content(
+        parent_context_sha256=context.context_sha256,
+        successor_context_sha256=successor.context_sha256,
+        requested_need_sha256=canonical_sha256([need.model_dump(mode="json")]),
+        priority_anchor_ids=(),
+        added_anchor_ids=("anchor-hidden-authorization",),
+        round_number=1,
+        exhausted=False,
+        reason_code="frozen_context_extended",
+    )
+    first._persist_evidence_refinement(
+        prepared=prepared,
+        needs=(need,),
+        successor_context=successor,
+        refinement=refinement,
+        freshness=dependencies.snapshot_acquirer.recheck(snapshot),
+    )
+    refined = resume_milestone_two_workflow(
+        run_handle=first.run_handle,
+        dependencies=dependencies,
+    )
+    refined.propose_risks()
+    sealed = refined.finish_without_risk()
+
+    resumed = resume_milestone_two_workflow(
+        run_handle=first.run_handle,
+        dependencies=dependencies,
+    )
+
+    assert resumed.terminal_record == sealed
+    assert resumed.context_refinements == (refinement,)
+
+
+@pytest.mark.parametrize(
+    ("artifact_round", "message"),
+    [
+        (0, "invalid round path"),
+        (2, "missing parent round"),
+        (4, "exceeds the configured round limit"),
+    ],
+)
+def test_resume_rejects_a_non_contiguous_or_unbounded_refinement_chain(
+    tmp_path,
+    artifact_round: int,
+    message: str,
+) -> None:
+    """Accepting a skipped or unbounded round would make replay non-causal."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    diffs = (
+        _diff("author_diff", snapshot.merge_base_sha, snapshot.head_sha, "a" * 64),
+        _diff(
+            "integration_diff",
+            snapshot.base_sha,
+            snapshot.candidate_sha,
+            "b" * 64,
+        ),
+        _diff(
+            "base_drift_diff",
+            snapshot.merge_base_sha,
+            snapshot.base_sha,
+            "c" * 64,
+        ),
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id=f"m2-invalid-refinement-round-{artifact_round}",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    workflow.prepare_pr(snapshot.pull_url)
+    need = FrozenEvidenceNeed(
+        need_id="need-has-privilege",
+        category="authorization",
+        search_terms=("hasPrivilege",),
+        explanation="Find the exact frozen authorization decision.",
+        supporting_anchor_ids=("anchor-integration",),
+    )
+    refinement = EvidenceRefinementResult.from_content(
+        parent_context_sha256=context.context_sha256,
+        successor_context_sha256=context.context_sha256,
+        requested_need_sha256=canonical_sha256([need.model_dump(mode="json")]),
+        priority_anchor_ids=("anchor-integration",),
+        added_anchor_ids=(),
+        round_number=max(1, artifact_round),
+        exhausted=False,
+        reason_code="catalog_evidence_prioritized",
+    )
+    workflow._persist_transition(
+        artifact_name=(
+            f"artifacts/workflow/evidence_refinements/{artifact_round}.json"
+        ),
+        event_type=f"workflow_frozen_evidence_refinement_{artifact_round}",
+        payload={
+            "refinement": refinement.model_dump(mode="json"),
+            "needs": [need.model_dump(mode="json")],
+            "successor_context": context.model_dump(mode="json"),
+            "freshness": dependencies.snapshot_acquirer.recheck(snapshot).model_dump(
+                mode="json"
+            ),
+        },
+        input_hashes={
+            "snapshot": snapshot.snapshot_key,
+            "parent_context": context.context_sha256,
+            "successor_context": context.context_sha256,
+            "requested_need": refinement.requested_need_sha256,
+            "refinement": refinement.refinement_sha256,
+        },
+        reason_code=refinement.reason_code,
+    )
+
+    with pytest.raises(MilestoneTwoTransitionError, match=message):
+        resume_milestone_two_workflow(
+            run_handle=workflow.run_handle,
+            dependencies=dependencies,
+        )
 
 
 def test_resume_rejects_tampered_prepared_evidence(tmp_path) -> None:

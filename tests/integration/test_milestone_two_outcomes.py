@@ -43,10 +43,20 @@ def test_nonrisk_outcomes_finish_without_gherkin(
 
     workflow.prepare_pr(SUPPORTED_PR_URL)
     assessment = workflow.propose_risks()
-    record = workflow.finish_without_risk()
+    if outcome == "insufficient_context_to_assess":
+        while True:
+            refinement = workflow.refine_frozen_evidence()
+            if refinement.exhausted:
+                break
+            assessment = workflow.propose_risks()
+        record = workflow.finish_with_insufficient_frozen_evidence()
+    else:
+        record = workflow.finish_without_risk()
 
     assert assessment.outcome == outcome
     assert record.status.value == terminal_status
     assert record.human_reviewed_risk is None
     assert record.gherkin_candidate is None
     assert record.gherkin_approval is None
+    if outcome == "insufficient_context_to_assess":
+        assert record.context_refinements[-1].exhausted is True

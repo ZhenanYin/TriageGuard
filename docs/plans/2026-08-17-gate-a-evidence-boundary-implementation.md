@@ -50,7 +50,7 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 - [x] Task 4 — Add the immutable model-evidence envelope
 - [x] Task 5 — Migrate risk generation and validation to visible evidence
 - [x] Task 6 — Migrate testability and Gherkin to visible evidence
-- [ ] Task 7 — Add bounded frozen-evidence refinement at model boundaries
+- [x] Task 7 — Add bounded frozen-evidence refinement at model boundaries
 - [ ] Task 8 — Unify model-stage execution, failure provenance, and recovery
 - [ ] Task 9 — Update replay and UI behavior without weakening gates
 - [ ] Task 10 — Complete Gate A verification and record measurements
@@ -92,6 +92,17 @@ complete non-UI suite passed 758 tests and the complete UI suite passed 54 tests
 (812 total). The combined one-process run reached the Streamlit teardown and
 exited without a pytest summary, so the two independently complete suites are
 the recorded regression evidence for this task.
+
+Task 7 completed on 2026-08-17. Risk and testability now share strict
+`FrozenEvidenceNeed` requests, catalog-first selection, snapshot-confined
+M/B/H/C Java search, hash-bound refinement results, a two-round bounded retry
+policy, persistence-before-mutation, complete downstream invalidation, and
+strict restart/terminal chain recovery. The focused Task 7, offline replay, and
+guided-state suite passed 132 tests. The complete suite passed all 833
+collected tests.
+Task 7 files pass Ruff; compilation and `git diff --check` are clean. The
+repository-wide format check still reports 25 pre-existing files outside this
+task that use the earlier formatting style.
 
 ---
 
@@ -886,7 +897,7 @@ git commit -m "feat: bind testability and gherkin to visible evidence"
 - Modify: `src/triageguard/evidence/selection.py`
 - Modify: `src/triageguard/workflow/milestone_two.py`
 - Modify: `tests/analysis/test_refinement.py`
-- Create: `tests/evidence/test_refinement.py`
+- Create: `tests/evidence/test_frozen_refinement.py`
 - Modify: `tests/workflow/test_milestone_two_refinement.py`
 
 ### Step 1: Add failing bounded-loop tests
@@ -969,7 +980,7 @@ and reject missing parents, non-monotonic rounds, or hash mismatches.
 ```bash
 .venv/bin/python -m pytest \
   tests/analysis/test_refinement.py \
-  tests/evidence/test_refinement.py \
+  tests/evidence/test_frozen_refinement.py \
   tests/workflow/test_milestone_two_refinement.py \
   tests/workflow/test_milestone_two_durability.py \
   tests/workflow/test_milestone_two_tamper_recovery.py \

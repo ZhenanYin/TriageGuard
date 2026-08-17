@@ -232,7 +232,7 @@ def test_risk_request_contains_only_frozen_evidence() -> None:
         "context_sha256",
         "comparisons",
         "evidence_envelope",
-        "output_rules",
+        "output_rule",
     }
     assert request.payload["snapshot_key"] == snapshot.snapshot_key
     assert request.payload["context_sha256"] == context.context_sha256
@@ -247,7 +247,7 @@ def test_risk_request_contains_only_frozen_evidence() -> None:
     assert "GROQ_API_KEY" not in serialized
     assert "GITHUB_TOKEN" not in serialized
     assert request.output_schema["additionalProperties"] is False
-    assert "Write each explanation as one readable" in request.system_prompt
+    assert "Use one readable paragraph per hypothesis" in request.system_prompt
 
 
 def test_risk_request_rejects_a_required_anchor_instead_of_slicing_it() -> None:
@@ -333,7 +333,7 @@ def _model_response(
         "coverage_limitations": [],
         "reason_code": None,
         "missing_evidence": [],
-        "needed_evidence": [],
+        "evidence_needs": [],
         "generated_at": "2026-08-12T00:00:00Z",
     }
 
@@ -427,8 +427,14 @@ def _model_response(
         response["missing_evidence"] = [
             "The authorization implementation is not available in the frozen context."
         ]
-        response["needed_evidence"] = [
-            "The relevant authorization implementation and its tests."
+        response["evidence_needs"] = [
+            {
+                "need_id": "need-has-privilege",
+                "category": "authorization",
+                "search_terms": ["hasPrivilege"],
+                "explanation": "Find the exact frozen authorization decision.",
+                "supporting_anchor_ids": ["anchor-integration"],
+            }
         ]
     else:
         raise ValueError("test fixture received an unsupported outcome")

@@ -2,9 +2,17 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from triageguard.analysis.context import ContextLimits
 from triageguard.config import Settings
-from triageguard.domain import EnvironmentKind, MilestoneTwoStatus
+from triageguard.domain import (
+    EnvironmentKind,
+    EvidenceRefinementResult,
+    FrozenEvidenceNeed,
+    MilestoneTwoStatus,
+)
+from triageguard.evidence import FrozenEvidenceResolution
 from triageguard.llm import ReplayGateway
 from triageguard.research import ArtifactRecorder
 from triageguard.workflow import milestone_two
@@ -51,9 +59,161 @@ class _RecordingRefiner:
         self.refinement = refinement
         self.calls: list[dict[str, object]] = []
 
-    def refine(self, **kwargs: object) -> tuple[object, object]:
+    def resolve(self, **kwargs: object) -> FrozenEvidenceResolution:
         self.calls.append(kwargs)
-        return self.refined_context, self.refinement
+        return FrozenEvidenceResolution(
+            context=self.refined_context,
+            refinement=self.refinement,
+        )
+
+
+class _RecordingResolver:
+    """Return one bounded resolution and retain the workflow's exact request."""
+
+    def __init__(self, resolution: FrozenEvidenceResolution) -> None:
+        self.resolution = resolution
+        self.calls: list[dict[str, object]] = []
+
+    def resolve(self, **kwargs: object) -> FrozenEvidenceResolution:
+        self.calls.append(kwargs)
+        return self.resolution
+
+
+def _need() -> FrozenEvidenceNeed:
+    return FrozenEvidenceNeed(
+        need_id="need-has-privilege",
+        category="authorization",
+        search_terms=("hasPrivilege",),
+        explanation="Find the exact frozen authorization decision.",
+        supporting_anchor_ids=("anchor-visible",),
+    )
+
+
+def _result(*, exhausted: bool = False) -> EvidenceRefinementResult:
+    return EvidenceRefinementResult.from_content(
+        parent_context_sha256="a" * 64,
+        successor_context_sha256="a" * 64,
+        requested_need_sha256="b" * 64,
+        priority_anchor_ids=() if exhausted else ("anchor-hidden",),
+        added_anchor_ids=(),
+        round_number=1,
+        exhausted=exhausted,
+        reason_code=(
+            "frozen_evidence_exhausted" if exhausted else "catalog_evidence_prioritized"
+        ),
+    )
+
+
+def test_refinement_cannot_continue_after_an_exhausted_result(tmp_path) -> None:
+    """A second exhaustion record would make the durable chain unrecoverable."""
+    snapshot = object()
+    context = object()
+    exhausted = _result(exhausted=True)
+    resolver = _RecordingResolver(
+        FrozenEvidenceResolution(context=context, refinement=exhausted)
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-already-exhausted-run",
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=ArtifactRecorder(tmp_path),
+        snapshot_acquirer=_SnapshotAcquirer(),
+        diff_builder=_UnusedDiffBuilder(),
+        context_builder=_UnusedContextBuilder(),
+        store=object(),
+        gateway=ReplayGateway({}),
+        evidence_refiner=resolver,
+    )
+    workflow._prepared = PreparedPullRequest(
+        snapshot=snapshot,
+        diffs=(object(), object(), object()),
+        context=context,
+    )
+    workflow._risk_assessment = SimpleNamespace(
+        outcome="insufficient_context_to_assess",
+        evidence_needs=(_need(),),
+    )
+    workflow._context_refinements = [exhausted]
+    workflow._state = milestone_two._State.EVIDENCE_REFINEMENT_REQUIRED
+
+    with pytest.raises(milestone_two.MilestoneTwoTransitionError, match="exhausted"):
+        workflow.refine_frozen_evidence()
+
+    assert resolver.calls == []
+
+
+def test_risk_level_refinement_is_persisted_before_downstream_state_is_cleared(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Moving persistence after mutation must expose cleared causal inputs."""
+    snapshot = object()
+    original_context = object()
+    refined_context = object()
+    need = _need()
+    risk_assessment = SimpleNamespace(
+        outcome="insufficient_context_to_assess",
+        evidence_needs=(need,),
+    )
+    refinement = _result()
+    resolver = _RecordingResolver(
+        FrozenEvidenceResolution(
+            context=refined_context,
+            refinement=refinement,
+        )
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-risk-refinement-run",
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=ArtifactRecorder(tmp_path),
+        snapshot_acquirer=_SnapshotAcquirer(),
+        diff_builder=_UnusedDiffBuilder(),
+        context_builder=_UnusedContextBuilder(),
+        store=object(),
+        gateway=ReplayGateway({}),
+        evidence_refiner=resolver,
+    )
+    workflow._prepared = PreparedPullRequest(
+        snapshot=snapshot,
+        diffs=(object(), object(), object()),
+        context=original_context,
+    )
+    workflow._risk_assessment = risk_assessment
+    workflow._risk_evidence_envelope = object()
+    workflow._risk_draft = object()
+    workflow._risk_response = object()
+    workflow._state = milestone_two._State.EVIDENCE_REFINEMENT_REQUIRED
+    persisted: list[object] = []
+
+    monkeypatch.setattr(workflow, "_is_typed_prepared", lambda _prepared: True)
+
+    def fake_persist(**values: object) -> None:
+        assert workflow._risk_assessment is risk_assessment
+        assert workflow.prepared_pull_request is not None
+        assert workflow.prepared_pull_request.context is original_context
+        assert values["needs"] == (need,)
+        assert values["refinement"] == refinement
+        persisted.append(values)
+
+    monkeypatch.setattr(
+        workflow,
+        "_persist_evidence_refinement",
+        fake_persist,
+        raising=False,
+    )
+
+    assert workflow.refine_frozen_evidence() == refinement
+    assert len(persisted) == 1
+    assert workflow.prepared_pull_request is not None
+    assert workflow.prepared_pull_request.context is refined_context
+    assert workflow.risk_assessment is None
+    assert workflow.human_reviewed_risk is None
+    assert workflow.testability_assessment is None
+    assert workflow.gherkin_candidate is None
+    assert workflow._refinement_priority_anchor_ids == ("anchor-hidden",)
+    assert workflow._state is milestone_two._State.PREPARED
+    assert resolver.calls[0]["needs"] == (need,)
+    assert resolver.calls[0]["completed_rounds"] == 0
+    assert resolver.calls[0]["max_rounds"] == 2
 
 
 def test_refinement_replaces_context_and_clears_downstream_analysis(
@@ -68,7 +228,11 @@ def test_refinement_replaces_context_and_clears_downstream_analysis(
         decision="needs_more_frozen_evidence",
         evidence_needs=(object(),),
     )
-    refinement = SimpleNamespace(exhausted=False)
+    refinement = SimpleNamespace(
+        exhausted=False,
+        priority_anchor_ids=(),
+        added_anchor_ids=("anchor-added",),
+    )
     acquirer = _SnapshotAcquirer()
     refiner = _RecordingRefiner(refined_context, refinement)
 
@@ -116,9 +280,11 @@ def test_refinement_replaces_context_and_clears_downstream_analysis(
         {
             "snapshot": snapshot,
             "context": original_context,
-            "assessment": assessment,
+            "needs": assessment.evidence_needs,
             "store": workflow._store,
             "limits": ContextLimits.from_settings(workflow._settings),
+            "completed_rounds": 0,
+            "max_rounds": workflow._settings.max_model_evidence_rounds,
             "created_at": refiner.calls[0]["created_at"],
         }
     ]
@@ -135,7 +301,11 @@ def test_exhausted_refinement_finishes_with_insufficient_frozen_evidence(
         decision="needs_more_frozen_evidence",
         evidence_needs=(object(),),
     )
-    refinement = SimpleNamespace(exhausted=True)
+    refinement = SimpleNamespace(
+        exhausted=True,
+        priority_anchor_ids=(),
+        added_anchor_ids=(),
+    )
     acquirer = _SnapshotAcquirer()
     refiner = _RecordingRefiner(original_context, refinement)
     finalized: list[tuple[object, object]] = []
@@ -188,3 +358,57 @@ def test_exhausted_refinement_finishes_with_insufficient_frozen_evidence(
     assert workflow._state is milestone_two._State.FINALIZED
     assert finalized == [(workflow.run_handle, terminal_marker)]
     assert acquirer.rechecked == [snapshot, snapshot]
+
+
+def test_exhausted_risk_refinement_seals_only_insufficient_context(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A risk-stage exhausted search must never be recorded as a no-risk result."""
+    snapshot = object()
+    context = object()
+    risk_assessment = SimpleNamespace(
+        outcome="insufficient_context_to_assess",
+        reason_code="analysis_limit_exceeded",
+        evidence_needs=(_need(),),
+    )
+    refinement = _result(exhausted=True)
+    terminal_marker = object()
+    finalized: list[object] = []
+
+    def fake_terminal_record(**values: object) -> object:
+        assert values["status"] is MilestoneTwoStatus.INSUFFICIENT_CONTEXT_TO_ASSESS
+        assert values["reason_code"] == "analysis_limit_exceeded"
+        assert values["risk_assessment"] is risk_assessment
+        assert values["human_reviewed_risk"] is None
+        assert values["testability_assessment"] is None
+        assert values["context_refinements"] == (refinement,)
+        return terminal_marker
+
+    monkeypatch.setattr(milestone_two, "MilestoneTwoRunRecord", fake_terminal_record)
+    monkeypatch.setattr(
+        ArtifactRecorder,
+        "finalize_run",
+        lambda _recorder, _handle, record: finalized.append(record),
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-risk-exhaustion-run",
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=ArtifactRecorder(tmp_path),
+        snapshot_acquirer=_SnapshotAcquirer(),
+        diff_builder=_UnusedDiffBuilder(),
+        context_builder=_UnusedContextBuilder(),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    workflow._prepared = PreparedPullRequest(
+        snapshot=snapshot,
+        diffs=(object(), object(), object()),
+        context=context,
+    )
+    workflow._risk_assessment = risk_assessment
+    workflow._context_refinements = [refinement]
+    workflow._state = milestone_two._State.EVIDENCE_REFINEMENT_REQUIRED
+
+    assert workflow.finish_with_insufficient_frozen_evidence() is terminal_marker
+    assert finalized == [terminal_marker]

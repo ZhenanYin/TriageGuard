@@ -324,6 +324,12 @@ def validate_risk_assessment(
             for anchor_id in normalized_draft.supporting_anchor_ids
         ):
             _add_reason(reason_codes, "missing_integration_evidence")
+    elif normalized_draft.outcome == "insufficient_context_to_assess" and any(
+        anchor_id not in anchors
+        for need in normalized_draft.evidence_needs
+        for anchor_id in need.supporting_anchor_ids
+    ):
+        _add_reason(reason_codes, "unknown_evidence_anchor")
 
     if reason_codes:
         report = RiskGroundingReport(

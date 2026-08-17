@@ -33,8 +33,8 @@ from triageguard.contracts.gherkin_generation import (
 )
 from triageguard.domain import (
     ContextBundle,
-    ContextRefinement,
     DiffArtifact,
+    EvidenceRefinementResult,
     FrozenEvidenceNeed,
     GherkinApproval,
     GherkinCandidate,
@@ -50,6 +50,8 @@ from triageguard.domain import (
 )
 from triageguard.evidence import (
     EvidenceArtifactBinding,
+    FrozenEvidenceResolution,
+    FrozenEvidenceResolver,
     ModelEvidenceEnvelope,
     validate_envelope_binding,
 )
@@ -152,17 +154,19 @@ class _ContextBuilder(Protocol):
 class _EvidenceRefiner(Protocol):
     """Refine only the already frozen evidence for one prepared pull request."""
 
-    def refine(
+    def resolve(
         self,
         *,
         snapshot: PullRequestSnapshot,
         context: ContextBundle,
-        assessment: TestabilityAssessment,
+        needs: Sequence[FrozenEvidenceNeed],
         store: object,
         limits: ContextLimits,
+        completed_rounds: int,
+        max_rounds: int,
         created_at: datetime,
-    ) -> tuple[ContextBundle, ContextRefinement]:
-        """Return a successor context or an exhausted refinement record."""
+    ) -> FrozenEvidenceResolution:
+        """Return one bounded catalog-first frozen-evidence resolution."""
 
 
 @dataclass(frozen=True)
@@ -286,7 +290,10 @@ class MilestoneTwoWorkflow:
         self._context_builder = context_builder
         self._store = store
         self._gateway = gateway
-        self._evidence_refiner = evidence_refiner
+        if evidence_refiner is not None and not hasattr(evidence_refiner, "resolve"):
+            self._evidence_refiner = FrozenEvidenceResolver(evidence_refiner)
+        else:
+            self._evidence_refiner = evidence_refiner
         self._operation_lock = RLock()
 
         self._started_at = datetime.now(UTC)
@@ -311,7 +318,9 @@ class MilestoneTwoWorkflow:
         self._testability_evidence_envelope: ModelEvidenceEnvelope | None = None
         self._testability_response: ModelResponse | None = None
         self._testability_assessment: TestabilityAssessment | None = None
-        self._context_refinements: list[ContextRefinement] = []
+        self._context_refinements: list[EvidenceRefinementResult] = []
+        self._refinement_priority_anchor_ids: tuple[str, ...] = ()
+        self._analysis_round = 0
         self._gherkin_candidate: GherkinCandidate | None = None
         self._gherkin_evidence_envelope: ModelEvidenceEnvelope | None = None
         self._gherkin_response: ModelResponse | None = None
@@ -361,7 +370,7 @@ class MilestoneTwoWorkflow:
         return self._testability_evidence_envelope
 
     @property
-    def context_refinements(self) -> tuple[ContextRefinement, ...]:
+    def context_refinements(self) -> tuple[EvidenceRefinementResult, ...]:
         """Return the immutable frozen-evidence refinements in this run."""
         return tuple(self._context_refinements)
 
@@ -433,6 +442,7 @@ class MilestoneTwoWorkflow:
                 diffs=prepared.diffs,
                 context=prepared.context,
                 budget=ProviderRequestBudget.from_settings(self._settings),
+                priority_anchor_ids=self._refinement_priority_anchor_ids,
             )
             evidence_envelope = envelope_result.envelope
             if self._is_typed_prepared(prepared):
@@ -493,7 +503,12 @@ class MilestoneTwoWorkflow:
         self._risk_response = response
         self._risk_assessment = assessment
         self._risk_grounding_report = grounding_report
-        self._state = _State.RISKS_READY
+        if getattr(assessment, "outcome", "risks_proposed") == (
+            "insufficient_context_to_assess"
+        ):
+            self._state = _State.EVIDENCE_REFINEMENT_REQUIRED
+        else:
+            self._state = _State.RISKS_READY
         return assessment
 
     @_with_workflow_lease
@@ -620,21 +635,22 @@ class MilestoneTwoWorkflow:
         return assessment
 
     @_with_workflow_lease
-    def refine_frozen_evidence(self) -> ContextRefinement:
+    def refine_frozen_evidence(self) -> EvidenceRefinementResult:
         """Replace the context only with bounded code from saved snapshots."""
-        if (
-            self._state is not _State.EVIDENCE_REFINEMENT_REQUIRED
-            or self._human_reviewed_risk is None
-            or self._testability_assessment is None
-        ):
+        if self._state is not _State.EVIDENCE_REFINEMENT_REQUIRED:
             raise MilestoneTwoTransitionError(
-                "Cannot refine frozen evidence: a reviewed risk needs more "
-                "frozen evidence before continuing."
+                "Cannot refine frozen evidence: a model stage must request "
+                "structured frozen evidence before continuing."
             )
         if self._evidence_refiner is None:
             raise MilestoneTwoTransitionError(
                 "Cannot refine frozen evidence: no frozen-evidence refiner "
                 "is configured."
+            )
+        if self._context_refinements and self._context_refinements[-1].exhausted:
+            raise MilestoneTwoTransitionError(
+                "Cannot refine frozen evidence: the bounded search is already "
+                "exhausted."
             )
 
         prepared = self._require_prepared("refine frozen evidence")
@@ -652,35 +668,42 @@ class MilestoneTwoWorkflow:
                 "requires a current snapshot."
             )
 
-        refined_context, refinement = self._evidence_refiner.refine(
+        needs = self._active_refinement_needs()
+        resolution = self._evidence_refiner.resolve(
             snapshot=prepared.snapshot,
             context=prepared.context,
-            assessment=self._testability_assessment,
+            needs=needs,
             store=self._store,
             limits=ContextLimits.from_settings(self._settings),
+            completed_rounds=len(self._context_refinements),
+            max_rounds=self._settings.max_model_evidence_rounds,
             created_at=datetime.now(UTC),
         )
+        refined_context = resolution.context
+        refinement = resolution.refinement
+        if self._is_typed_prepared(prepared):
+            self._persist_evidence_refinement(
+                prepared=prepared,
+                needs=needs,
+                successor_context=refined_context,
+                refinement=refinement,
+                freshness=freshness,
+            )
+        self._context_refinements.append(refinement)
         if refinement.exhausted:
-            if self._is_typed_prepared(prepared) and isinstance(
-                self._testability_assessment,
-                TestabilityAssessment,
-            ):
-                self._persist_exhausted_context_refinement(
-                    prepared=prepared,
-                    human_review=self._human_reviewed_risk,
-                    assessment=self._testability_assessment,
-                    refinement=refinement,
-                    freshness=freshness,
-                )
-            self._context_refinements.append(refinement)
             return refinement
 
-        self._context_refinements.append(refinement)
         self._prepared = PreparedPullRequest(
             snapshot=prepared.snapshot,
             diffs=prepared.diffs,
             context=refined_context,
         )
+        self._refinement_priority_anchor_ids = tuple(
+            dict.fromkeys(
+                (*refinement.priority_anchor_ids, *refinement.added_anchor_ids)
+            )
+        )
+        self._analysis_round += 1
         self._risk_evidence_envelope = None
         self._risk_draft = None
         self._risk_response = None
@@ -701,17 +724,50 @@ class MilestoneTwoWorkflow:
         self._state = _State.PREPARED
         return refinement
 
+    def _active_refinement_needs(self) -> tuple[FrozenEvidenceNeed, ...]:
+        """Return the validated needs from the exact stage requesting refinement."""
+        if (
+            self._risk_assessment is not None
+            and getattr(self._risk_assessment, "outcome", None)
+            == "insufficient_context_to_assess"
+        ):
+            needs = tuple(self._risk_assessment.evidence_needs)
+        elif (
+            self._testability_assessment is not None
+            and self._testability_assessment.decision == "needs_more_frozen_evidence"
+        ):
+            needs = tuple(self._testability_assessment.evidence_needs)
+        else:
+            raise MilestoneTwoTransitionError(
+                "Cannot refine frozen evidence: no structured evidence need is active."
+            )
+        if not needs:
+            raise MilestoneTwoTransitionError(
+                "Cannot refine frozen evidence: the active stage supplied no needs."
+            )
+        return needs
+
     @_with_workflow_lease
     def finish_with_insufficient_frozen_evidence(self) -> MilestoneTwoRunRecord:
         """Seal an exhausted frozen-evidence search without treating it as safe."""
+        risk_exhausted = (
+            self._risk_assessment is not None
+            and getattr(self._risk_assessment, "outcome", None)
+            == "insufficient_context_to_assess"
+            and self._human_reviewed_risk is None
+            and self._testability_assessment is None
+        )
+        testability_exhausted = (
+            self._risk_assessment is not None
+            and self._human_reviewed_risk is not None
+            and self._testability_assessment is not None
+            and self._testability_assessment.decision == "needs_more_frozen_evidence"
+        )
         if (
             self._state is not _State.EVIDENCE_REFINEMENT_REQUIRED
-            or self._risk_assessment is None
-            or self._human_reviewed_risk is None
-            or self._testability_assessment is None
-            or self._testability_assessment.decision != "needs_more_frozen_evidence"
             or not self._context_refinements
             or not self._context_refinements[-1].exhausted
+            or not (risk_exhausted or testability_exhausted)
         ):
             raise MilestoneTwoTransitionError(
                 "Cannot finish with insufficient frozen evidence: an exhausted "
@@ -732,14 +788,25 @@ class MilestoneTwoWorkflow:
                 "a current snapshot."
             )
 
+        if risk_exhausted:
+            status = MilestoneTwoStatus.INSUFFICIENT_CONTEXT_TO_ASSESS
+            reason_code = self._risk_assessment.reason_code
+            explanation = (
+                "Insufficient bounded frozen code evidence to assess this change."
+            )
+        else:
+            status = MilestoneTwoStatus.INSUFFICIENT_FROZEN_EVIDENCE_FOR_SCENARIO
+            reason_code = "insufficient_frozen_evidence_for_scenario"
+            explanation = (
+                "Insufficient frozen code evidence to design an executable scenario."
+            )
+
         record = MilestoneTwoRunRecord(
             run_id=self._run_handle.run_id,
             snapshot=prepared.snapshot,
-            status=MilestoneTwoStatus.INSUFFICIENT_FROZEN_EVIDENCE_FOR_SCENARIO,
-            reason_code="insufficient_frozen_evidence_for_scenario",
-            explanation=(
-                "Insufficient frozen code evidence to design an executable scenario."
-            ),
+            status=status,
+            reason_code=reason_code,
+            explanation=explanation,
             started_at=self._started_at,
             finished_at=datetime.now(UTC),
             freshness=freshness,
@@ -1025,13 +1092,11 @@ class MilestoneTwoWorkflow:
             )
 
         assessment = self._risk_assessment
-        if assessment.outcome not in {
-            "no_meaningful_security_risk_found",
-            "insufficient_context_to_assess",
-        }:
+        if assessment.outcome != "no_meaningful_security_risk_found":
             raise MilestoneTwoTransitionError(
-                "Cannot finish without risk: the assessment is not a supported "
-                "non-risk outcome."
+                "Cannot finish without risk: only the bounded non-risk assessment "
+                "may use this exit. Insufficient context requires exhausted "
+                "frozen-evidence refinement."
             )
 
         freshness = self._snapshot_acquirer.recheck(prepared.snapshot)
@@ -1047,14 +1112,9 @@ class MilestoneTwoWorkflow:
                 "a current snapshot."
             )
 
-        if assessment.outcome == "no_meaningful_security_risk_found":
-            status = MilestoneTwoStatus.NO_MEANINGFUL_SECURITY_RISK_FOUND
-            reason_code = "no_meaningful_security_risk_found"
-            explanation = assessment.rationale
-        else:
-            status = MilestoneTwoStatus.INSUFFICIENT_CONTEXT_TO_ASSESS
-            reason_code = assessment.reason_code
-            explanation = "The bounded evidence was insufficient for a risk assessment."
+        status = MilestoneTwoStatus.NO_MEANINGFUL_SECURITY_RISK_FOUND
+        reason_code = "no_meaningful_security_risk_found"
+        explanation = assessment.rationale
 
         if not explanation or not reason_code:
             raise MilestoneTwoTransitionError(
@@ -1073,6 +1133,7 @@ class MilestoneTwoWorkflow:
             freshness=freshness,
             risk_assessment=assessment,
             human_reviewed_risk=None,
+            context_refinements=tuple(self._context_refinements),
             gherkin_candidate=None,
             gherkin_approval=None,
         )
@@ -1274,6 +1335,7 @@ class MilestoneTwoWorkflow:
                 diffs=prepared.diffs,
                 context=prepared.context,
                 budget=ProviderRequestBudget.from_settings(self._settings),
+                priority_anchor_ids=self._refinement_priority_anchor_ids,
             ).envelope
             if draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256:
                 raise MilestoneTwoTransitionError(
@@ -1496,50 +1558,69 @@ class MilestoneTwoWorkflow:
             reason_code="testability_evidence_envelope_recorded",
         )
 
-    def _persist_exhausted_context_refinement(
+    def _persist_evidence_refinement(
         self,
         *,
         prepared: PreparedPullRequest,
-        human_review: HumanReviewedRisk,
-        assessment: TestabilityAssessment,
-        refinement: ContextRefinement,
+        needs: tuple[FrozenEvidenceNeed, ...],
+        successor_context: ContextBundle,
+        refinement: EvidenceRefinementResult,
         freshness: SnapshotFreshness,
     ) -> None:
-        """Save the bounded proof that no further frozen code was available."""
-        evidence_need_ids = tuple(need.need_id for need in assessment.evidence_needs)
+        """Save one refinement link before mutating any in-memory workflow state."""
+        requested_need_sha256 = canonical_sha256(
+            [need.model_dump(mode="json") for need in needs]
+        )
+        parent_anchor_ids = {anchor.anchor_id for anchor in prepared.context.anchors}
+        successor_anchor_ids = {
+            anchor.anchor_id for anchor in successor_context.anchors
+        }
         if (
-            assessment.decision != "needs_more_frozen_evidence"
-            or not refinement.exhausted
-            or refinement.snapshot_key != prepared.snapshot.snapshot_key
+            refinement.round_number != len(self._context_refinements) + 1
             or refinement.parent_context_sha256 != prepared.context.context_sha256
-            or refinement.refined_context_sha256 != prepared.context.context_sha256
-            or refinement.evidence_need_ids != evidence_need_ids
-            or assessment.snapshot_key != prepared.snapshot.snapshot_key
-            or assessment.context_sha256 != prepared.context.context_sha256
-            or assessment.reviewed_risk_sha256 != human_review.reviewed_content_sha256
+            or refinement.successor_context_sha256 != successor_context.context_sha256
+            or refinement.requested_need_sha256 != requested_need_sha256
+            or successor_context.snapshot_key != prepared.snapshot.snapshot_key
+            or not parent_anchor_ids.issubset(successor_anchor_ids)
+            or set(refinement.added_anchor_ids)
+            != successor_anchor_ids - parent_anchor_ids
+            or any(
+                anchor_id not in parent_anchor_ids
+                for anchor_id in refinement.priority_anchor_ids
+            )
+            or any(
+                anchor_id not in parent_anchor_ids
+                for need in needs
+                for anchor_id in need.supporting_anchor_ids
+            )
             or freshness.snapshot_key != prepared.snapshot.snapshot_key
             or freshness.status != "current"
         ):
             raise MilestoneTwoTransitionError(
-                "Exhausted frozen-evidence refinement is not bound to the "
-                "current reviewed evidence."
+                "Frozen-evidence refinement is not bound to the current snapshot."
             )
 
         payload = {
             "refinement": refinement.model_dump(mode="json"),
+            "needs": [need.model_dump(mode="json") for need in needs],
+            "successor_context": successor_context.model_dump(mode="json"),
             "freshness": freshness.model_dump(mode="json"),
         }
         self._persist_transition(
-            artifact_name="artifacts/workflow/exhausted_context_refinement.json",
-            event_type="workflow_frozen_evidence_exhausted",
+            artifact_name=(
+                "artifacts/workflow/evidence_refinements/"
+                f"{refinement.round_number}.json"
+            ),
+            event_type=f"workflow_frozen_evidence_refinement_{refinement.round_number}",
             payload=payload,
             input_hashes={
                 "snapshot": prepared.snapshot.snapshot_key,
-                "context": prepared.context.context_sha256,
-                "reviewed_risk": human_review.reviewed_content_sha256,
-                "testability": assessment.assessment_sha256,
+                "parent_context": prepared.context.context_sha256,
+                "successor_context": successor_context.context_sha256,
+                "requested_need": requested_need_sha256,
+                "refinement": refinement.refinement_sha256,
             },
-            reason_code="frozen_evidence_exhausted",
+            reason_code=refinement.reason_code,
         )
 
     def _persist_gherkin_generation(
@@ -1757,6 +1838,11 @@ class MilestoneTwoWorkflow:
         reason_code: str,
     ) -> None:
         """Write one hash-bound artifact, then append its exact transformation."""
+        artifact_name = self._round_scoped_artifact_name(artifact_name)
+        if self._analysis_round and not artifact_name.startswith(
+            "artifacts/workflow/evidence_refinements/"
+        ):
+            event_type = f"{event_type}_round_{self._analysis_round}"
         content = (canonical_json(dict(payload)) + "\n").encode("utf-8")
         digest = hashlib.sha256(content).hexdigest()
         started_at = datetime.now(UTC)
@@ -1787,6 +1873,7 @@ class MilestoneTwoWorkflow:
         artifact_name: str,
     ) -> tuple[dict[str, object], TransformationEvent] | None:
         """Read an artifact only when its journal and hash agree exactly."""
+        artifact_name = self._round_scoped_artifact_name(artifact_name)
         try:
             content = self._recorder.read_artifact(self._run_handle, artifact_name)
         except FileNotFoundError:
@@ -1868,6 +1955,139 @@ class MilestoneTwoWorkflow:
             )
         return payload, transformation
 
+    def _round_scoped_artifact_name(self, artifact_name: str) -> str:
+        """Keep each post-refinement analysis round in immutable distinct paths."""
+        if (
+            self._analysis_round == 0
+            or artifact_name == "artifacts/workflow/prepared.json"
+            or artifact_name.startswith("artifacts/workflow/evidence_refinements/")
+        ):
+            return artifact_name
+        if not artifact_name.startswith("artifacts/"):
+            raise ValueError("workflow artifact names must live under artifacts/")
+        suffix = artifact_name.removeprefix("artifacts/")
+        return f"artifacts/refinement_rounds/{self._analysis_round}/{suffix}"
+
+    def _hydrate_refinement_chain(
+        self,
+        prepared: PreparedPullRequest,
+    ) -> PreparedPullRequest:
+        """Replay every contiguous hash-bound refinement before model artifacts."""
+        current = prepared
+        prefix = "artifacts/workflow/evidence_refinements/"
+        durable_rounds: set[int] = set()
+        for event in self._recorder.read_events(self._run_handle):
+            if event.event_type != "artifact_write_completed":
+                continue
+            artifact_name = event.payload.get("artifact_name")
+            if not isinstance(artifact_name, str) or not artifact_name.startswith(
+                prefix
+            ):
+                continue
+            suffix = artifact_name.removeprefix(prefix)
+            if not suffix.endswith(".json") or not suffix[:-5].isdigit():
+                raise MilestoneTwoTransitionError(
+                    "The saved refinement chain contains an invalid round path."
+                )
+            parsed_round = int(suffix[:-5])
+            if parsed_round <= 0:
+                raise MilestoneTwoTransitionError(
+                    "The saved refinement chain contains an invalid round path."
+                )
+            durable_rounds.add(parsed_round)
+        if durable_rounds and max(durable_rounds) > (
+            self._settings.max_model_evidence_rounds + 1
+        ):
+            raise MilestoneTwoTransitionError(
+                "The saved refinement chain exceeds the configured round limit."
+            )
+        saw_gap = False
+        saw_exhaustion = False
+        for round_number in range(1, self._settings.max_model_evidence_rounds + 2):
+            item = self._load_durable_artifact(
+                f"artifacts/workflow/evidence_refinements/{round_number}.json"
+            )
+            if item is None:
+                saw_gap = True
+                continue
+            if saw_gap:
+                raise MilestoneTwoTransitionError(
+                    "The saved refinement chain has a missing parent round."
+                )
+            if saw_exhaustion:
+                raise MilestoneTwoTransitionError(
+                    "The saved refinement chain continues after exhaustion."
+                )
+
+            payload, _event = item
+            try:
+                raw_refinement = payload["refinement"]
+                raw_needs = payload["needs"]
+                raw_context = payload["successor_context"]
+                raw_freshness = payload["freshness"]
+                if (
+                    not isinstance(raw_refinement, dict)
+                    or not isinstance(raw_needs, list)
+                    or not isinstance(raw_context, dict)
+                    or not isinstance(raw_freshness, dict)
+                ):
+                    raise TypeError("refinement payload structure is invalid")
+                refinement = EvidenceRefinementResult.model_validate(raw_refinement)
+                needs = tuple(
+                    FrozenEvidenceNeed.model_validate(need) for need in raw_needs
+                )
+                successor = ContextBundle.model_validate(raw_context)
+                freshness = SnapshotFreshness.model_validate(raw_freshness)
+            except (KeyError, TypeError, ValueError) as error:
+                raise MilestoneTwoTransitionError(
+                    "The saved frozen-evidence refinement is invalid."
+                ) from error
+
+            current_anchor_ids = {
+                anchor.anchor_id for anchor in current.context.anchors
+            }
+            successor_anchor_ids = {anchor.anchor_id for anchor in successor.anchors}
+            requested_need_sha256 = canonical_sha256(
+                [need.model_dump(mode="json") for need in needs]
+            )
+            if (
+                refinement.round_number != round_number
+                or refinement.parent_context_sha256 != current.context.context_sha256
+                or refinement.successor_context_sha256 != successor.context_sha256
+                or refinement.requested_need_sha256 != requested_need_sha256
+                or successor.snapshot_key != current.snapshot.snapshot_key
+                or not current_anchor_ids.issubset(successor_anchor_ids)
+                or set(refinement.added_anchor_ids)
+                != successor_anchor_ids - current_anchor_ids
+                or any(
+                    anchor_id not in current_anchor_ids
+                    for anchor_id in refinement.priority_anchor_ids
+                )
+                or freshness.snapshot_key != current.snapshot.snapshot_key
+                or freshness.status != "current"
+            ):
+                raise MilestoneTwoTransitionError(
+                    "The saved refinement chain is not bound to its parent context."
+                )
+
+            self._context_refinements.append(refinement)
+            self._freshness = freshness
+            if refinement.exhausted:
+                saw_exhaustion = True
+                continue
+            current = PreparedPullRequest(
+                snapshot=current.snapshot,
+                diffs=current.diffs,
+                context=successor,
+            )
+            self._refinement_priority_anchor_ids = tuple(
+                dict.fromkeys(
+                    (*refinement.priority_anchor_ids, *refinement.added_anchor_ids)
+                )
+            )
+            self._analysis_round += 1
+        return current
+
     def _load_terminal_record(self) -> MilestoneTwoRunRecord | None:
         """Reload only a sealed terminal record with a matching finalization journal."""
         try:
@@ -1924,6 +2144,23 @@ class MilestoneTwoWorkflow:
         """Rebuild only verified completed or recoverable durable workflow stages."""
         terminal_record = self._load_terminal_record()
         if terminal_record is not None:
+            self._context_refinements = list(terminal_record.context_refinements)
+            successful_refinements = tuple(
+                refinement
+                for refinement in terminal_record.context_refinements
+                if not refinement.exhausted
+            )
+            self._analysis_round = len(successful_refinements)
+            if successful_refinements:
+                last_refinement = successful_refinements[-1]
+                self._refinement_priority_anchor_ids = tuple(
+                    dict.fromkeys(
+                        (
+                            *last_refinement.priority_anchor_ids,
+                            *last_refinement.added_anchor_ids,
+                        )
+                    )
+                )
             terminal_assessment = terminal_record.risk_assessment
             if terminal_assessment is not None:
                 envelope_item = self._load_durable_artifact(
@@ -1951,6 +2188,12 @@ class MilestoneTwoWorkflow:
                         evidence_envelope.selection_policy_version != "risk-evidence-v1"
                         or evidence_envelope.envelope_sha256
                         != terminal_assessment.evidence_envelope_sha256
+                        or not set(self._refinement_priority_anchor_ids).issubset(
+                            {
+                                anchor.anchor_id
+                                for anchor in evidence_envelope.visible_anchors
+                            }
+                        )
                     ):
                         raise ValueError(
                             "terminal assessment does not bind the risk envelope"
@@ -2060,7 +2303,6 @@ class MilestoneTwoWorkflow:
             self._risk_assessment = terminal_record.risk_assessment
             self._human_reviewed_risk = terminal_record.human_reviewed_risk
             self._testability_assessment = terminal_record.testability_assessment
-            self._context_refinements = list(terminal_record.context_refinements)
             self._gherkin_candidate = terminal_record.gherkin_candidate
             self._gherkin_approval = terminal_record.gherkin_approval
             self._state = _State.FINALIZED
@@ -2106,6 +2348,7 @@ class MilestoneTwoWorkflow:
             raise MilestoneTwoTransitionError(
                 "The saved prepared evidence has invalid runtime types."
             )
+        prepared = self._hydrate_refinement_chain(prepared)
         self._started_at = started_at
         self._prepared = prepared
         self._state = _State.PREPARED
@@ -2138,6 +2381,9 @@ class MilestoneTwoWorkflow:
             if (
                 evidence_envelope.max_request_body_bytes
                 != self._settings.max_model_request_bytes
+                or not set(self._refinement_priority_anchor_ids).issubset(
+                    {anchor.anchor_id for anchor in evidence_envelope.visible_anchors}
+                )
             ):
                 raise ValueError("saved envelope uses a different request budget")
         except (TypeError, ValueError) as error:
@@ -2379,46 +2625,6 @@ class MilestoneTwoWorkflow:
             self._state = _State.TESTABILITY_READY
         else:
             self._state = _State.EVIDENCE_REFINEMENT_REQUIRED
-            exhausted_refinement_item = self._load_durable_artifact(
-                "artifacts/workflow/exhausted_context_refinement.json"
-            )
-            if exhausted_refinement_item is None:
-                return
-
-            exhausted_payload, _exhausted_event = exhausted_refinement_item
-            try:
-                saved_refinement = exhausted_payload["refinement"]
-                saved_freshness = exhausted_payload["freshness"]
-                if not isinstance(saved_refinement, dict) or not isinstance(
-                    saved_freshness,
-                    dict,
-                ):
-                    raise TypeError("exhausted-refinement payload structure is invalid")
-                refinement = ContextRefinement.model_validate(saved_refinement)
-                refinement_freshness = SnapshotFreshness.model_validate(saved_freshness)
-            except (KeyError, TypeError, ValueError) as error:
-                raise MilestoneTwoTransitionError(
-                    "The saved exhausted frozen-evidence refinement is invalid."
-                ) from error
-
-            if (
-                testability_assessment.decision != "needs_more_frozen_evidence"
-                or not refinement.exhausted
-                or refinement.snapshot_key != prepared.snapshot.snapshot_key
-                or refinement.parent_context_sha256 != prepared.context.context_sha256
-                or refinement.refined_context_sha256 != prepared.context.context_sha256
-                or refinement.evidence_need_ids
-                != tuple(need.need_id for need in testability_assessment.evidence_needs)
-                or refinement_freshness.snapshot_key != prepared.snapshot.snapshot_key
-                or refinement_freshness.status != "current"
-            ):
-                raise MilestoneTwoTransitionError(
-                    "The saved exhausted frozen-evidence refinement is not bound "
-                    "to current reviewed evidence."
-                )
-
-            self._context_refinements = [refinement]
-            self._freshness = refinement_freshness
             return
 
         gherkin_envelope_item = self._load_durable_artifact(

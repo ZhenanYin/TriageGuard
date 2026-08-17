@@ -61,6 +61,7 @@ class EvidenceEnvelopeBuilder:
         priority_terms: tuple[str, ...],
         budget: ProviderRequestBudget,
         request_factory: Callable[[ModelEvidenceEnvelope], ModelRequest],
+        priority_anchor_ids: tuple[str, ...] = (),
     ) -> EnvelopeBuildResult:
         """Build one exact request without slicing or mutating frozen context."""
         catalog = {anchor.anchor_id: anchor for anchor in context.anchors}
@@ -70,12 +71,18 @@ class EvidenceEnvelopeBuilder:
         if unknown_required:
             unknown = ", ".join(sorted(unknown_required))
             raise ValueError(f"required anchor IDs are absent from context: {unknown}")
+        if len(priority_anchor_ids) != len(set(priority_anchor_ids)):
+            raise ValueError("priority anchor IDs must be unique")
+        unknown_priority = set(priority_anchor_ids) - set(catalog)
+        if unknown_priority:
+            unknown = ", ".join(sorted(unknown_priority))
+            raise ValueError(f"priority anchor IDs are absent from context: {unknown}")
         if any(not isinstance(term, str) or not term for term in priority_terms):
             raise ValueError("priority terms must be non-empty strings")
         if len(priority_terms) != len(set(priority_terms)):
             raise ValueError("priority terms must be unique")
 
-        required = set(required_anchor_ids)
+        required = {*required_anchor_ids, *priority_anchor_ids}
         if stage == "risk_hypothesis":
             # ContextBuilder can create base_drift_change anchors only from changed
             # diff hunks; an unchanged canonical drift comparison has no such anchor.

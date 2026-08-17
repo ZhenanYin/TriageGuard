@@ -9,6 +9,7 @@ from triageguard.domain.pr_analysis import (
     ClaimEvidenceBinding,
     ContextAnchor,
     ContextBundle,
+    FrozenEvidenceNeed,
     PullRequestSnapshot,
     RiskAssessmentDraft,
     RiskHypothesisDraft,
@@ -613,9 +614,7 @@ def test_invalid_model_contract_drafts_are_never_approved(
                 "hypotheses": (),
                 "reason_code": "invented_reason_code",
                 "missing_evidence": ("The relevant authorization implementation.",),
-                "needed_evidence": (
-                    "The relevant authorization implementation and tests.",
-                ),
+                "evidence_needs": (),
             }
         )
     else:
@@ -678,8 +677,14 @@ def test_valid_insufficient_context_outcome_is_retained() -> None:
         missing_evidence=(
             "The relevant authorization implementation exceeds the approved context limit.",
         ),
-        needed_evidence=(
-            "A bounded excerpt containing the authorization implementation.",
+        evidence_needs=(
+            FrozenEvidenceNeed(
+                need_id="need-has-privilege",
+                category="authorization",
+                search_terms=("hasPrivilege",),
+                explanation=("Find the exact frozen authorization implementation."),
+                supporting_anchor_ids=("anchor-integration",),
+            ),
         ),
         generated_at=datetime(2026, 8, 12, tzinfo=UTC),
     )
@@ -694,3 +699,73 @@ def test_valid_insufficient_context_outcome_is_retained() -> None:
     assert assessment.outcome == "insufficient_context_to_assess"
     assert report.approved is True
     assert report.validated_hypothesis_ids == ()
+
+
+def test_insufficient_context_need_cannot_cite_a_hidden_catalog_anchor() -> None:
+    """Resolving needs against the full catalog would bypass model visibility."""
+    snapshot = _snapshot()
+    initial = _context(snapshot)
+    hidden_text = "boolean hasPrivilege(String privilege) { return true; }\n"
+    hidden = ContextAnchor(
+        anchor_id="anchor-hidden",
+        revision_role="candidate",
+        commit_sha=snapshot.candidate_sha,
+        blob_sha="5" * 40,
+        path="api/AuthorizationContext.java",
+        java_symbol="hasPrivilege",
+        start_line=1,
+        end_line=1,
+        text=hidden_text,
+        text_sha256=hashlib.sha256(hidden_text.encode()).hexdigest(),
+        selection_reason="repository context",
+        score_components=(),
+        change_relation="repository_context",
+        truncated=False,
+    )
+    context = ContextBundle.from_content(
+        **{
+            **initial.model_dump(
+                mode="python",
+                exclude={
+                    "anchors",
+                    "selected_file_count",
+                    "selected_anchor_count",
+                    "selected_bytes",
+                    "context_sha256",
+                },
+            ),
+            "anchors": (*initial.anchors, hidden),
+            "selected_file_count": 2,
+            "selected_anchor_count": 2,
+            "selected_bytes": initial.selected_bytes + len(hidden_text.encode()),
+        }
+    )
+    envelope = _envelope(context, visible_anchor_ids=("anchor-integration",))
+    draft = RiskAssessmentDraft(
+        snapshot_key=snapshot.snapshot_key,
+        context_sha256=context.context_sha256,
+        evidence_envelope_sha256=envelope.envelope_sha256,
+        outcome="insufficient_context_to_assess",
+        reason_code="analysis_limit_exceeded",
+        missing_evidence=("The authorization decision was omitted.",),
+        evidence_needs=(
+            FrozenEvidenceNeed(
+                need_id="need-hidden",
+                category="authorization",
+                search_terms=("hasPrivilege",),
+                explanation="Find the exact frozen authorization decision.",
+                supporting_anchor_ids=("anchor-hidden",),
+            ),
+        ),
+        generated_at=datetime(2026, 8, 12, tzinfo=UTC),
+    )
+
+    assessment, report = validate_risk_assessment(
+        draft=draft,
+        snapshot=snapshot,
+        context=context,
+        evidence_envelope=envelope,
+    )
+
+    assert assessment is None
+    assert report.reason_codes == ("unknown_evidence_anchor",)

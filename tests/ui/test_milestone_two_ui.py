@@ -292,6 +292,12 @@ def test_nonrisk_outcomes_finish_without_review_or_gherkin(
 
     state.analyze_pr(SUPPORTED_PR_URL)
     state.propose_risks()
+    if outcome == "insufficient_context_to_assess":
+        while True:
+            refinement = state.refine_frozen_evidence()
+            if refinement.exhausted:
+                break
+            state.propose_risks()
     record = state.finish_without_risk()
 
     assert record.status.value == terminal_status

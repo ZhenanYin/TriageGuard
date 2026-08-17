@@ -115,33 +115,15 @@ def _risks_ready_workflow(
     return workflow, assessment, acquirer
 
 
-@pytest.mark.parametrize(
-    ("outcome", "reason_code", "expected_status"),
-    [
-        (
-            "no_meaningful_security_risk_found",
-            "no_meaningful_security_risk_found",
-            "no_meaningful_security_risk_found",
-        ),
-        (
-            "insufficient_context_to_assess",
-            "analysis_limit_exceeded",
-            "insufficient_context_to_assess",
-        ),
-    ],
-)
 def test_finish_without_risk_seals_only_supported_nonrisk_outcomes(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
-    outcome: str,
-    reason_code: str,
-    expected_status: str,
 ) -> None:
-    """A human may explicitly finish only a valid no-risk or abstention result."""
+    """A human may explicitly finish only a valid bounded no-risk result."""
     workflow, assessment, acquirer = _risks_ready_workflow(
         tmp_path,
         monkeypatch,
-        outcome=outcome,
+        outcome="no_meaningful_security_risk_found",
         statuses=("current",),
     )
     terminal_record = object()
@@ -150,8 +132,8 @@ def test_finish_without_risk_seals_only_supported_nonrisk_outcomes(
     def fake_terminal_record(**kwargs: object) -> object:
         assert kwargs["run_id"] == "m2-terminal-run"
         assert kwargs["snapshot"] is acquirer.snapshot
-        assert kwargs["status"].value == expected_status
-        assert kwargs["reason_code"] == reason_code
+        assert kwargs["status"].value == "no_meaningful_security_risk_found"
+        assert kwargs["reason_code"] == "no_meaningful_security_risk_found"
         assert kwargs["risk_assessment"] is assessment
         assert kwargs["human_reviewed_risk"] is None
         assert kwargs["gherkin_candidate"] is None

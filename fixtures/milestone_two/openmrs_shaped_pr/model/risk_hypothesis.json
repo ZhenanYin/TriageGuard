@@ -8,8 +8,18 @@
     "missing_evidence": [
       "The complete authorization configuration is not in the bounded evidence."
     ],
-    "needed_evidence": [
-      "The complete authorization configuration and its tests."
+    "evidence_needs": [
+      {
+        "category": "authorization",
+        "explanation": "Find the exact frozen authorization decision for patient deletion.",
+        "need_id": "need-delete-authorization",
+        "search_terms": [
+          "deletePatient"
+        ],
+        "supporting_anchor_ids": [
+          "__INTEGRATION_ANCHOR_ID__"
+        ]
+      }
     ],
     "outcome": "insufficient_context_to_assess",
     "rationale": null,
@@ -27,7 +37,7 @@
     "generated_at": "2026-08-15T00:00:00Z",
     "hypotheses": [],
     "missing_evidence": [],
-    "needed_evidence": [],
+    "evidence_needs": [],
     "outcome": "no_meaningful_security_risk_found",
     "rationale": "The bounded evidence does not show a specific testable security-risk hypothesis.",
     "reason_code": null,
@@ -119,7 +129,7 @@
       }
     ],
     "missing_evidence": [],
-    "needed_evidence": [],
+    "evidence_needs": [],
     "outcome": "risks_proposed",
     "rationale": null,
     "reason_code": null,

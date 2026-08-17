@@ -18,8 +18,8 @@ from triageguard.domain import (
     ContextBundle,
     ContextRefinement,
     ContextScoreComponent,
+    FrozenEvidenceNeed,
     PullRequestSnapshot,
-    TestabilityAssessment,
 )
 from triageguard.provenance import canonical_sha256
 from triageguard.sources.git import GitTreeEntry
@@ -50,7 +50,7 @@ class FrozenContextRefiner:
         *,
         snapshot: PullRequestSnapshot,
         context: ContextBundle,
-        assessment: TestabilityAssessment,
+        needs: Sequence[FrozenEvidenceNeed],
         store: _FrozenStore,
         limits: ContextLimits,
         created_at: datetime,
@@ -59,14 +59,14 @@ class FrozenContextRefiner:
         _validate_inputs(
             snapshot=snapshot,
             context=context,
-            assessment=assessment,
+            needs=needs,
             limits=limits,
             created_at=created_at,
         )
 
         anchors = list(context.anchors)
         added: list[ContextAnchor] = []
-        unresolved_needs = list(assessment.evidence_needs)
+        unresolved_needs = list(needs)
 
         for revision_role, commit_sha in _frozen_revisions(snapshot):
             if not unresolved_needs:
@@ -108,9 +108,7 @@ class FrozenContextRefiner:
                 snapshot_key=snapshot.snapshot_key,
                 parent_context_sha256=context.context_sha256,
                 refined_context_sha256=context.context_sha256,
-                evidence_need_ids=tuple(
-                    need.need_id for need in assessment.evidence_needs
-                ),
+                evidence_need_ids=tuple(need.need_id for need in needs),
                 added_anchor_ids=(),
                 exhausted=True,
                 created_at=created_at,
@@ -141,7 +139,7 @@ class FrozenContextRefiner:
             snapshot_key=snapshot.snapshot_key,
             parent_context_sha256=context.context_sha256,
             refined_context_sha256=refined_context.context_sha256,
-            evidence_need_ids=tuple(need.need_id for need in assessment.evidence_needs),
+            evidence_need_ids=tuple(need.need_id for need in needs),
             added_anchor_ids=tuple(anchor.anchor_id for anchor in added),
             exhausted=False,
             created_at=created_at,
@@ -153,7 +151,7 @@ def _validate_inputs(
     *,
     snapshot: PullRequestSnapshot,
     context: ContextBundle,
-    assessment: TestabilityAssessment,
+    needs: Sequence[FrozenEvidenceNeed],
     limits: ContextLimits,
     created_at: datetime,
 ) -> None:
@@ -162,17 +160,28 @@ def _validate_inputs(
         raise FrozenEvidenceRefinementError(
             "context snapshot key must match the frozen snapshot"
         )
-    if assessment.snapshot_key != snapshot.snapshot_key:
+    if not needs:
         raise FrozenEvidenceRefinementError(
-            "testability snapshot key must match the frozen snapshot"
+            "frozen evidence refinement requires at least one structured need"
         )
-    if assessment.context_sha256 != context.context_sha256:
+    normalized_needs = tuple(FrozenEvidenceNeed.model_validate(need) for need in needs)
+    if len({need.need_id for need in normalized_needs}) != len(normalized_needs):
+        raise FrozenEvidenceRefinementError("frozen evidence need IDs must be unique")
+    if (
+        sum(len(need.search_terms) for need in normalized_needs)
+        > limits.max_search_identifiers
+    ):
         raise FrozenEvidenceRefinementError(
-            "testability context hash must match the current frozen context"
+            "frozen evidence needs exceed the search identifier limit"
         )
-    if assessment.decision != "needs_more_frozen_evidence":
+    context_anchor_ids = {anchor.anchor_id for anchor in context.anchors}
+    if any(
+        anchor_id not in context_anchor_ids
+        for need in normalized_needs
+        for anchor_id in need.supporting_anchor_ids
+    ):
         raise FrozenEvidenceRefinementError(
-            "only a needs-more-frozen-evidence assessment may request refinement"
+            "frozen evidence needs must cite the current context"
         )
     if not _is_utc(created_at):
         raise FrozenEvidenceRefinementError(

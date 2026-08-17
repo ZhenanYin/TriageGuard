@@ -90,7 +90,7 @@ def test_propose_risks_runs_generation_then_local_grounding(
     workflow, snapshot, diffs, context = _prepared_workflow(tmp_path)
     draft = object()
     response = object()
-    assessment = object()
+    assessment = SimpleNamespace(outcome="risks_proposed")
     evidence_envelope = object()
     calls: list[str] = []
 
@@ -201,3 +201,42 @@ def test_propose_risks_rejects_an_ungrounded_model_draft(
 
     with pytest.raises(MilestoneTwoTransitionError, match="risk grounding"):
         workflow.propose_risks()
+
+
+def test_insufficient_risk_enters_refinement_with_prioritized_catalog_evidence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping refinement priority or the risk-level gate must fail this transition."""
+    workflow, _snapshot, _diffs, _context = _prepared_workflow(tmp_path)
+    envelope = object()
+    assessment = SimpleNamespace(
+        outcome="insufficient_context_to_assess",
+        evidence_needs=(object(),),
+    )
+    captured: list[tuple[str, ...]] = []
+    workflow._refinement_priority_anchor_ids = ("anchor-hidden",)
+
+    def fake_build_risk_evidence(**values: object) -> object:
+        captured.append(values["priority_anchor_ids"])
+        return SimpleNamespace(envelope=envelope)
+
+    monkeypatch.setattr(
+        milestone_two,
+        "build_risk_evidence",
+        fake_build_risk_evidence,
+    )
+    monkeypatch.setattr(
+        milestone_two,
+        "generate_risk_assessment",
+        lambda **_kwargs: (object(), object()),
+    )
+    monkeypatch.setattr(
+        milestone_two,
+        "validate_risk_assessment",
+        lambda **_kwargs: (assessment, object()),
+    )
+
+    assert workflow.propose_risks() is assessment
+    assert captured == [("anchor-hidden",)]
+    assert workflow._state is milestone_two._State.EVIDENCE_REFINEMENT_REQUIRED

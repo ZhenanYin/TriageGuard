@@ -11,7 +11,7 @@ from triageguard.domain.pr_analysis import (
     ClaimEvidenceBinding,
     ContextAnchor,
     ContextBundle,
-    ContextRefinement,
+    EvidenceRefinementResult,
     FrozenEvidenceNeed,
     GherkinApproval,
     GherkinCandidate,
@@ -655,12 +655,46 @@ def test_insufficient_context_requires_an_allowlisted_reason_code() -> None:
         RiskAssessmentDraft(
             snapshot_key="0" * 64,
             context_sha256="a" * 64,
+            evidence_envelope_sha256="b" * 64,
             outcome="insufficient_context_to_assess",
             reason_code="made_up_reason",
             missing_evidence=["integration diff"],
-            needed_evidence=["current merge commit"],
+            evidence_needs=[
+                FrozenEvidenceNeed(
+                    need_id="need-merge-handler",
+                    category="entry_point",
+                    search_terms=("mergePatient",),
+                    explanation="Find the frozen merge entry point.",
+                    supporting_anchor_ids=("anchor-integration",),
+                )
+            ],
             generated_at=datetime(2026, 8, 11, tzinfo=UTC),
         )
+
+
+def test_risk_insufficient_context_uses_structured_frozen_evidence_needs() -> None:
+    """Restoring free-form needed evidence must violate the risk output contract."""
+    draft = RiskAssessmentDraft(
+        snapshot_key="0" * 64,
+        context_sha256="a" * 64,
+        evidence_envelope_sha256="b" * 64,
+        outcome="insufficient_context_to_assess",
+        reason_code="analysis_limit_exceeded",
+        missing_evidence=("The authorization entry point is not visible.",),
+        evidence_needs=(
+            FrozenEvidenceNeed(
+                need_id="need-authorization-entry",
+                category="authorization",
+                search_terms=("hasPrivilege",),
+                explanation="Find the exact frozen authorization decision.",
+                supporting_anchor_ids=("anchor-integration",),
+            ),
+        ),
+        generated_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+    assert draft.evidence_needs[0].search_terms == ("hasPrivilege",)
+    assert "needed_evidence" not in draft.model_dump(mode="json")
 
 
 def test_failed_terminal_record_requires_an_allowlisted_reason_code() -> None:
@@ -674,6 +708,42 @@ def test_failed_terminal_record_requires_an_allowlisted_reason_code() -> None:
             explanation="An unsupported failure occurred.",
             started_at=datetime(2026, 8, 11, tzinfo=UTC),
             finished_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
+        )
+
+
+def test_terminal_refinement_chain_requires_monotonic_parent_bound_rounds() -> None:
+    """Reordering refinement links must invalidate the terminal assurance chain."""
+    first = EvidenceRefinementResult.from_content(
+        parent_context_sha256="a" * 64,
+        successor_context_sha256="b" * 64,
+        requested_need_sha256="c" * 64,
+        priority_anchor_ids=(),
+        added_anchor_ids=("anchor-added",),
+        round_number=1,
+        exhausted=False,
+        reason_code="frozen_context_extended",
+    )
+    skipped = EvidenceRefinementResult.from_content(
+        parent_context_sha256="b" * 64,
+        successor_context_sha256="b" * 64,
+        requested_need_sha256="d" * 64,
+        priority_anchor_ids=(),
+        added_anchor_ids=(),
+        round_number=3,
+        exhausted=True,
+        reason_code="refinement_round_limit_reached",
+    )
+
+    with pytest.raises(ValidationError, match="monotonic refinement rounds"):
+        MilestoneTwoRunRecord(
+            run_id="run-invalid-refinement-chain",
+            snapshot=PullRequestSnapshot.model_validate(snapshot_payload()),
+            status="failed",
+            reason_code="model_generation_failed",
+            explanation="The analysis stopped before reaching a terminal review.",
+            started_at=datetime(2026, 8, 11, tzinfo=UTC),
+            finished_at=datetime(2026, 8, 11, 0, 1, tzinfo=UTC),
+            context_refinements=(first, skipped),
         )
 
 
@@ -704,14 +774,15 @@ def test_exhausted_frozen_evidence_terminal_preserves_its_testability_history() 
         generated_at=datetime(2026, 8, 12, tzinfo=UTC),
         validated_at=datetime(2026, 8, 12, tzinfo=UTC),
     )
-    refinement = ContextRefinement.from_content(
-        snapshot_key=snapshot.snapshot_key,
+    refinement = EvidenceRefinementResult.from_content(
         parent_context_sha256=assessment.context_sha256,
-        refined_context_sha256=assessment.context_sha256,
-        evidence_need_ids=(need.need_id,),
+        successor_context_sha256=assessment.context_sha256,
+        requested_need_sha256=canonical_sha256([need.model_dump(mode="json")]),
+        priority_anchor_ids=(),
         added_anchor_ids=(),
+        round_number=1,
         exhausted=True,
-        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+        reason_code="frozen_evidence_exhausted",
     )
 
     record = MilestoneTwoRunRecord(

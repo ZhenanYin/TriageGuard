@@ -12,6 +12,10 @@ from triageguard.evidence.model_envelope import (
     VisibleEvidenceAnchor,
     validate_envelope_binding,
 )
+from triageguard.evidence.refinement import (
+    FrozenEvidenceResolution,
+    FrozenEvidenceResolver,
+)
 from triageguard.evidence.selection import (
     EnvelopeBuildResult,
     EvidenceEnvelopeBuilder,
@@ -22,6 +26,8 @@ __all__ = [
     "EnvelopeBuildResult",
     "EvidenceArtifactBinding",
     "EvidenceEnvelopeBuilder",
+    "FrozenEvidenceResolution",
+    "FrozenEvidenceResolver",
     "ModelEvidenceBudgetError",
     "ModelEvidenceEnvelope",
     "ModelEvidenceStage",

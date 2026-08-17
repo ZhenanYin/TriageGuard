@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime
+from itertools import pairwise
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -431,7 +432,7 @@ class TestabilityBinding(ResearchArtifact):
 class FrozenEvidenceNeed(ResearchArtifact):
     """One precise frozen-code gap that blocks an executable scenario."""
 
-    need_id: StrictStr = Field(min_length=1)
+    need_id: StrictStr = Field(min_length=1, max_length=128)
     category: Literal[
         "setup",
         "entry_point",
@@ -440,17 +441,124 @@ class FrozenEvidenceNeed(ResearchArtifact):
         "caller",
         "existing_test",
     ]
-    search_terms: tuple[StrictStr, ...] = Field(min_length=1)
-    explanation: StrictStr = Field(min_length=1)
-    supporting_anchor_ids: tuple[StrictStr, ...] = Field(min_length=1)
+    search_terms: tuple[StrictStr, ...] = Field(min_length=1, max_length=8)
+    explanation: StrictStr = Field(min_length=1, max_length=1_000)
+    supporting_anchor_ids: tuple[StrictStr, ...] = Field(
+        min_length=1,
+        max_length=20,
+    )
 
     @model_validator(mode="after")
     def validate_need_coherence(self) -> FrozenEvidenceNeed:
         if len(self.search_terms) != len(set(self.search_terms)):
             raise ValueError("frozen evidence search terms must be unique")
+        vague_terms = {
+            "action",
+            "authorization",
+            "caller",
+            "code",
+            "entrypoint",
+            "observable",
+            "setup",
+            "test",
+        }
+        identifier_pattern = re.compile(
+            r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*"
+        )
+        if any(
+            term != term.strip()
+            or identifier_pattern.fullmatch(term) is None
+            or term.casefold() in vague_terms
+            for term in self.search_terms
+        ):
+            raise ValueError(
+                "frozen evidence search terms must be an exact code identifier"
+            )
         if len(self.supporting_anchor_ids) != len(set(self.supporting_anchor_ids)):
             raise ValueError("frozen evidence supporting anchor IDs must be unique")
         return self
+
+
+EvidenceRefinementReason = Literal[
+    "catalog_evidence_prioritized",
+    "frozen_context_extended",
+    "frozen_evidence_exhausted",
+    "refinement_round_limit_reached",
+]
+
+
+class EvidenceRefinementResult(ResearchArtifact):
+    """One hash-bound step in the bounded frozen-evidence refinement chain."""
+
+    parent_context_sha256: Sha256
+    successor_context_sha256: Sha256
+    requested_need_sha256: Sha256
+    priority_anchor_ids: tuple[StrictStr, ...]
+    added_anchor_ids: tuple[StrictStr, ...]
+    round_number: StrictInt = Field(gt=0)
+    exhausted: StrictBool
+    reason_code: EvidenceRefinementReason
+    refinement_sha256: Sha256 = ""
+
+    @model_validator(mode="after")
+    def validate_result_coherence(self) -> EvidenceRefinementResult:
+        if len(self.priority_anchor_ids) != len(set(self.priority_anchor_ids)):
+            raise ValueError("refinement priority anchor IDs must be unique")
+        if len(self.added_anchor_ids) != len(set(self.added_anchor_ids)):
+            raise ValueError("refinement added anchor IDs must be unique")
+        if set(self.priority_anchor_ids) & set(self.added_anchor_ids):
+            raise ValueError("refinement priority and added anchors must be disjoint")
+
+        if self.exhausted:
+            if self.priority_anchor_ids or self.added_anchor_ids:
+                raise ValueError("an exhausted refinement cannot select new evidence")
+            if self.parent_context_sha256 != self.successor_context_sha256:
+                raise ValueError("an exhausted refinement must retain its context")
+            if self.reason_code not in {
+                "frozen_evidence_exhausted",
+                "refinement_round_limit_reached",
+            }:
+                raise ValueError("an exhausted refinement requires an exhausted reason")
+        else:
+            if not self.priority_anchor_ids and not self.added_anchor_ids:
+                raise ValueError("a successful refinement must select frozen evidence")
+            if self.added_anchor_ids:
+                if self.parent_context_sha256 == self.successor_context_sha256:
+                    raise ValueError("added evidence requires a successor context")
+                if self.reason_code != "frozen_context_extended":
+                    raise ValueError(
+                        "added evidence requires the context-extended reason"
+                    )
+            elif (
+                self.parent_context_sha256 != self.successor_context_sha256
+                or self.reason_code != "catalog_evidence_prioritized"
+            ):
+                raise ValueError(
+                    "catalog prioritization must retain the frozen context"
+                )
+
+        content = self.model_dump(mode="json", exclude={"refinement_sha256"})
+        if self.refinement_sha256 != _canonical_content_hash(content):
+            raise ValueError(
+                "refinement SHA-256 must match canonical refinement content"
+            )
+        return self
+
+    @classmethod
+    def from_content(cls, **values: object) -> EvidenceRefinementResult:
+        normalized = {
+            **values,
+            "priority_anchor_ids": tuple(values.get("priority_anchor_ids", ())),
+            "added_anchor_ids": tuple(values.get("added_anchor_ids", ())),
+        }
+        provisional = cls.model_construct(**normalized)
+        content = provisional.model_dump(
+            mode="json",
+            exclude={"refinement_sha256"},
+        )
+        return cls.model_validate(
+            {**normalized, "refinement_sha256": _canonical_content_hash(content)}
+        )
 
 
 class TestabilityAssessmentDraft(ResearchArtifact):
@@ -794,7 +902,7 @@ class RiskAssessmentDraft(ResearchArtifact):
     coverage_limitations: tuple[StrictStr, ...] = Field(default_factory=tuple)
     reason_code: InsufficientContextReason | None = None
     missing_evidence: tuple[StrictStr, ...] = Field(default_factory=tuple)
-    needed_evidence: tuple[StrictStr, ...] = Field(default_factory=tuple)
+    evidence_needs: tuple[FrozenEvidenceNeed, ...] = Field(default_factory=tuple)
     generated_at: datetime
 
     @field_validator(
@@ -802,7 +910,6 @@ class RiskAssessmentDraft(ResearchArtifact):
         "security_relevant_areas",
         "coverage_limitations",
         "missing_evidence",
-        "needed_evidence",
     )
     @classmethod
     def reject_prohibited_assessment_claims(cls, value: object) -> object:
@@ -845,14 +952,21 @@ class RiskAssessmentDraft(ResearchArtifact):
                 "a no-risk outcome must state that it is not proof of safety"
             )
         if self.outcome == "insufficient_context_to_assess" and (
-            not self.reason_code
-            or not self.missing_evidence
-            or not self.needed_evidence
+            not self.reason_code or not self.missing_evidence or not self.evidence_needs
         ):
             raise ValueError(
                 "an insufficient-context outcome requires a reason and evidence gap"
             )
+        if self.outcome != "insufficient_context_to_assess" and self.evidence_needs:
+            raise ValueError(
+                "only an insufficient-context outcome may request frozen evidence"
+            )
         return self
+
+    @property
+    def needed_evidence(self) -> tuple[str, ...]:
+        """Return plain explanations for the current presentation compatibility."""
+        return tuple(need.explanation for need in self.evidence_needs)
 
 
 class IdentifierEvidence(ResearchArtifact):
@@ -1026,7 +1140,12 @@ class RiskAssessment(RiskAssessmentDraft):
             "supporting_anchor_ids": as_tuple("supporting_anchor_ids"),
             "coverage_limitations": as_tuple("coverage_limitations"),
             "missing_evidence": as_tuple("missing_evidence"),
-            "needed_evidence": as_tuple("needed_evidence"),
+            "evidence_needs": tuple(
+                need
+                if isinstance(need, FrozenEvidenceNeed)
+                else FrozenEvidenceNeed.model_validate(need)
+                for need in as_tuple("evidence_needs")
+            ),
             "grounding_reports": normalized_reports,
         }
         provisional = cls.model_construct(**normalized_values)
@@ -1407,7 +1526,9 @@ class MilestoneTwoRunRecord(ResearchArtifact):
     risk_assessment: RiskAssessment | None = None
     human_reviewed_risk: HumanReviewedRisk | None = None
     testability_assessment: TestabilityAssessment | None = None
-    context_refinements: tuple[ContextRefinement, ...] = Field(default_factory=tuple)
+    context_refinements: tuple[EvidenceRefinementResult, ...] = Field(
+        default_factory=tuple
+    )
     gherkin_candidate: GherkinCandidate | None = None
     gherkin_approval: GherkinApproval | None = None
 
@@ -1579,12 +1700,26 @@ class MilestoneTwoRunRecord(ResearchArtifact):
             {refinement.refinement_sha256 for refinement in refinements}
         ):
             raise ValueError("terminal context refinements must be unique")
+        if tuple(refinement.round_number for refinement in refinements) != tuple(
+            range(1, len(refinements) + 1)
+        ):
+            raise ValueError("terminal refinements require monotonic refinement rounds")
         if any(
-            refinement.snapshot_key != self.snapshot.snapshot_key
-            for refinement in refinements
+            current.parent_context_sha256 != previous.successor_context_sha256
+            for previous, current in pairwise(refinements)
         ):
             raise ValueError(
-                "context refinement snapshot key must match the terminal snapshot"
+                "terminal refinement parents must match the previous successor"
+            )
+        if any(refinement.exhausted for refinement in refinements[:-1]):
+            raise ValueError("terminal refinement cannot continue after exhaustion")
+        if (
+            refinements
+            and assessment is not None
+            and refinements[-1].successor_context_sha256 != assessment.context_sha256
+        ):
+            raise ValueError(
+                "terminal refinement successor must match the assessment context"
             )
         if candidate is not None:
             if review is None:

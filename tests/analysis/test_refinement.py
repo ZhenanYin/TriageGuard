@@ -144,7 +144,7 @@ def test_refiner_adds_a_matching_anchor_from_frozen_candidate_code() -> None:
     refined_context, refinement = FrozenContextRefiner().refine(
         snapshot=snapshot,
         context=context,
-        assessment=assessment,
+        needs=assessment.evidence_needs,
         store=FrozenStore(),
         limits=limits,
         created_at=NOW,
@@ -218,7 +218,7 @@ def test_refiner_records_exhaustion_when_frozen_revisions_have_no_match() -> Non
     refined_context, refinement = FrozenContextRefiner().refine(
         snapshot=snapshot,
         context=context,
-        assessment=assessment,
+        needs=assessment.evidence_needs,
         store=store,
         limits=limits,
         created_at=NOW,
