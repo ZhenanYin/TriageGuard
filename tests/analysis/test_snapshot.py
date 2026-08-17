@@ -18,10 +18,18 @@ from triageguard.sources.github import (
 )
 
 
-def test_acquirer_freezes_one_exact_base_head_and_merge_candidate() -> None:
+@pytest.mark.parametrize(
+    ("merge_base_sha", "base_sha"),
+    [
+        pytest.param("a" * 40, "b" * 40, id="base-drifted"),
+        pytest.param("b" * 40, "b" * 40, id="base-unchanged"),
+    ],
+)
+def test_acquirer_freezes_one_exact_base_head_and_merge_candidate(
+    merge_base_sha: str,
+    base_sha: str,
+) -> None:
     """GitHub metadata and local Git objects become one reproducible PR snapshot."""
-    merge_base_sha = "a" * 40
-    base_sha = "b" * 40
     head_sha = "c" * 40
     candidate_sha = "d" * 40
     acquired_at = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -37,7 +45,7 @@ def test_acquirer_freezes_one_exact_base_head_and_merge_candidate() -> None:
         html_url="https://github.com/openmrs/openmrs-core/pull/7312",
         state="open",
         base_branch="main",
-        base_sha=merge_base_sha,
+        base_sha=base_sha,
         head_sha=head_sha,
         mergeable=True,
         merge_commit_sha=candidate_sha,
@@ -110,6 +118,8 @@ def test_acquirer_freezes_one_exact_base_head_and_merge_candidate() -> None:
     )
     assert snapshot.default_branch == "main"
     assert snapshot.base_branch == "main"
+    if merge_base_sha == base_sha:
+        assert snapshot.merge_base_tree_sha == snapshot.base_tree_sha
     assert snapshot.git_version == "2.47.1"
     assert snapshot.acquired_at == acquired_at
     assert snapshot.acquisition_tool_version == "triageguard/2.0.0"

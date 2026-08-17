@@ -99,13 +99,39 @@ def snapshot_payload(**changes: object) -> dict[str, object]:
     return payload
 
 
-def test_snapshot_requires_four_distinct_full_commit_shas() -> None:
-    """Short or reused frozen revisions would make a PR analysis non-reproducible."""
+def test_snapshot_requires_full_commit_shas() -> None:
+    """Short frozen revisions would make a PR analysis non-reproducible."""
     with pytest.raises(ValidationError, match="full 40-character"):
         PullRequestSnapshot.model_validate(snapshot_payload(base_sha="abc1234"))
 
-    with pytest.raises(ValidationError, match="distinct"):
-        PullRequestSnapshot.model_validate(snapshot_payload(candidate_sha="2" * 40))
+
+def test_snapshot_allows_merge_base_to_equal_current_base() -> None:
+    """Equal M and B roles mean that main has not drifted since divergence."""
+    snapshot = PullRequestSnapshot.model_validate(snapshot_payload(base_sha="1" * 40))
+
+    assert snapshot.merge_base_sha == snapshot.base_sha
+
+
+@pytest.mark.parametrize(
+    ("left_role", "right_role"),
+    [
+        ("merge_base_sha", "head_sha"),
+        ("merge_base_sha", "candidate_sha"),
+        ("base_sha", "head_sha"),
+        ("base_sha", "candidate_sha"),
+        ("head_sha", "candidate_sha"),
+    ],
+)
+def test_snapshot_rejects_unsupported_equal_revision_roles(
+    left_role: str,
+    right_role: str,
+) -> None:
+    """Only an explicitly supported logical-role equality may be frozen."""
+    values = snapshot_payload()
+    values[right_role] = values[left_role]
+
+    with pytest.raises(ValidationError, match="equal revision roles"):
+        PullRequestSnapshot.model_validate(snapshot_payload(**values))
 
 
 def test_snapshot_rejects_non_utc_acquisition_time() -> None:

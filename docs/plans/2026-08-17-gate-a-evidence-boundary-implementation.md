@@ -44,7 +44,7 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 
 ## Progress
 
-- [ ] Task 1 — Permit only coherent snapshot-role equality
+- [x] Task 1 — Permit only coherent snapshot-role equality
 - [ ] Task 2 — Represent unchanged comparisons as canonical artifacts
 - [ ] Task 3 — Centralize exact provider request sizing and policy
 - [ ] Task 4 — Add the immutable model-evidence envelope
@@ -54,6 +54,9 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 - [ ] Task 8 — Unify model-stage execution, failure provenance, and recovery
 - [ ] Task 9 — Update replay and UI behavior without weakening gates
 - [ ] Task 10 — Complete Gate A verification and record measurements
+
+Task 1 completed on 2026-08-17. Focused snapshot, domain, and Git regressions:
+50 passed. Full regression suite: 755 passed.
 
 ---
 

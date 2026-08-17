@@ -154,16 +154,18 @@ class PullRequestSnapshot(ResearchArtifact):
             raise ValueError("snapshot key must match canonical immutable identity")
         if not _is_utc(self.acquired_at):
             raise ValueError("acquired_at must be timezone-aware UTC")
-        revisions = (
-            self.merge_base_sha,
-            self.base_sha,
-            self.head_sha,
-            self.candidate_sha,
+        forbidden_equalities = (
+            ("merge-base", self.merge_base_sha, "head", self.head_sha),
+            ("merge-base", self.merge_base_sha, "candidate", self.candidate_sha),
+            ("base", self.base_sha, "head", self.head_sha),
+            ("base", self.base_sha, "candidate", self.candidate_sha),
+            ("head", self.head_sha, "candidate", self.candidate_sha),
         )
-        if len(set(revisions)) != len(revisions):
-            raise ValueError(
-                "merge-base, base, head, and candidate revisions must be distinct"
-            )
+        for left_role, left_sha, right_role, right_sha in forbidden_equalities:
+            if left_sha == right_sha:
+                raise ValueError(
+                    f"unsupported equal revision roles: {left_role} and {right_role}"
+                )
         return self
 
     @classmethod
