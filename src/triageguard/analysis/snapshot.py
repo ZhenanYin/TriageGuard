@@ -264,6 +264,8 @@ class SnapshotAcquirer:
                 "max_context_hits_per_identifier": (
                     self._settings.max_context_hits_per_identifier
                 ),
+                "max_model_request_bytes": self._settings.max_model_request_bytes,
+                "max_model_evidence_rounds": (self._settings.max_model_evidence_rounds),
             }
         )
 

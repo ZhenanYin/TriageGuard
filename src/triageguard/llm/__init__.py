@@ -11,6 +11,12 @@ from triageguard.llm.gateway import (
 )
 from triageguard.llm.groq_gateway import GroqStructuredGateway
 from triageguard.llm.replay_gateway import ReplayGateway, ReplayResponseMissing
+from triageguard.llm.request_budget import (
+    ModelRequestTooLarge,
+    ProviderRequestBudget,
+    groq_request_body,
+    groq_request_body_bytes,
+)
 
 __all__ = [
     "GroqStructuredGateway",
@@ -19,8 +25,12 @@ __all__ = [
     "ModelGatewayError",
     "ModelOutputInvalid",
     "ModelRequest",
+    "ModelRequestTooLarge",
     "ModelResponse",
+    "ProviderRequestBudget",
     "ReplayGateway",
     "ReplayResponseMissing",
     "StructuredModelGateway",
+    "groq_request_body",
+    "groq_request_body_bytes",
 ]

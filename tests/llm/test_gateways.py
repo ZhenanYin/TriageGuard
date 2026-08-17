@@ -4,9 +4,10 @@ from types import SimpleNamespace
 import pytest
 
 from triageguard.config import Settings
-from triageguard.llm.gateway import ModelOutputInvalid, ModelRequest
+from triageguard.llm.gateway import ModelOutputInvalid, ModelRequest, canonical_json
 from triageguard.llm.groq_gateway import GroqRequestFailed, GroqStructuredGateway
 from triageguard.llm.replay_gateway import ReplayGateway, ReplayResponseMissing
+from triageguard.llm.request_budget import ModelRequestTooLarge
 
 
 def _request() -> ModelRequest:
@@ -282,7 +283,54 @@ def test_live_gateway_exposes_provenance_for_a_non_retryable_error():
     assert [(attempt.number, attempt.outcome) for attempt in provenance.attempts] == [
         (1, "failed")
     ]
+    assert provenance.attempts[0].status_code == 400
+    assert provenance.attempts[0].request_body_bytes == len(
+        canonical_json(client.calls[0]).encode("utf-8")
+    )
     assert provenance.error_sha256 is not None
+
+
+def test_live_gateway_records_only_a_numeric_provider_body_limit() -> None:
+    """A request-size failure may retain its numeric cap but never raw error text."""
+    client = _FakeGroqClient([_GroqErrorWithBodyLimit(413, "8 KB")])
+    gateway = GroqStructuredGateway(
+        _live_settings(), client=client, max_attempts=1, sleep=lambda _: None
+    )
+
+    with pytest.raises(GroqRequestFailed) as error:
+        gateway.generate(_request())
+
+    attempt = error.value.provenance.attempts[0]
+    assert attempt.status_code == 413
+    assert attempt.provider_body_limit_bytes == 8_192
+    assert "8 KB" not in error.value.provenance.model_dump_json()
+
+
+def test_live_gateway_rejects_an_oversized_body_before_calling_groq() -> None:
+    """The local byte boundary must prevent known-oversized provider calls."""
+    client = _FakeGroqClient([_completion('{"plan_id":"plan-1"}', 1, 1)])
+    gateway = GroqStructuredGateway(
+        _live_settings(max_model_request_bytes=300),
+        client=client,
+        max_attempts=3,
+    )
+
+    with pytest.raises(ModelRequestTooLarge, match="declared provider budget") as error:
+        gateway.generate(_request())
+
+    assert client.calls == []
+    provenance = error.value.provenance
+    assert provenance.reason_code == "model_request_too_large"
+    assert provenance.final_outcome == "failed"
+    assert len(provenance.attempts) == 1
+    attempt = provenance.attempts[0]
+    assert attempt.error_type == "ModelRequestTooLarge"
+    assert attempt.status_code is None
+    assert attempt.request_body_bytes > 300
+    assert attempt.provider_body_limit_bytes == 300
+    serialized = provenance.model_dump_json()
+    assert "test-key" not in serialized
+    assert "contract_id" not in serialized
 
 
 def test_live_gateway_exposes_response_provenance_for_invalid_model_output():
@@ -319,8 +367,8 @@ def test_live_gateway_keeps_missing_usage_nullable_in_failure_provenance():
     assert error.value.provenance.output_tokens is None
 
 
-def _live_settings() -> Settings:
-    return Settings(llm_mode="live", groq_api_key="test-key")
+def _live_settings(**changes: object) -> Settings:
+    return Settings(llm_mode="live", groq_api_key="test-key", **changes)
 
 
 class _FakeGroqClient:
@@ -341,6 +389,14 @@ class _TransientGroqError(Exception):
     def __init__(self, status_code: int):
         self.status_code = status_code
         super().__init__(f"transient status {status_code}")
+
+
+class _GroqErrorWithBodyLimit(_TransientGroqError):
+    def __init__(self, status_code: int, limit: str):
+        super().__init__(status_code)
+        self.response = SimpleNamespace(
+            json=lambda: {"error": {"message": f"Maximum request size is {limit}"}}
+        )
 
 
 def _completion(content: str, prompt_tokens: int, completion_tokens: int):

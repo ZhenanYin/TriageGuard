@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from time import perf_counter
 from time import sleep as default_sleep
@@ -16,12 +17,17 @@ from triageguard.llm.gateway import (
     ModelOutputInvalid,
     ModelRequest,
     ModelResponse,
-    canonical_json,
     error_sha256,
     parse_and_validate_output,
     prompt_sha256,
     request_sha256,
     response_sha256,
+)
+from triageguard.llm.request_budget import (
+    ModelRequestTooLarge,
+    ProviderRequestBudget,
+    groq_request_body,
+    groq_request_body_bytes,
 )
 
 
@@ -55,6 +61,7 @@ class GroqStructuredGateway:
 
         self._client = client
         self._model = settings.llm_model
+        self._request_budget = ProviderRequestBudget.from_settings(settings)
         self._max_attempts = max_attempts
         self._sleep = sleep
 
@@ -71,23 +78,41 @@ class GroqStructuredGateway:
         attempts: list[ModelAttempt] = []
         request_hash = prompt_sha256(request)
         canonical_request_hash = request_sha256(request)
-        call_kwargs = {
-            "messages": [
-                {"role": "system", "content": request.system_prompt},
-                {"role": "user", "content": canonical_json(request.payload)},
-            ],
-            "model": self._model,
-            "max_tokens": request.max_output_tokens,
-            "reasoning_effort": "medium",
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": request.purpose,
-                    "strict": True,
-                    "schema": request.output_schema,
-                },
-            },
-        }
+        call_kwargs = groq_request_body(request=request, model=self._model)
+        request_body_bytes = groq_request_body_bytes(
+            request=request,
+            model=self._model,
+        )
+        if request_body_bytes > self._request_budget.max_body_bytes:
+            observed_at = datetime.now(UTC)
+            local_error = ModelRequestTooLarge(
+                "Model request exceeded the declared provider budget"
+            )
+            attempt = ModelAttempt(
+                number=1,
+                started_at=observed_at,
+                finished_at=observed_at,
+                latency_ms=0,
+                outcome="failed",
+                error_type=type(local_error).__name__,
+                request_body_bytes=request_body_bytes,
+                provider_body_limit_bytes=self._request_budget.max_body_bytes,
+            )
+            attempts.append(attempt)
+            raise ModelRequestTooLarge(
+                str(local_error),
+                attempts,
+                provenance=_failure_provenance(
+                    model=self._model,
+                    request=request,
+                    prompt_hash=request_hash,
+                    request_hash=canonical_request_hash,
+                    attempts=attempts,
+                    final_outcome="failed",
+                    reason_code="model_request_too_large",
+                    error_hash=error_sha256(local_error),
+                ),
+            )
 
         for number in range(1, self._max_attempts + 1):
             started_at = datetime.now(UTC)
@@ -96,6 +121,7 @@ class GroqStructuredGateway:
                 completion = self._client.chat.completions.create(**call_kwargs)
             except Exception as error:
                 finished_at = datetime.now(UTC)
+                status_code = _status_code(error)
                 is_transient = _is_transient_groq_error(error)
                 attempt = ModelAttempt(
                     number=number,
@@ -104,6 +130,9 @@ class GroqStructuredGateway:
                     latency_ms=_elapsed_milliseconds(started_clock),
                     outcome="transient_error" if is_transient else "failed",
                     error_type=type(error).__name__,
+                    status_code=status_code,
+                    request_body_bytes=request_body_bytes,
+                    provider_body_limit_bytes=_provider_body_limit_bytes(error),
                 )
                 attempts.append(attempt)
                 if is_transient and number < self._max_attempts:
@@ -137,7 +166,9 @@ class GroqStructuredGateway:
             try:
                 content = completion.choices[0].message.content
                 if not isinstance(content, str):
-                    raise ModelOutputInvalid("Groq response did not contain text content")
+                    raise ModelOutputInvalid(
+                        "Groq response did not contain text content"
+                    )
                 data = parse_and_validate_output(content, request.output_schema)
             except (AttributeError, IndexError, ModelOutputInvalid) as error:
                 attempts.append(
@@ -148,6 +179,7 @@ class GroqStructuredGateway:
                         latency_ms=latency_ms,
                         outcome="invalid_output",
                         error_type=type(error).__name__,
+                        request_body_bytes=request_body_bytes,
                     )
                 )
                 raise ModelOutputInvalid(
@@ -161,7 +193,9 @@ class GroqStructuredGateway:
                         attempts=attempts,
                         final_outcome="invalid_output",
                         reason_code="groq_invalid_output",
-                        response_hash=response_sha256(content) if content is not None else None,
+                        response_hash=response_sha256(content)
+                        if content is not None
+                        else None,
                         error_hash=error_sha256(error),
                         input_tokens=_nullable_usage_count(usage, "prompt_tokens"),
                         output_tokens=_nullable_usage_count(usage, "completion_tokens"),
@@ -175,6 +209,7 @@ class GroqStructuredGateway:
                     finished_at=finished_at,
                     latency_ms=latency_ms,
                     outcome="succeeded",
+                    request_body_bytes=request_body_bytes,
                 )
             )
             return ModelResponse(
@@ -239,5 +274,57 @@ def _elapsed_milliseconds(started_clock: float) -> int:
 
 def _is_transient_groq_error(error: Exception) -> bool:
     """Match Groq's documented rate-limit and server-status retry conditions only."""
+    status_code = _status_code(error)
+    return (
+        status_code == 429 or isinstance(status_code, int) and 500 <= status_code <= 599
+    )
+
+
+def _status_code(error: Exception) -> int | None:
+    """Extract only a valid HTTP status, never a provider response body."""
     status_code = getattr(error, "status_code", None)
-    return status_code == 429 or isinstance(status_code, int) and 500 <= status_code <= 599
+    if (
+        isinstance(status_code, int)
+        and not isinstance(status_code, bool)
+        and 100 <= status_code <= 599
+    ):
+        return status_code
+    return None
+
+
+def _provider_body_limit_bytes(error: Exception) -> int | None:
+    """Extract only a numeric request-size cap from a provider error response."""
+    response = getattr(error, "response", None)
+    response_json = getattr(response, "json", None)
+    if not callable(response_json):
+        return None
+    try:
+        body = response_json()
+    except Exception:  # noqa: BLE001 - malformed provider errors are untrusted
+        return None
+    if not isinstance(body, Mapping):
+        return None
+    error_body = body.get("error")
+    if not isinstance(error_body, Mapping):
+        return None
+    message = error_body.get("message")
+    if not isinstance(message, str):
+        return None
+
+    match = re.search(
+        r"(?:maximum|max|limit)[^0-9]{0,48}"
+        r"(?P<count>[0-9][0-9,_ ]*)\s*(?P<unit>bytes?|kb|mb)\b",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    try:
+        count = int(re.sub(r"[,_ ]", "", match.group("count")))
+    except ValueError:
+        return None
+    multiplier = {"b": 1, "byte": 1, "bytes": 1, "kb": 1024, "mb": 1024**2}[
+        match.group("unit").lower()
+    ]
+    size = count * multiplier
+    return size if 512 <= size <= 10_000_000 else None

@@ -14,6 +14,8 @@ MIN_REPEAT_COUNT = 1
 MAX_REPEAT_COUNT = 20
 DEFAULT_MAX_DIFF_FILES = 1_000
 DEFAULT_MAX_DIFF_BYTES = 25_000_000
+DEFAULT_MAX_MODEL_REQUEST_BYTES = 7_000
+DEFAULT_MAX_MODEL_EVIDENCE_ROUNDS = 2
 _PROCESS_SECRETS: dict[int, tuple[str | None, str | None]] = {}
 
 
@@ -38,6 +40,8 @@ class Settings:
     max_context_blob_bytes: int = 1_000_000
     max_context_search_identifiers: int = 100
     max_context_hits_per_identifier: int = 20
+    max_model_request_bytes: int = DEFAULT_MAX_MODEL_REQUEST_BYTES
+    max_model_evidence_rounds: int = DEFAULT_MAX_MODEL_EVIDENCE_ROUNDS
     repeat_count: int = 3
     environment_kind: EnvironmentKind = EnvironmentKind.CONTROLLED_FIXTURE
 
@@ -71,6 +75,8 @@ class Settings:
             "max_context_blob_bytes",
             "max_context_search_identifiers",
             "max_context_hits_per_identifier",
+            "max_model_request_bytes",
+            "max_model_evidence_rounds",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -119,6 +125,8 @@ class Settings:
             "max_context_blob_bytes": "TRIAGEGUARD_MAX_CONTEXT_BLOB_BYTES",
             "max_context_search_identifiers": "TRIAGEGUARD_MAX_CONTEXT_SEARCH_IDENTIFIERS",
             "max_context_hits_per_identifier": "TRIAGEGUARD_MAX_CONTEXT_HITS_PER_IDENTIFIER",
+            "max_model_request_bytes": "TRIAGEGUARD_MAX_MODEL_REQUEST_BYTES",
+            "max_model_evidence_rounds": "TRIAGEGUARD_MAX_MODEL_EVIDENCE_ROUNDS",
         }
         context_defaults = {
             "max_diff_files": DEFAULT_MAX_DIFF_FILES,
@@ -130,6 +138,8 @@ class Settings:
             "max_context_blob_bytes": 1_000_000,
             "max_context_search_identifiers": 100,
             "max_context_hits_per_identifier": 20,
+            "max_model_request_bytes": DEFAULT_MAX_MODEL_REQUEST_BYTES,
+            "max_model_evidence_rounds": DEFAULT_MAX_MODEL_EVIDENCE_ROUNDS,
         }
         context_limits: dict[str, int] = {}
         for field_name, environment_name in context_environment_names.items():
@@ -176,6 +186,8 @@ class Settings:
             max_context_blob_bytes=self.max_context_blob_bytes,
             max_context_search_identifiers=self.max_context_search_identifiers,
             max_context_hits_per_identifier=self.max_context_hits_per_identifier,
+            max_model_request_bytes=self.max_model_request_bytes,
+            max_model_evidence_rounds=self.max_model_evidence_rounds,
             repeat_count=self.repeat_count,
             environment_kind=self.environment_kind,
         )
@@ -200,6 +212,8 @@ class PublicSettings:
     max_context_blob_bytes: int
     max_context_search_identifiers: int
     max_context_hits_per_identifier: int
+    max_model_request_bytes: int
+    max_model_evidence_rounds: int
     repeat_count: int
     environment_kind: EnvironmentKind
     groq_api_key: None = field(default=None, init=False, repr=False)

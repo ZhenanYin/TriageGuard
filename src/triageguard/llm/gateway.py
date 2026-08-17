@@ -44,6 +44,9 @@ class ModelAttempt(BaseModel):
     latency_ms: int = Field(ge=0)
     outcome: Literal["succeeded", "transient_error", "invalid_output", "failed"]
     error_type: str | None = None
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    request_body_bytes: int | None = Field(default=None, gt=0)
+    provider_body_limit_bytes: int | None = Field(default=None, gt=0)
 
 
 class ModelFailureProvenance(BaseModel):

@@ -425,3 +425,36 @@ def test_analysis_configuration_hash_changes_with_diff_limits() -> None:
     )
 
     assert first._analysis_config_sha256() != second._analysis_config_sha256()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "first_value", "second_value"),
+    [
+        ("max_model_request_bytes", 7_000, 6_500),
+        ("max_model_evidence_rounds", 2, 3),
+    ],
+)
+def test_analysis_configuration_hash_changes_with_model_request_policy(
+    field_name: str,
+    first_value: int,
+    second_value: int,
+) -> None:
+    """Model evidence policy changes must produce distinct research snapshots."""
+    first = SnapshotAcquirer(
+        github=object(),
+        store=object(),
+        settings=Settings(
+            environment_kind=EnvironmentKind.REAL_PR_ANALYSIS,
+            **{field_name: first_value},
+        ),
+    )
+    second = SnapshotAcquirer(
+        github=object(),
+        store=object(),
+        settings=Settings(
+            environment_kind=EnvironmentKind.REAL_PR_ANALYSIS,
+            **{field_name: second_value},
+        ),
+    )
+
+    assert first._analysis_config_sha256() != second._analysis_config_sha256()

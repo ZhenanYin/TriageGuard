@@ -86,6 +86,48 @@ def test_diff_settings_have_generous_bounded_defaults() -> None:
     assert public_settings.max_diff_bytes == 25_000_000
 
 
+def test_model_request_settings_have_conservative_bounded_defaults() -> None:
+    """Live requests and evidence refinement must have reproducible hard limits."""
+    settings = Settings()
+    public_settings = settings.public_view()
+
+    assert settings.max_model_request_bytes == 7_000
+    assert settings.max_model_evidence_rounds == 2
+    assert public_settings.max_model_request_bytes == 7_000
+    assert public_settings.max_model_evidence_rounds == 2
+
+
+def test_model_request_settings_load_from_the_environment(monkeypatch) -> None:
+    """Deployments may tighten the policy without changing code."""
+    monkeypatch.setenv("TRIAGEGUARD_MAX_MODEL_REQUEST_BYTES", "6500")
+    monkeypatch.setenv("TRIAGEGUARD_MAX_MODEL_EVIDENCE_ROUNDS", "3")
+
+    settings = Settings.from_env()
+
+    assert settings.max_model_request_bytes == 6_500
+    assert settings.max_model_evidence_rounds == 3
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("max_model_request_bytes", 0),
+        ("max_model_request_bytes", -1),
+        ("max_model_request_bytes", True),
+        ("max_model_evidence_rounds", 0),
+        ("max_model_evidence_rounds", -1),
+        ("max_model_evidence_rounds", True),
+    ],
+)
+def test_model_request_settings_require_positive_strict_integers(
+    field_name: str,
+    value: object,
+) -> None:
+    """Boolean and disabled limits would silently remove an assurance boundary."""
+    with pytest.raises(ValueError, match=field_name):
+        Settings(**{field_name: value})
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [

@@ -46,7 +46,7 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 
 - [x] Task 1 — Permit only coherent snapshot-role equality
 - [x] Task 2 — Represent unchanged comparisons as canonical artifacts
-- [ ] Task 3 — Centralize exact provider request sizing and policy
+- [x] Task 3 — Centralize exact provider request sizing and policy
 - [ ] Task 4 — Add the immutable model-evidence envelope
 - [ ] Task 5 — Migrate risk generation and validation to visible evidence
 - [ ] Task 6 — Migrate testability and Gherkin to visible evidence
@@ -62,6 +62,13 @@ Task 2 completed on 2026-08-17. Focused diff, context, durability, and recovery
 regressions at the clean Task 2 commit: 104 passed. Full clean-commit regression
 suite: 753 passed. The preserved uncommitted diagnostics add eight tests, so the
 combined working tree passed 761.
+
+Task 3 completed on 2026-08-17. Strict configuration, exact Groq body
+serialization, safe local rejection provenance, and gateway regressions: 70
+passed. The exact Task 3 commit passed all 770 collected regressions; the
+combined working tree, including seven preserved diagnostic tests, passed 777.
+The 7,000-byte default is an initial conservative operational policy, not a
+claim about Groq's universal platform limit.
 
 ---
 
