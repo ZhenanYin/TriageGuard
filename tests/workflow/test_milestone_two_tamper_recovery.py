@@ -1,5 +1,6 @@
 """Tests that Milestone 2 recovery rejects tampered saved evidence."""
 
+import hashlib
 from datetime import UTC, datetime
 
 import pytest
@@ -96,12 +97,13 @@ def _diff(kind: str, old_revision: str, new_revision: str, digest: str) -> DiffA
     """Build one valid empty reproducible diff."""
     return DiffArtifact(
         kind=kind,
+        comparison_status="unchanged",
         old_revision=old_revision,
         new_revision=new_revision,
         git_arguments=("diff", "--no-ext-diff"),
         git_version="2.47.1",
         files=(),
-        patch_sha256=digest,
+        patch_sha256=hashlib.sha256(b"").hexdigest(),
         artifact_sha256=digest,
     )
 

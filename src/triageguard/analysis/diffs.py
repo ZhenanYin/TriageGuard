@@ -74,18 +74,21 @@ class DiffBuilder:
 
         artifacts: list[DiffArtifact] = []
         for kind, old_sha, new_sha in comparisons:
-            try:
-                patch_bytes, numstat_bytes = self._store.diff(old_sha, new_sha)
-            except GitCommandError as error:
-                if kind == "integration_diff":
+            if old_sha == new_sha:
+                patch_bytes, numstat_bytes = b"", b""
+            else:
+                try:
+                    patch_bytes, numstat_bytes = self._store.diff(old_sha, new_sha)
+                except GitCommandError as error:
+                    if kind == "integration_diff":
+                        raise DiffBuildError(
+                            "primary_integration_artifact_missing",
+                            "The primary integration diff could not be produced.",
+                        ) from error
                     raise DiffBuildError(
-                        "primary_integration_artifact_missing",
-                        "The primary integration diff could not be produced.",
+                        "diff_build_failed",
+                        "A required frozen diff could not be produced.",
                     ) from error
-                raise DiffBuildError(
-                    "diff_build_failed",
-                    "A required frozen diff could not be produced.",
-                ) from error
 
             artifacts.append(
                 parse_patch(
@@ -177,6 +180,7 @@ def parse_patch(
     )
     artifact_content = {
         "kind": kind,
+        "comparison_status": "changed" if files else "unchanged",
         "old_revision": old_sha,
         "new_revision": new_sha,
         "git_arguments": git_arguments,
@@ -206,12 +210,20 @@ def _validate_inputs(
         raise ValueError("old SHA must be a full 40-character lowercase SHA")
     if _FULL_COMMIT_SHA.fullmatch(new_sha) is None:
         raise ValueError("new SHA must be a full 40-character lowercase SHA")
-    if old_sha == new_sha:
-        raise ValueError("diff revisions must be distinct")
     if not isinstance(patch_bytes, bytes) or not isinstance(numstat_bytes, bytes):
         raise TypeError("patch and numstat values must be bytes")
     if not isinstance(git_version, str) or not git_version:
         raise ValueError("Git version must be a non-empty string")
+    if old_sha == new_sha:
+        if kind != "base_drift_diff":
+            raise ValueError(
+                "equal revisions are supported only for a base-drift comparison"
+            )
+        if patch_bytes or numstat_bytes:
+            raise DiffBuildError(
+                "diff_revision_mismatch",
+                "An equal-revision base-drift comparison must be empty.",
+            )
 
 
 def _validate_limits(*, max_files: int, max_bytes: int) -> None:

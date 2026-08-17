@@ -1,5 +1,6 @@
 """Tests that saved Milestone 2 risk responses survive interruption."""
 
+import hashlib
 import json
 from datetime import UTC, datetime
 
@@ -137,12 +138,13 @@ def _diff(
     """Build one valid empty diff whose identity is still reproducible."""
     return DiffArtifact(
         kind=kind,
+        comparison_status="unchanged",
         old_revision=old_revision,
         new_revision=new_revision,
         git_arguments=("diff", "--no-ext-diff"),
         git_version="2.47.1",
         files=(),
-        patch_sha256=digest,
+        patch_sha256=hashlib.sha256(b"").hexdigest(),
         artifact_sha256=digest,
     )
 

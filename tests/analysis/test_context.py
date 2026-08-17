@@ -181,6 +181,8 @@ def _diffs(snapshot: PullRequestSnapshot) -> tuple[object, ...]:
 def test_context_builder_reserves_evidence_for_an_integration_hunk() -> None:
     """The primary predicted-merge change is always represented as evidence."""
     snapshot = _snapshot()
+    diffs = _diffs(snapshot)
+    assert diffs[2].comparison_status == "unchanged"
     source = (
         b"package org.openmrs.api;\n"
         b"class PatientService {\n"
@@ -219,7 +221,7 @@ def test_context_builder_reserves_evidence_for_an_integration_hunk() -> None:
 
     bundle = ContextBuilder().build(
         snapshot=snapshot,
-        diffs=_diffs(snapshot),
+        diffs=diffs,
         store=FakeStore(),
         limits=limits,
     )
@@ -227,6 +229,9 @@ def test_context_builder_reserves_evidence_for_an_integration_hunk() -> None:
     assert bundle.primary_change_represented is True
     assert bundle.selected_file_count == 1
     assert bundle.selected_anchor_count == 1
+    assert {anchor.change_relation for anchor in bundle.anchors} == {
+        "integration_change"
+    }
 
     anchor = bundle.anchors[0]
     assert anchor.revision_role == "candidate"

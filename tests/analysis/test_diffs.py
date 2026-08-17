@@ -4,12 +4,13 @@ import hashlib
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from triageguard.analysis import DiffBuilder as PublicDiffBuilder
 from triageguard.analysis import DiffBuildError as PublicDiffBuildError
 from triageguard.analysis import parse_patch as public_parse_patch
 from triageguard.analysis.diffs import DiffBuilder, DiffBuildError, parse_patch
-from triageguard.domain.pr_analysis import PullRequestSnapshot
+from triageguard.domain.pr_analysis import DiffArtifact, PullRequestSnapshot
 from triageguard.provenance import canonical_sha256
 from triageguard.sources.git import GitCommandError
 
@@ -42,6 +43,7 @@ def test_parse_patch_records_one_modified_file_and_its_hunk() -> None:
     assert artifact.old_revision == old_sha
     assert artifact.new_revision == new_sha
     assert artifact.patch_sha256 == hashlib.sha256(patch_bytes).hexdigest()
+    assert artifact.comparison_status == "changed"
     assert len(artifact.artifact_sha256) == 64
     assert len(artifact.files) == 1
 
@@ -88,7 +90,11 @@ def test_binary_rename_is_explicitly_recorded() -> None:
     assert changed_file.hunks == ()
 
 
-def _snapshot() -> PullRequestSnapshot:
+def _snapshot(
+    *,
+    merge_base_sha: str = "a" * 40,
+    base_sha: str = "b" * 40,
+) -> PullRequestSnapshot:
     """Create one fixed snapshot with four distinct revisions."""
     return PullRequestSnapshot.from_identity(
         repository="openmrs/openmrs-core",
@@ -97,8 +103,8 @@ def _snapshot() -> PullRequestSnapshot:
         state="open",
         default_branch="main",
         base_branch="main",
-        merge_base_sha="a" * 40,
-        base_sha="b" * 40,
+        merge_base_sha=merge_base_sha,
+        base_sha=base_sha,
         head_sha="c" * 40,
         candidate_sha="d" * 40,
         merge_base_tree_sha="e" * 40,
@@ -153,6 +159,50 @@ def test_builder_uses_the_three_approved_frozen_comparisons() -> None:
         (snapshot.merge_base_sha, snapshot.head_sha),
         (snapshot.base_sha, snapshot.candidate_sha),
         (snapshot.merge_base_sha, snapshot.base_sha),
+    ]
+
+
+def test_builder_records_no_base_drift_without_asking_git_for_an_equal_diff() -> None:
+    """Equal M and B roles produce canonical evidence without an invalid Git read."""
+    snapshot = _snapshot(
+        merge_base_sha="a" * 40,
+        base_sha="a" * 40,
+    )
+    patch_bytes = (
+        b"diff --git a/api/PatientService.java b/api/PatientService.java\n"
+        b"index 1111111..2222222 100644\n"
+        b"--- a/api/PatientService.java\n"
+        b"+++ b/api/PatientService.java\n"
+        b"@@ -10 +10 @@\n"
+        b"-return oldValue;\n"
+        b"+return newValue;\n"
+    )
+    numstat_bytes = b"1\t1\tapi/PatientService.java\0"
+
+    class RecordingStore:
+        def __init__(self) -> None:
+            self.diff_calls: list[tuple[str, str]] = []
+
+        def diff(self, old_sha: str, new_sha: str) -> tuple[bytes, bytes]:
+            assert old_sha != new_sha
+            self.diff_calls.append((old_sha, new_sha))
+            return patch_bytes, numstat_bytes
+
+        def git_version(self) -> str:
+            return "2.47.1"
+
+    store = RecordingStore()
+    author, integration, base_drift = DiffBuilder(store).build_all(snapshot)
+
+    assert author.comparison_status == "changed"
+    assert integration.comparison_status == "changed"
+    assert base_drift.comparison_status == "unchanged"
+    assert base_drift.old_revision == base_drift.new_revision == "a" * 40
+    assert base_drift.files == ()
+    assert base_drift.patch_sha256 == hashlib.sha256(b"").hexdigest()
+    assert store.diff_calls == [
+        (snapshot.merge_base_sha, snapshot.head_sha),
+        (snapshot.base_sha, snapshot.candidate_sha),
     ]
 
 
@@ -453,8 +503,99 @@ def test_parse_patch_records_an_empty_but_valid_frozen_comparison() -> None:
     )
 
     assert artifact.kind == "base_drift_diff"
+    assert artifact.comparison_status == "unchanged"
     assert artifact.files == ()
     assert artifact.patch_sha256 == hashlib.sha256(b"").hexdigest()
+
+
+def test_parse_patch_records_a_canonical_equal_revision_base_drift() -> None:
+    """No main-branch drift is an explicit, hash-bound unchanged comparison."""
+    revision = "b" * 40
+
+    artifact = parse_patch(
+        kind="base_drift_diff",
+        old_sha=revision,
+        new_sha=revision,
+        patch_bytes=b"",
+        numstat_bytes=b"",
+        git_version="2.47.1",
+    )
+
+    assert artifact.comparison_status == "unchanged"
+    assert artifact.old_revision == artifact.new_revision == revision
+    assert artifact.files == ()
+    assert artifact.patch_sha256 == hashlib.sha256(b"").hexdigest()
+    assert artifact.artifact_sha256 == canonical_sha256(
+        artifact.model_dump(mode="json", exclude={"artifact_sha256"})
+    )
+
+
+@pytest.mark.parametrize("kind", ["author_diff", "integration_diff"])
+def test_parse_patch_rejects_equal_revisions_for_non_drift_comparisons(
+    kind: str,
+) -> None:
+    """Logical author and integration roles may not collapse into one revision."""
+    with pytest.raises(ValueError, match="equal revisions"):
+        parse_patch(
+            kind=kind,
+            old_sha="b" * 40,
+            new_sha="b" * 40,
+            patch_bytes=b"",
+            numstat_bytes=b"",
+            git_version="2.47.1",
+        )
+
+
+def test_parse_patch_rejects_content_for_an_equal_revision_base_drift() -> None:
+    """Equal Git objects cannot truthfully carry a non-empty comparison."""
+    with pytest.raises(DiffBuildError, match="diff_revision_mismatch") as error:
+        parse_patch(
+            kind="base_drift_diff",
+            old_sha="b" * 40,
+            new_sha="b" * 40,
+            patch_bytes=b"unexpected patch",
+            numstat_bytes=b"",
+            git_version="2.47.1",
+        )
+
+    assert error.value.reason_code == "diff_revision_mismatch"
+
+
+def test_diff_artifact_rejects_a_status_that_disagrees_with_its_content() -> None:
+    """Persisted comparison status cannot reinterpret changed or empty evidence."""
+    changed = parse_patch(
+        kind="integration_diff",
+        old_sha="b" * 40,
+        new_sha="c" * 40,
+        patch_bytes=(
+            b"diff --git a/api/A.java b/api/A.java\n"
+            b"index 1111111..2222222 100644\n"
+            b"--- a/api/A.java\n"
+            b"+++ b/api/A.java\n"
+            b"@@ -1 +1 @@\n"
+            b"-old\n"
+            b"+new\n"
+        ),
+        numstat_bytes=b"1\t1\tapi/A.java\0",
+        git_version="2.47.1",
+    )
+    unchanged = parse_patch(
+        kind="base_drift_diff",
+        old_sha="b" * 40,
+        new_sha="c" * 40,
+        patch_bytes=b"",
+        numstat_bytes=b"",
+        git_version="2.47.1",
+    )
+
+    with pytest.raises(ValidationError, match="unchanged comparison"):
+        DiffArtifact.model_validate(
+            changed.model_dump(mode="json") | {"comparison_status": "unchanged"}
+        )
+    with pytest.raises(ValidationError, match="changed comparison"):
+        DiffArtifact.model_validate(
+            unchanged.model_dump(mode="json") | {"comparison_status": "changed"}
+        )
 
 
 def test_parse_patch_rejects_a_patch_and_manifest_with_different_file_sets() -> None:

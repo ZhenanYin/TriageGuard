@@ -45,7 +45,7 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 ## Progress
 
 - [x] Task 1 — Permit only coherent snapshot-role equality
-- [ ] Task 2 — Represent unchanged comparisons as canonical artifacts
+- [x] Task 2 — Represent unchanged comparisons as canonical artifacts
 - [ ] Task 3 — Centralize exact provider request sizing and policy
 - [ ] Task 4 — Add the immutable model-evidence envelope
 - [ ] Task 5 — Migrate risk generation and validation to visible evidence
@@ -56,7 +56,12 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 - [ ] Task 10 — Complete Gate A verification and record measurements
 
 Task 1 completed on 2026-08-17. Focused snapshot, domain, and Git regressions:
-50 passed. Full regression suite: 755 passed.
+50 passed. Combined working-tree regression suite: 755 passed.
+
+Task 2 completed on 2026-08-17. Focused diff, context, durability, and recovery
+regressions at the clean Task 2 commit: 104 passed. Full clean-commit regression
+suite: 753 passed. The preserved uncommitted diagnostics add eight tests, so the
+combined working tree passed 761.
 
 ---
 
@@ -205,7 +210,7 @@ Add rejection tests for:
 - equal revisions with `author_diff`;
 - equal revisions with `integration_diff`;
 - equal revisions plus non-empty patch or numstat;
-- distinct revisions marked `unchanged` in persisted input;
+- non-empty content marked `unchanged` in persisted input;
 - empty distinct-revision comparison marked `changed`.
 
 ### Step 2: Run the red tests
@@ -230,12 +235,15 @@ comparison_status: Literal["changed", "unchanged"]
 Validate this invariant:
 
 ```python
+empty_patch_sha256 = hashlib.sha256(b"").hexdigest()
 same_revision = self.old_revision == self.new_revision
-if self.comparison_status == "unchanged":
-    if self.kind != "base_drift_diff" or not same_revision or self.files:
-        raise ValueError("unchanged comparison must be an empty equal-revision base drift")
-elif same_revision:
-    raise ValueError("changed comparison revisions must be distinct")
+if self.comparison_status == "changed":
+    if not self.files or self.patch_sha256 == empty_patch_sha256 or same_revision:
+        raise ValueError("changed comparison requires distinct changed content")
+elif self.files or self.patch_sha256 != empty_patch_sha256:
+    raise ValueError("unchanged comparison requires canonical empty content")
+if same_revision and self.kind != "base_drift_diff":
+    raise ValueError("only base drift supports equal revisions")
 ```
 
 Include `comparison_status` in canonical artifact hash input. Update every
@@ -247,18 +255,18 @@ migration that guesses status from missing data.
 Before normal file parsing:
 
 ```python
-same_revision = old_revision == new_revision
-if same_revision:
+if old_revision == new_revision:
     if kind != "base_drift_diff" or patch_bytes or numstat_bytes:
         raise DiffBuildError(
             "diff_revision_mismatch",
             "Only an empty base-drift comparison may use one revision.",
         )
-    files: tuple[DiffFile, ...] = ()
-    comparison_status = "unchanged"
-else:
-    files = tuple(_parse_file_blocks(patch_bytes, _parse_numstat(numstat_bytes)))
-    comparison_status = "changed"
+files = (
+    ()
+    if patch_bytes == b"" and numstat_bytes == b""
+    else tuple(_parse_file_blocks(patch_bytes, _parse_numstat(numstat_bytes)))
+)
+comparison_status = "changed" if files else "unchanged"
 ```
 
 Use the existing error constructor signature in `diffs.py`; preserve its public

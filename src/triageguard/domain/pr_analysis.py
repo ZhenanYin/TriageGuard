@@ -256,6 +256,7 @@ class DiffArtifact(ResearchArtifact):
     """One reproducible locally generated author, integration, or drift diff."""
 
     kind: Literal["author_diff", "integration_diff", "base_drift_diff"]
+    comparison_status: Literal["changed", "unchanged"]
     old_revision: FullCommitSha
     new_revision: FullCommitSha
     git_arguments: tuple[StrictStr, ...] = Field(min_length=1)
@@ -266,8 +267,19 @@ class DiffArtifact(ResearchArtifact):
 
     @model_validator(mode="after")
     def validate_diff_revisions(self) -> DiffArtifact:
-        if self.old_revision == self.new_revision:
-            raise ValueError("diff revisions must be distinct")
+        empty_patch_sha256 = hashlib.sha256(b"").hexdigest()
+        if self.comparison_status == "changed":
+            if not self.files or self.patch_sha256 == empty_patch_sha256:
+                raise ValueError("changed comparison requires changed file content")
+            if self.old_revision == self.new_revision:
+                raise ValueError("changed comparison revisions must be distinct")
+        elif self.files or self.patch_sha256 != empty_patch_sha256:
+            raise ValueError("unchanged comparison requires canonical empty content")
+
+        if self.old_revision == self.new_revision and self.kind != "base_drift_diff":
+            raise ValueError(
+                "equal revisions are supported only for a base-drift comparison"
+            )
         return self
 
 
