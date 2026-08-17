@@ -50,6 +50,17 @@ def test_replay_discards_both_provider_secrets(monkeypatch) -> None:
     assert "secret" not in repr(settings)
 
 
+def test_live_mode_treats_a_blank_github_token_as_not_configured(monkeypatch) -> None:
+    """An optional blank token must not become an invalid Bearer header."""
+    monkeypatch.setenv("TRIAGEGUARD_LLM_MODE", "live")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "   ")
+
+    settings = Settings.from_env()
+
+    assert settings.github_token is None
+
+
 def test_context_settings_have_documented_bounded_defaults() -> None:
     """Unconfigured context collection must remain reproducibly bounded."""
     settings = Settings()

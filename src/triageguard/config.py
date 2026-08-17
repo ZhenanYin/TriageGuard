@@ -90,6 +90,8 @@ class Settings:
             raise ValueError("TRIAGEGUARD_LLM_PROVIDER must be 'groq'")
         groq_api_key = os.getenv("GROQ_API_KEY") if llm_mode == "live" else None
         github_token = os.getenv("GITHUB_TOKEN") if llm_mode == "live" else None
+        if github_token is not None and not github_token.strip():
+            github_token = None
 
         try:
             environment_kind = EnvironmentKind(
