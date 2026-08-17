@@ -14,7 +14,10 @@ from triageguard.analysis.diffs import DiffBuildError
 from triageguard.analysis.snapshot import SnapshotAcquisitionError
 from triageguard.config import Settings
 from triageguard.domain import EnvironmentKind
-from triageguard.evidence import ModelEvidenceBudgetError
+from triageguard.evidence import (
+    ModelEvidenceBudgetError,
+    ModelEvidencePreflightStop,
+)
 from triageguard.llm import (
     ModelAttempt,
     ModelFailureProvenance,
@@ -221,6 +224,48 @@ def test_local_evidence_budget_stop_reports_exact_bytes_without_raw_error() -> N
         "No conclusion was produced."
     )
     assert "secret anchor identity" not in message
+
+
+def test_restored_preflight_stop_is_presented_as_zero_provider_attempts() -> None:
+    """Restart diagnostics must distinguish local policy from a Groq failure."""
+    stop = ModelEvidencePreflightStop(
+        stage="risk_hypothesis",
+        snapshot_key="a" * 64,
+        context_sha256="b" * 64,
+        reason_code="model_request_too_large",
+        request_body_bytes=12_589,
+        max_request_body_bytes=7_000,
+        catalog_anchor_count=54,
+        observed_at=datetime(2026, 8, 17, tzinfo=UTC),
+    )
+    workflow = SimpleNamespace(
+        model_failure=lambda stage: None,
+        model_preflight_stop=lambda stage: stop,
+    )
+    settings = Settings(
+        llm_mode="live",
+        llm_provider="groq",
+        llm_model="openai/gpt-oss-120b",
+        groq_api_key="test-only-key",
+    ).public_view()
+    state = MilestoneTwoAppState(settings=settings, workflow=workflow)
+
+    assert state.model_failure_view("risk_hypothesis") == {
+        "stage": "risk_hypothesis",
+        "provider": "groq",
+        "model": "openai/gpt-oss-120b",
+        "purpose": "risk_hypothesis",
+        "reason_code": "model_request_too_large",
+        "final_outcome": "stopped_before_provider",
+        "attempt_count": 0,
+        "latency_ms": 0,
+        "last_http_status": None,
+        "last_error_type": "ModelEvidenceBudgetError",
+        "last_request_body_bytes": 12_589,
+        "provider_body_limit_bytes": None,
+        "declared_request_limit_bytes": 7_000,
+        "catalog_anchor_count": 54,
+    }
 
 
 def _app_state(

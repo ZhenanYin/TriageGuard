@@ -499,7 +499,26 @@ class MilestoneTwoAppState:
         """Expose compact, secret-free diagnostics for one retryable model stage."""
         failure = self.workflow.model_failure(stage)
         if failure is None:
-            return None
+            stop = self.workflow.model_preflight_stop(stage)
+            if stop is None:
+                return None
+            provider = self.provider_view()
+            return {
+                "stage": stage,
+                "provider": provider["provider"],
+                "model": provider["model"],
+                "purpose": stage,
+                "reason_code": stop.reason_code,
+                "final_outcome": "stopped_before_provider",
+                "attempt_count": 0,
+                "latency_ms": 0,
+                "last_http_status": None,
+                "last_error_type": "ModelEvidenceBudgetError",
+                "last_request_body_bytes": stop.request_body_bytes,
+                "provider_body_limit_bytes": None,
+                "declared_request_limit_bytes": stop.max_request_body_bytes,
+                "catalog_anchor_count": stop.catalog_anchor_count,
+            }
         evidence = self.model_evidence_view(stage)
         return {
             "stage": stage,

@@ -15,6 +15,7 @@ from triageguard.domain import (
     PullRequestSnapshot,
     SnapshotFreshness,
 )
+from triageguard.evidence import ModelEvidenceBudgetError
 from triageguard.llm import (
     ModelGatewayError,
     ModelRequest,
@@ -201,6 +202,63 @@ def _context(snapshot: PullRequestSnapshot) -> ContextBundle:
     )
 
 
+def _oversized_required_context(snapshot: PullRequestSnapshot) -> ContextBundle:
+    """Build two whole mandatory anchors that cannot fit the request policy."""
+    anchors = tuple(
+        ContextAnchor(
+            anchor_id=anchor_id,
+            revision_role="candidate" if relation == "integration_change" else "head",
+            commit_sha=(
+                snapshot.candidate_sha
+                if relation == "integration_change"
+                else snapshot.head_sha
+            ),
+            blob_sha=blob_sha,
+            path=path,
+            java_symbol="deletePatient",
+            start_line=10,
+            end_line=10,
+            text=text,
+            text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            selection_reason=f"required {relation}",
+            score_components=(),
+            change_relation=relation,
+            truncated=False,
+        )
+        for anchor_id, relation, blob_sha, path, text in (
+            (
+                "anchor-integration-large",
+                "integration_change",
+                "a" * 40,
+                "api/src/main/java/org/openmrs/PatientService.java",
+                "integrationEvidence" * 180,
+            ),
+            (
+                "anchor-author-large",
+                "author_change",
+                "b" * 40,
+                "api/src/main/java/org/openmrs/PatientServiceImpl.java",
+                "authorEvidence" * 220,
+            ),
+        )
+    )
+    return ContextBundle.from_content(
+        snapshot_key=snapshot.snapshot_key,
+        anchors=anchors,
+        selected_file_count=2,
+        selected_anchor_count=2,
+        selected_bytes=sum(len(anchor.text.encode()) for anchor in anchors),
+        max_files=40,
+        max_anchors=80,
+        max_bytes=160_000,
+        max_anchor_lines=120,
+        max_blob_bytes=1_000_000,
+        max_search_identifiers=100,
+        max_hits_per_identifier=20,
+        primary_change_represented=True,
+    )
+
+
 def _risk_response(
     snapshot: PullRequestSnapshot,
     context: ContextBundle,
@@ -253,6 +311,154 @@ def _no_risk_response(
         "evidence_needs": [],
         "generated_at": "2026-08-15T00:00:00Z",
     }
+
+
+def test_risk_preflight_budget_stop_is_durable_and_never_calls_the_gateway(
+    tmp_path,
+) -> None:
+    """A mandatory-anchor overflow must survive restart without a model call."""
+    snapshot = _snapshot()
+    context = _oversized_required_context(snapshot)
+    diffs = (
+        _diff(
+            kind="author_diff",
+            old_revision=snapshot.merge_base_sha,
+            new_revision=snapshot.head_sha,
+            digest="a" * 64,
+        ),
+        _diff(
+            kind="integration_diff",
+            old_revision=snapshot.base_sha,
+            new_revision=snapshot.candidate_sha,
+            digest="b" * 64,
+        ),
+        _diff(
+            kind="base_drift_diff",
+            old_revision=snapshot.merge_base_sha,
+            new_revision=snapshot.base_sha,
+            digest="c" * 64,
+        ),
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    gateway = _CountingGateway({})
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=gateway,
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-risk-preflight-stop-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    workflow.prepare_pr("https://github.com/openmrs/openmrs-core/pull/900000001")
+
+    with pytest.raises(ModelEvidenceBudgetError) as first_error:
+        workflow.propose_risks()
+
+    first_stop = workflow.model_preflight_stop("risk_hypothesis")
+    assert first_stop is not None
+    assert first_stop.request_body_bytes == first_error.value.request_body_bytes
+    assert first_stop.max_request_body_bytes == 7_000
+    assert first_stop.catalog_anchor_count == 2
+    assert gateway.call_count == 0
+    saved = json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/model_preflight_stops/risk_hypothesis.json",
+        )
+    )
+    assert saved["reason_code"] == "model_request_too_large"
+    assert "integrationEvidence" not in json.dumps(saved)
+    assert "authorEvidence" not in json.dumps(saved)
+
+    resumed = resume_milestone_two_workflow(
+        run_handle=workflow.run_handle,
+        dependencies=dependencies,
+    )
+
+    assert resumed.model_preflight_stop("risk_hypothesis") == first_stop
+    with pytest.raises(ModelEvidenceBudgetError) as resumed_error:
+        resumed.propose_risks()
+    assert (
+        resumed_error.value.request_body_bytes == first_error.value.request_body_bytes
+    )
+    assert resumed_error.value.limit_bytes == 7_000
+    assert gateway.call_count == 0
+
+
+def test_resume_rejects_a_tampered_risk_preflight_stop(tmp_path) -> None:
+    """The local-stop artifact must remain protected by its recorder journal."""
+    snapshot = _snapshot()
+    context = _oversized_required_context(snapshot)
+    diffs = (
+        _diff(
+            kind="author_diff",
+            old_revision=snapshot.merge_base_sha,
+            new_revision=snapshot.head_sha,
+            digest="a" * 64,
+        ),
+        _diff(
+            kind="integration_diff",
+            old_revision=snapshot.base_sha,
+            new_revision=snapshot.candidate_sha,
+            digest="b" * 64,
+        ),
+        _diff(
+            kind="base_drift_diff",
+            old_revision=snapshot.merge_base_sha,
+            new_revision=snapshot.base_sha,
+            digest="c" * 64,
+        ),
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    gateway = _CountingGateway({})
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=gateway,
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-tampered-risk-preflight-stop-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    workflow.prepare_pr("https://github.com/openmrs/openmrs-core/pull/900000001")
+    with pytest.raises(ModelEvidenceBudgetError):
+        workflow.propose_risks()
+
+    stop_path = (
+        recorder.locate_run(workflow.run_handle.run_id)
+        / "artifacts"
+        / "model_preflight_stops"
+        / "risk_hypothesis.json"
+    )
+    stop_path.write_bytes(b'{"request_body_bytes": 7001}\n')
+
+    with pytest.raises(MilestoneTwoTransitionError, match="does not match its journal"):
+        resume_milestone_two_workflow(
+            run_handle=workflow.run_handle,
+            dependencies=dependencies,
+        )
+    assert gateway.call_count == 0
 
 
 def test_resume_reuses_a_durable_risk_response_without_another_model_call(

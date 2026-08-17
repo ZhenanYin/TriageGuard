@@ -39,8 +39,9 @@ pull request. It freezes four exact code photographs before any model request:
 It compares author change (**M → H**), merge impact (**B → C**), and
 main-branch drift (**M → B**). The model may propose readable, unconfirmed
 risk hypotheses, testability assessments, and Gherkin candidates. Local,
-deterministic validation decides whether each item is grounded in the frozen
-code evidence.
+deterministic validation confirms whether each citation resolves to exact code
+that was visible in that model call. Citation validation does not prove the
+claim is semantically true or that a vulnerability exists.
 
 Milestone 2 has five human-gated pages:
 
@@ -56,6 +57,12 @@ Milestone 2 stops after an approved evidence-bound Gherkin scenario, a supported
 non-risk outcome, or an explicit insufficient-frozen-evidence outcome. It does
 not generate pytest, execute OpenMRS, calculate CVSS, or claim that a real PR
 is safe.
+
+All three Milestone 2 model stages use immutable evidence envelopes and one
+shared 7,000-byte exact serialized-request policy. Required evidence is never
+silently sliced. If the exact request cannot fit, the stage stops locally with
+a typed outcome before contacting the provider. This is a conservative current
+policy for the OpenMRS pilot, not a claim about Groq's universal platform limit.
 
 ## Model boundary and deterministic gates
 
@@ -165,10 +172,11 @@ this repository intentionally reports no invented evaluation numbers.
 
 ## Current limitations and non-claims
 
-- There is no real OpenMRS diff/context adapter or system-aware risk proposal
-  stage yet; the single risk contract is prepared and fixture-specific.
-- The local fixture is OpenMRS-shaped but is not OpenMRS and does not validate
-  real checkout, build, migration, configuration, or deployment behavior.
+- Milestone 2 has a real OpenMRS Core snapshot, diff, bounded-context, and
+  human-review front half, but it does not yet build or execute real OpenMRS
+  revisions.
+- Milestone 1's local fixture is OpenMRS-shaped but is not OpenMRS and does not
+  validate a real checkout, build, migration, configuration, or deployment.
 - Base/PR execution and a GitHub check are future work. This repository does not
   claim GitHub Actions integration or continuous pull-request monitoring.
 - The prototype does not claim to discover production vulnerabilities, measure
@@ -258,6 +266,35 @@ intended model. The first live run should use a public, open OpenMRS Core PR and
 should be reviewed as an engineering smoke test, not as a vulnerability finding.
 There is no replay fallback: a missing key, unsupported PR, GitHub error, or
 provider failure stops the run without inventing a result.
+
+For the Gate A live review, use fresh artifact and cache directories so the
+observation is easy to distinguish from earlier debugging runs:
+
+```bash
+cd /Users/zhenanyin/Desktop/CVSS/TriageGuard-clean/.worktrees/milestone-2
+source .venv/bin/activate
+export TRIAGEGUARD_LLM_MODE=live
+export TRIAGEGUARD_LLM_PROVIDER=groq
+export TRIAGEGUARD_LLM_MODEL=openai/gpt-oss-120b
+export TRIAGEGUARD_ENVIRONMENT_KIND=real_pr_analysis
+export TRIAGEGUARD_MAX_MODEL_REQUEST_BYTES=7000
+export TRIAGEGUARD_ARTIFACTS_DIR=artifacts/gate-a-live-review
+export TRIAGEGUARD_ANALYSIS_CACHE_DIR=analysis-cache/gate-a-live-review
+read -s "GROQ_API_KEY?Groq API key: "
+export GROQ_API_KEY
+read -s "GITHUB_TOKEN?GitHub token (recommended; Enter to skip): "
+export GITHUB_TOKEN
+.venv/bin/python -m streamlit run src/triageguard/ui/app.py
+```
+
+In the UI, confirm **Live · groq**, enter one public open pull request from
+`openmrs/openmrs-core`, and proceed until the workflow reaches a typed outcome
+or stops at a typed stage boundary. A risk proposal is not required for Gate A;
+a bounded, durable abstention is valid. After the run, report only the terminal
+stage, visible coverage text, omission reasons, and safe diagnostic shown by
+the UI. The local artifacts can then be inspected for aggregate measurements
+without sharing prompts, model responses, credentials, or unpublished security
+conclusions.
 
 After stopping Streamlit with <kbd>Ctrl</kbd>+<kbd>C</kbd>, clear the session in
 that same shell:

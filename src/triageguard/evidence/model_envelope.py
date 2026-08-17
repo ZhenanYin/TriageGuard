@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field, StrictInt, StrictStr, model_validator
@@ -16,6 +17,26 @@ ModelEvidenceStage = Literal[
     "testability_assessment",
     "gherkin_generation",
 ]
+
+
+class ModelEvidencePreflightStop(ResearchArtifact):
+    """Safe durable provenance for a request stopped before an envelope exists."""
+
+    schema_version: Literal[1] = 1
+    stage: ModelEvidenceStage
+    snapshot_key: Sha256
+    context_sha256: Sha256
+    reason_code: Literal["model_request_too_large"]
+    request_body_bytes: StrictInt = Field(gt=0)
+    max_request_body_bytes: StrictInt = Field(gt=0)
+    catalog_anchor_count: StrictInt = Field(ge=0)
+    observed_at: datetime
+
+    @model_validator(mode="after")
+    def validate_overflow(self) -> ModelEvidencePreflightStop:
+        if self.request_body_bytes <= self.max_request_body_bytes:
+            raise ValueError("preflight stop requires a request over its byte limit")
+        return self
 
 
 class EvidenceArtifactBinding(ResearchArtifact):

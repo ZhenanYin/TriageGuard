@@ -7,6 +7,7 @@ from triageguard.evidence.classifier import (
 from triageguard.evidence.model_envelope import (
     EvidenceArtifactBinding,
     ModelEvidenceEnvelope,
+    ModelEvidencePreflightStop,
     ModelEvidenceStage,
     OmittedEvidenceAnchor,
     VisibleEvidenceAnchor,
@@ -30,6 +31,7 @@ __all__ = [
     "FrozenEvidenceResolver",
     "ModelEvidenceBudgetError",
     "ModelEvidenceEnvelope",
+    "ModelEvidencePreflightStop",
     "ModelEvidenceStage",
     "OmittedEvidenceAnchor",
     "UnsupportedRiskContractError",

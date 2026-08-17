@@ -32,9 +32,11 @@ htmlcov/
 # Local agent collaboration records — never publish
 /HANDOVER.md
 /docs/superpowers/
+/.planning/
 
 # Local research artifacts
 /artifacts/
+/analysis-cache/
 
 # macOS
 .DS_Store

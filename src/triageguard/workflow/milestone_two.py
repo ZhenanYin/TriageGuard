@@ -53,7 +53,9 @@ from triageguard.evidence import (
     EvidenceArtifactBinding,
     FrozenEvidenceResolution,
     FrozenEvidenceResolver,
+    ModelEvidenceBudgetError,
     ModelEvidenceEnvelope,
+    ModelEvidencePreflightStop,
     validate_envelope_binding,
 )
 from triageguard.hypotheses import (
@@ -326,6 +328,7 @@ class MilestoneTwoWorkflow:
         self._risk_assessment: RiskAssessment | None = None
         self._risk_grounding_report: RiskGroundingReport | None = None
         self._model_failures: dict[str, ModelFailureProvenance] = {}
+        self._model_preflight_stops: dict[str, ModelEvidencePreflightStop] = {}
         self._freshness: SnapshotFreshness | None = None
         self._human_reviewed_risk: HumanReviewedRisk | None = None
         self._testability_draft: TestabilityAssessmentDraft | None = None
@@ -377,6 +380,16 @@ class MilestoneTwoWorkflow:
         }:
             raise ValueError("unknown Milestone 2 model stage")
         return self._model_failures.get(stage)
+
+    def model_preflight_stop(self, stage: str) -> ModelEvidencePreflightStop | None:
+        """Return a durable local stop that occurred before a model request."""
+        if stage not in {
+            "risk_hypothesis",
+            "testability_assessment",
+            "gherkin_generation",
+        }:
+            raise ValueError("unknown Milestone 2 model stage")
+        return self._model_preflight_stops.get(stage)
 
     @property
     def human_reviewed_risk(self) -> HumanReviewedRisk | None:
@@ -460,14 +473,31 @@ class MilestoneTwoWorkflow:
             )
 
         prepared = self._require_prepared("propose risks")
-        if self._risk_evidence_envelope is None:
-            envelope_result = build_risk_evidence(
-                snapshot=prepared.snapshot,
-                diffs=prepared.diffs,
-                context=prepared.context,
-                budget=ProviderRequestBudget.from_settings(self._settings),
-                priority_anchor_ids=self._refinement_priority_anchor_ids,
+        saved_stop = self._model_preflight_stops.get("risk_hypothesis")
+        if saved_stop is not None:
+            raise ModelEvidenceBudgetError(
+                "required frozen evidence cannot fit the model request budget",
+                stage=saved_stop.stage,
+                request_body_bytes=saved_stop.request_body_bytes,
+                limit_bytes=saved_stop.max_request_body_bytes,
             )
+        if self._risk_evidence_envelope is None:
+            try:
+                envelope_result = build_risk_evidence(
+                    snapshot=prepared.snapshot,
+                    diffs=prepared.diffs,
+                    context=prepared.context,
+                    budget=ProviderRequestBudget.from_settings(self._settings),
+                    priority_anchor_ids=self._refinement_priority_anchor_ids,
+                )
+            except ModelEvidenceBudgetError as error:
+                if self._is_typed_prepared(prepared):
+                    stop = self._persist_model_preflight_stop(
+                        prepared=prepared,
+                        error=error,
+                    )
+                    self._model_preflight_stops[error.stage] = stop
+                raise
             evidence_envelope = envelope_result.envelope
             self._risk_evidence_envelope = evidence_envelope
         else:
@@ -762,6 +792,7 @@ class MilestoneTwoWorkflow:
         self._risk_assessment = None
         self._risk_grounding_report = None
         self._model_failures.clear()
+        self._model_preflight_stops.clear()
         self._human_reviewed_risk = None
         self._testability_evidence_envelope = None
         self._testability_draft = None
@@ -1394,6 +1425,35 @@ class MilestoneTwoWorkflow:
             },
             reason_code="risk_evidence_envelope_recorded",
         )
+
+    def _persist_model_preflight_stop(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        error: ModelEvidenceBudgetError,
+    ) -> ModelEvidencePreflightStop:
+        """Save one aggregate local stop without prompt or provider content."""
+        stop = ModelEvidencePreflightStop(
+            stage=error.stage,
+            snapshot_key=prepared.snapshot.snapshot_key,
+            context_sha256=prepared.context.context_sha256,
+            reason_code=error.reason_code,
+            request_body_bytes=error.request_body_bytes,
+            max_request_body_bytes=error.limit_bytes,
+            catalog_anchor_count=len(prepared.context.anchors),
+            observed_at=datetime.now(UTC),
+        )
+        self._persist_transition(
+            artifact_name=(f"artifacts/model_preflight_stops/{error.stage}.json"),
+            event_type=f"model_stage_{error.stage}_preflight_stopped",
+            payload=stop.model_dump(mode="json"),
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+            },
+            reason_code=stop.reason_code,
+        )
+        return stop
 
     def _persist_risk_generation(
         self,
@@ -2559,12 +2619,63 @@ class MilestoneTwoWorkflow:
         envelope_item = self._load_durable_artifact(
             "artifacts/model_evidence/risk_hypothesis.json"
         )
+        preflight_item = self._load_durable_artifact(
+            "artifacts/model_preflight_stops/risk_hypothesis.json"
+        )
         risk_item = self._load_durable_artifact(
             "artifacts/model_responses/risk_hypothesis.json"
         )
         failure_item = self._load_durable_artifact(
             "artifacts/model_failures/risk_hypothesis.json"
         )
+        if preflight_item is not None:
+            if any(
+                item is not None for item in (envelope_item, risk_item, failure_item)
+            ):
+                raise MilestoneTwoTransitionError(
+                    "The saved risk preflight stop conflicts with later model artifacts."
+                )
+            preflight_payload, _preflight_event = preflight_item
+            try:
+                stop = ModelEvidencePreflightStop.model_validate(preflight_payload)
+                if (
+                    stop.stage != "risk_hypothesis"
+                    or stop.snapshot_key != prepared.snapshot.snapshot_key
+                    or stop.context_sha256 != prepared.context.context_sha256
+                    or stop.max_request_body_bytes
+                    != self._settings.max_model_request_bytes
+                    or stop.catalog_anchor_count != len(prepared.context.anchors)
+                    or stop.observed_at.tzinfo is None
+                ):
+                    raise ValueError("preflight stop binding is invalid")
+                try:
+                    build_risk_evidence(
+                        snapshot=prepared.snapshot,
+                        diffs=prepared.diffs,
+                        context=prepared.context,
+                        budget=ProviderRequestBudget.from_settings(self._settings),
+                        priority_anchor_ids=self._refinement_priority_anchor_ids,
+                    )
+                except ModelEvidenceBudgetError as observed:
+                    if (
+                        observed.stage != stop.stage
+                        or observed.reason_code != stop.reason_code
+                        or observed.request_body_bytes != stop.request_body_bytes
+                        or observed.limit_bytes != stop.max_request_body_bytes
+                    ):
+                        raise ValueError(
+                            "preflight stop does not match deterministic selection"
+                        ) from observed
+                else:
+                    raise ValueError(
+                        "saved preflight stop no longer reproduces locally"
+                    )
+            except (TypeError, ValueError) as error:
+                raise MilestoneTwoTransitionError(
+                    "The saved risk preflight stop is not bound to prepared evidence."
+                ) from error
+            self._model_preflight_stops[stop.stage] = stop
+            return
         if envelope_item is None:
             if risk_item is not None or failure_item is not None:
                 raise MilestoneTwoTransitionError(

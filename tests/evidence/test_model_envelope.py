@@ -9,10 +9,59 @@ from triageguard.domain import ContextAnchor, ContextBundle, ContextScoreCompone
 from triageguard.evidence.model_envelope import (
     EvidenceArtifactBinding,
     ModelEvidenceEnvelope,
+    ModelEvidencePreflightStop,
     OmittedEvidenceAnchor,
     VisibleEvidenceAnchor,
 )
 from triageguard.provenance import canonical_sha256
+
+
+def test_preflight_stop_records_only_a_bound_local_budget_overflow() -> None:
+    """A pre-provider stop must bind its exact prepared evidence and byte policy."""
+    stop = ModelEvidencePreflightStop(
+        stage="risk_hypothesis",
+        snapshot_key="a" * 64,
+        context_sha256="b" * 64,
+        reason_code="model_request_too_large",
+        request_body_bytes=12_589,
+        max_request_body_bytes=7_000,
+        catalog_anchor_count=54,
+        observed_at="2026-08-17T17:30:00Z",
+    )
+
+    assert stop.request_body_bytes == 12_589
+    assert stop.max_request_body_bytes == 7_000
+    assert stop.catalog_anchor_count == 54
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("snapshot_key", "not-a-hash"),
+        ("reason_code", "groq_non_retryable_error"),
+        ("request_body_bytes", 7_000),
+        ("catalog_anchor_count", -1),
+    ],
+)
+def test_preflight_stop_rejects_unbound_or_nonoverflow_content(
+    field_name: str,
+    replacement: object,
+) -> None:
+    """Invalid local-stop provenance must fail before it can be persisted."""
+    payload = {
+        "stage": "risk_hypothesis",
+        "snapshot_key": "a" * 64,
+        "context_sha256": "b" * 64,
+        "reason_code": "model_request_too_large",
+        "request_body_bytes": 12_589,
+        "max_request_body_bytes": 7_000,
+        "catalog_anchor_count": 54,
+        "observed_at": "2026-08-17T17:30:00Z",
+    }
+    payload[field_name] = replacement
+
+    with pytest.raises(ValidationError):
+        ModelEvidencePreflightStop.model_validate(payload)
 
 
 def _anchor(
