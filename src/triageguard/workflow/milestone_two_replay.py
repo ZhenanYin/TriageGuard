@@ -18,6 +18,7 @@ from triageguard.analysis import (
 from triageguard.config import Settings
 from triageguard.domain import EnvironmentKind
 from triageguard.llm import ModelRequest, ModelResponse, ReplayGateway
+from triageguard.llm.gateway import prompt_sha256
 from triageguard.research import ArtifactRecorder
 from triageguard.sources.git import GitCommandRunner, GitObjectStore
 from triageguard.sources.github import GitHubClient
@@ -167,6 +168,9 @@ class _FixtureGitObjectStore(GitObjectStore):
 class _TemplateReplayGateway:
     """Bind replay templates to this exact workflow request before validation."""
 
+    provider = "replay"
+    model = "replay/openai-gpt-oss-120b"
+
     def __init__(
         self,
         *,
@@ -191,7 +195,7 @@ class _TemplateReplayGateway:
 
         return ReplayGateway(
             {request.purpose: template},
-            model="replay/openai-gpt-oss-120b",
+            model=self.model,
         ).generate(request)
 
     def _risk_template(self, request: ModelRequest) -> dict[str, object]:
@@ -372,6 +376,16 @@ class _OutcomeBoundGateway:
         self._gateway = gateway
         self._outcome = outcome
 
+    @property
+    def provider(self) -> str:
+        """Expose the identity of the wrapped replay provider."""
+        return self._gateway.provider
+
+    @property
+    def model(self) -> str:
+        """Expose the identity of the wrapped replay model."""
+        return self._gateway.model
+
     def generate(self, request: ModelRequest) -> ModelResponse:
         """Pass the normal request through with the fixture outcome annotation."""
         if request.purpose != "risk_hypothesis":
@@ -385,7 +399,8 @@ class _OutcomeBoundGateway:
                 }
             }
         )
-        return self._gateway.generate(replay_request)
+        response = self._gateway.generate(replay_request)
+        return response.model_copy(update={"prompt_sha256": prompt_sha256(request)})
 
 
 def _load_fixture_object(path: Path) -> dict[str, object]:

@@ -37,6 +37,14 @@ class _CountingGateway:
         self._response = response
         self.call_count = 0
 
+    @property
+    def provider(self) -> str:
+        return "replay"
+
+    @property
+    def model(self) -> str:
+        return "replay/openai-gpt-oss-120b"
+
     def generate(self, request: ModelRequest) -> ModelResponse:
         self.call_count += 1
         response = dict(self._response)
@@ -316,7 +324,7 @@ def test_resume_reuses_a_durable_risk_response_without_another_model_call(
         )
     )
     assert (
-        saved_response["draft"]["evidence_envelope_sha256"]
+        saved_response["response"]["data"]["evidence_envelope_sha256"]
         == (saved_envelope["envelope_sha256"])
     )
 
@@ -382,15 +390,19 @@ def test_risk_generation_failure_is_saved_and_survives_a_restart(tmp_path) -> No
 
     provenance = error.value.provenance
     assert provenance is not None
-    assert workflow.risk_failure == provenance
+    assert workflow.model_failure("risk_hypothesis") == provenance
     saved = json.loads(
         recorder.read_artifact(
             workflow.run_handle,
-            "artifacts/workflow/risk_generation_failure.json",
+            "artifacts/model_failures/risk_hypothesis.json",
         )
     )
-    assert saved["snapshot_key"] == snapshot.snapshot_key
-    assert saved["context_sha256"] == context.context_sha256
+    assert saved["stage"] == "risk_hypothesis"
+    assert saved["evidence_envelope_sha256"] == (
+        workflow.risk_evidence_envelope.envelope_sha256
+    )
+    assert saved["request_body_bytes"] > 0
+    assert saved["max_request_body_bytes"] == 7_000
     assert saved["failure"]["reason_code"] == "replay_response_missing"
     assert "no replay response" not in json.dumps(saved)
 
@@ -400,7 +412,7 @@ def test_risk_generation_failure_is_saved_and_survives_a_restart(tmp_path) -> No
     )
 
     assert resumed.risk_assessment is None
-    assert resumed.risk_failure == provenance
+    assert resumed.model_failure("risk_hypothesis") == provenance
 
 
 def test_nonrisk_terminal_measurements_bind_every_planned_stage(tmp_path) -> None:

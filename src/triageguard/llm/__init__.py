@@ -17,6 +17,7 @@ from triageguard.llm.request_budget import (
     groq_request_body,
     groq_request_body_bytes,
 )
+from triageguard.llm.stage_runner import ModelStageResult, ModelStageRunner
 
 __all__ = [
     "GroqStructuredGateway",
@@ -27,6 +28,8 @@ __all__ = [
     "ModelRequest",
     "ModelRequestTooLarge",
     "ModelResponse",
+    "ModelStageResult",
+    "ModelStageRunner",
     "ProviderRequestBudget",
     "ReplayGateway",
     "ReplayResponseMissing",

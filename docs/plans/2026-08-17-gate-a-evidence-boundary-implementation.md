@@ -51,7 +51,7 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 - [x] Task 5 — Migrate risk generation and validation to visible evidence
 - [x] Task 6 — Migrate testability and Gherkin to visible evidence
 - [x] Task 7 — Add bounded frozen-evidence refinement at model boundaries
-- [ ] Task 8 — Unify model-stage execution, failure provenance, and recovery
+- [x] Task 8 — Unify model-stage execution, failure provenance, and recovery
 - [ ] Task 9 — Update replay and UI behavior without weakening gates
 - [ ] Task 10 — Complete Gate A verification and record measurements
 

@@ -79,6 +79,14 @@ class _ContextBuilder:
 class _NoRiskGateway:
     """Return one bounded no-risk result bound to the request envelope."""
 
+    @property
+    def provider(self) -> str:
+        return "replay"
+
+    @property
+    def model(self) -> str:
+        return "replay/openai-gpt-oss-120b"
+
     def generate(self, request: ModelRequest) -> ModelResponse:
         snapshot_key = request.payload["snapshot_key"]
         context_sha256 = request.payload["context_sha256"]
@@ -651,6 +659,68 @@ def test_resume_rejects_a_tampered_risk_evidence_envelope(tmp_path) -> None:
     envelope_file.write_bytes(b'{"tampered": true}\n')
 
     with pytest.raises(MilestoneTwoTransitionError, match="does not match its journal"):
+        resume_milestone_two_workflow(
+            run_handle=workflow.run_handle,
+            dependencies=dependencies,
+        )
+
+
+def test_resume_rejects_a_risk_response_without_its_evidence_envelope(
+    tmp_path,
+) -> None:
+    """A durable response cannot be interpreted after its visibility record vanishes."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    diffs = (
+        _diff("author_diff", snapshot.merge_base_sha, snapshot.head_sha, "a" * 64),
+        _diff(
+            "integration_diff",
+            snapshot.base_sha,
+            snapshot.candidate_sha,
+            "b" * 64,
+        ),
+        _diff(
+            "base_drift_diff",
+            snapshot.merge_base_sha,
+            snapshot.base_sha,
+            "c" * 64,
+        ),
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    gateway = _NoRiskGateway()
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(snapshot),
+        diff_builder=_DiffBuilder(diffs),
+        context_builder=_ContextBuilder(context),
+        store=object(),
+        gateway=gateway,
+    )
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-missing-risk-envelope-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    workflow.prepare_pr("https://github.com/openmrs/openmrs-core/pull/900000002")
+    workflow.propose_risks()
+    envelope_path = (
+        recorder.locate_run(workflow.run_handle.run_id)
+        / "artifacts"
+        / "model_evidence"
+        / "risk_hypothesis.json"
+    )
+    envelope_path.unlink()
+
+    with pytest.raises(
+        MilestoneTwoTransitionError,
+        match="missing its evidence envelope",
+    ):
         resume_milestone_two_workflow(
             run_handle=workflow.run_handle,
             dependencies=dependencies,

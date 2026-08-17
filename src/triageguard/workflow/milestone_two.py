@@ -17,6 +17,7 @@ from triageguard.config import Settings
 from triageguard.contracts import (
     GherkinValidationReport,
     apply_gherkin_text_edit,
+    interpret_gherkin_response,
     validate_edited_gherkin,
     validate_gherkin_candidate,
 )
@@ -62,15 +63,22 @@ from triageguard.hypotheses import (
     build_risk_request,
     create_human_review,
     generate_risk_assessment,
+    interpret_risk_response,
     validate_risk_assessment,
 )
 from triageguard.llm import (
     ModelFailureProvenance,
     ModelGatewayError,
+    ModelRequest,
     ModelResponse,
+    ModelStageRunner,
     StructuredModelGateway,
 )
-from triageguard.llm.request_budget import ProviderRequestBudget
+from triageguard.llm.gateway import prompt_sha256, request_sha256
+from triageguard.llm.request_budget import (
+    ProviderRequestBudget,
+    groq_request_body_bytes,
+)
 from triageguard.provenance import canonical_json, canonical_sha256
 from triageguard.research import ArtifactRecorder, RunHandle, RunOwnership
 from triageguard.research.recorder import (
@@ -83,6 +91,7 @@ from triageguard.testability.generator import (
     build_testability_evidence,
     build_testability_request,
     generate_testability_assessment,
+    interpret_testability_response,
 )
 from triageguard.testability.validator import (
     validate_testability_assessment,
@@ -290,6 +299,11 @@ class MilestoneTwoWorkflow:
         self._context_builder = context_builder
         self._store = store
         self._gateway = gateway
+        self._model_stage_runner = ModelStageRunner(
+            recorder,
+            artifact_name=self._round_scoped_artifact_name,
+            request_model=settings.llm_model,
+        )
         if evidence_refiner is not None and not hasattr(evidence_refiner, "resolve"):
             self._evidence_refiner = FrozenEvidenceResolver(evidence_refiner)
         else:
@@ -311,7 +325,7 @@ class MilestoneTwoWorkflow:
         self._risk_response: ModelResponse | None = None
         self._risk_assessment: RiskAssessment | None = None
         self._risk_grounding_report: RiskGroundingReport | None = None
-        self._risk_failure: ModelFailureProvenance | None = None
+        self._model_failures: dict[str, ModelFailureProvenance] = {}
         self._freshness: SnapshotFreshness | None = None
         self._human_reviewed_risk: HumanReviewedRisk | None = None
         self._testability_draft: TestabilityAssessmentDraft | None = None
@@ -352,7 +366,17 @@ class MilestoneTwoWorkflow:
     @property
     def risk_failure(self) -> ModelFailureProvenance | None:
         """Return the latest safe model-failure provenance for a retryable stage."""
-        return self._risk_failure
+        return self.model_failure("risk_hypothesis")
+
+    def model_failure(self, stage: str) -> ModelFailureProvenance | None:
+        """Return safe failure provenance for one named model stage, if any."""
+        if stage not in {
+            "risk_hypothesis",
+            "testability_assessment",
+            "gherkin_generation",
+        }:
+            raise ValueError("unknown Milestone 2 model stage")
+        return self._model_failures.get(stage)
 
     @property
     def human_reviewed_risk(self) -> HumanReviewedRisk | None:
@@ -445,11 +469,6 @@ class MilestoneTwoWorkflow:
                 priority_anchor_ids=self._refinement_priority_anchor_ids,
             )
             evidence_envelope = envelope_result.envelope
-            if self._is_typed_prepared(prepared):
-                self._persist_risk_evidence_envelope(
-                    prepared=prepared,
-                    evidence_envelope=evidence_envelope,
-                )
             self._risk_evidence_envelope = evidence_envelope
         else:
             evidence_envelope = self._risk_evidence_envelope
@@ -466,27 +485,39 @@ class MilestoneTwoWorkflow:
                 )
         else:
             try:
-                draft, response = generate_risk_assessment(
-                    snapshot=prepared.snapshot,
-                    diffs=prepared.diffs,
-                    context=prepared.context,
-                    evidence_envelope=evidence_envelope,
-                    gateway=self._gateway,
-                )
+                if self._is_typed_prepared(prepared):
+                    request = build_risk_request(
+                        snapshot=prepared.snapshot,
+                        diffs=prepared.diffs,
+                        context=prepared.context,
+                        evidence_envelope=evidence_envelope,
+                    )
+                    result = self._model_stage_runner.run(
+                        run_handle=self._run_handle,
+                        envelope=evidence_envelope,
+                        request=request,
+                        gateway=self._gateway,
+                    )
+                    draft, response = interpret_risk_response(
+                        snapshot=prepared.snapshot,
+                        context=prepared.context,
+                        evidence_envelope=evidence_envelope,
+                        request=request,
+                        response=result.response,
+                    )
+                else:
+                    draft, response = generate_risk_assessment(
+                        snapshot=prepared.snapshot,
+                        diffs=prepared.diffs,
+                        context=prepared.context,
+                        evidence_envelope=evidence_envelope,
+                        gateway=self._gateway,
+                    )
             except ModelGatewayError as error:
                 if error.provenance is not None:
-                    self._record_risk_failure(
-                        prepared=prepared,
-                        failure=error.provenance,
-                    )
+                    self._model_failures["risk_hypothesis"] = error.provenance
                 raise
-            if self._is_typed_prepared(prepared):
-                self._persist_risk_generation(
-                    prepared=prepared,
-                    draft=draft,
-                    response=response,
-                )
-            self._risk_failure = None
+            self._model_failures.pop("risk_hypothesis", None)
 
         assessment, grounding_report = validate_risk_assessment(
             draft=draft,
@@ -587,22 +618,43 @@ class MilestoneTwoWorkflow:
                 budget=ProviderRequestBudget.from_settings(self._settings),
             )
             evidence_envelope = envelope_result.envelope
-            self._persist_testability_evidence_envelope(
-                prepared=prepared,
-                human_review=self._human_reviewed_risk,
-                evidence_envelope=evidence_envelope,
-            )
         else:
             evidence_envelope = object()
         self._testability_evidence_envelope = evidence_envelope
 
-        draft, response = generate_testability_assessment(
-            human_review=self._human_reviewed_risk,
-            context=prepared.context,
-            comparison_bindings=comparison_bindings,
-            evidence_envelope=evidence_envelope,
-            gateway=self._gateway,
-        )
+        try:
+            if self._is_typed_prepared(prepared):
+                request = build_testability_request(
+                    human_review=self._human_reviewed_risk,
+                    context=prepared.context,
+                    comparison_bindings=comparison_bindings,
+                    evidence_envelope=evidence_envelope,
+                )
+                result = self._model_stage_runner.run(
+                    run_handle=self._run_handle,
+                    envelope=evidence_envelope,
+                    request=request,
+                    gateway=self._gateway,
+                )
+                draft, response = interpret_testability_response(
+                    human_review=self._human_reviewed_risk,
+                    context=prepared.context,
+                    evidence_envelope=evidence_envelope,
+                    response=result.response,
+                )
+            else:
+                draft, response = generate_testability_assessment(
+                    human_review=self._human_reviewed_risk,
+                    context=prepared.context,
+                    comparison_bindings=comparison_bindings,
+                    evidence_envelope=evidence_envelope,
+                    gateway=self._gateway,
+                )
+        except ModelGatewayError as error:
+            if error.provenance is not None:
+                self._model_failures["testability_assessment"] = error.provenance
+            raise
+        self._model_failures.pop("testability_assessment", None)
         assessment, _report = validate_testability_assessment(
             draft=draft,
             human_review=self._human_reviewed_risk,
@@ -709,7 +761,7 @@ class MilestoneTwoWorkflow:
         self._risk_response = None
         self._risk_assessment = None
         self._risk_grounding_report = None
-        self._risk_failure = None
+        self._model_failures.clear()
         self._human_reviewed_risk = None
         self._testability_evidence_envelope = None
         self._testability_draft = None
@@ -860,24 +912,46 @@ class MilestoneTwoWorkflow:
                 budget=ProviderRequestBudget.from_settings(self._settings),
             )
             evidence_envelope = envelope_result.envelope
-            self._persist_gherkin_evidence_envelope(
-                prepared=prepared,
-                human_review=self._human_reviewed_risk,
-                testability_assessment=self._testability_assessment,
-                evidence_envelope=evidence_envelope,
-            )
         else:
             evidence_envelope = object()
         self._gherkin_evidence_envelope = evidence_envelope
 
-        candidate, response = request_gherkin_candidate(
-            human_review=self._human_reviewed_risk,
-            testability_assessment=self._testability_assessment,
-            context=prepared.context,
-            comparison_bindings=comparison_bindings,
-            evidence_envelope=evidence_envelope,
-            gateway=self._gateway,
-        )
+        try:
+            if self._is_typed_prepared(prepared):
+                request = build_gherkin_request(
+                    human_review=self._human_reviewed_risk,
+                    testability_assessment=self._testability_assessment,
+                    context=prepared.context,
+                    comparison_bindings=comparison_bindings,
+                    evidence_envelope=evidence_envelope,
+                )
+                result = self._model_stage_runner.run(
+                    run_handle=self._run_handle,
+                    envelope=evidence_envelope,
+                    request=request,
+                    gateway=self._gateway,
+                )
+                candidate, response = interpret_gherkin_response(
+                    human_review=self._human_reviewed_risk,
+                    testability_assessment=self._testability_assessment,
+                    context=prepared.context,
+                    evidence_envelope=evidence_envelope,
+                    response=result.response,
+                )
+            else:
+                candidate, response = request_gherkin_candidate(
+                    human_review=self._human_reviewed_risk,
+                    testability_assessment=self._testability_assessment,
+                    context=prepared.context,
+                    comparison_bindings=comparison_bindings,
+                    evidence_envelope=evidence_envelope,
+                    gateway=self._gateway,
+                )
+        except ModelGatewayError as error:
+            if error.provenance is not None:
+                self._model_failures["gherkin_generation"] = error.provenance
+            raise
+        self._model_failures.pop("gherkin_generation", None)
         generated_report = validate_gherkin_candidate(
             candidate=candidate,
             human_review=self._human_reviewed_risk,
@@ -1353,71 +1427,16 @@ class MilestoneTwoWorkflow:
             raise MilestoneTwoTransitionError(
                 "Risk response does not bind the selected evidence envelope."
             )
-        payload = {
-            "draft": draft.model_dump(mode="json"),
-            "response": response.model_dump(mode="json"),
-        }
-        self._persist_transition(
-            artifact_name="artifacts/model_responses/risk_hypothesis.json",
-            event_type="workflow_risk_generation",
-            payload=payload,
-            input_hashes={
-                "snapshot": prepared.snapshot.snapshot_key,
-                "context": prepared.context.context_sha256,
-                "evidence_envelope": draft.evidence_envelope_sha256,
-            },
-            reason_code="risk_response_recorded",
+        request = build_risk_request(
+            snapshot=prepared.snapshot,
+            diffs=prepared.diffs,
+            context=prepared.context,
+            evidence_envelope=self._risk_evidence_envelope,
         )
-
-    def _record_risk_failure(
-        self,
-        *,
-        prepared: PreparedPullRequest,
-        failure: ModelFailureProvenance,
-    ) -> None:
-        """Persist the first safe failure for this retryable model stage."""
-        if self._risk_failure is not None:
-            return
-        if self._is_typed_prepared(prepared):
-            self._persist_risk_failure(prepared=prepared, failure=failure)
-        self._risk_failure = failure
-
-    def _persist_risk_failure(
-        self,
-        *,
-        prepared: PreparedPullRequest,
-        failure: ModelFailureProvenance,
-    ) -> None:
-        """Save safe provider metadata without retaining request or error content."""
-        if failure.purpose != "risk_hypothesis":
-            raise MilestoneTwoTransitionError(
-                "Risk-failure provenance does not belong to the risk-proposal stage."
-            )
-        payload = {
-            "snapshot_key": prepared.snapshot.snapshot_key,
-            "context_sha256": prepared.context.context_sha256,
-            "evidence_envelope_sha256": (
-                self._risk_evidence_envelope.envelope_sha256
-                if self._risk_evidence_envelope is not None
-                else None
-            ),
-            "failure": failure.model_dump(mode="json"),
-        }
-        self._persist_transition(
-            artifact_name="artifacts/workflow/risk_generation_failure.json",
-            event_type="workflow_risk_generation_failure",
-            payload=payload,
-            input_hashes={
-                "snapshot": prepared.snapshot.snapshot_key,
-                "context": prepared.context.context_sha256,
-                "evidence_envelope": (
-                    self._risk_evidence_envelope.envelope_sha256
-                    if self._risk_evidence_envelope is not None
-                    else "0" * 64
-                ),
-                "request": failure.request_sha256,
-            },
-            reason_code=failure.reason_code,
+        self._persist_model_stage_response(
+            envelope=self._risk_evidence_envelope,
+            request=request,
+            response=response,
         )
 
     def _persist_human_review(
@@ -1511,10 +1530,21 @@ class MilestoneTwoWorkflow:
                 "frozen evidence."
             )
 
+        request = build_testability_request(
+            human_review=human_review,
+            context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=evidence_envelope,
+        )
+        self._persist_model_stage_response(
+            envelope=evidence_envelope,
+            request=request,
+            response=response,
+        )
+
         payload = {
             "draft": draft.model_dump(mode="json"),
             "assessment": assessment.model_dump(mode="json"),
-            "response": response.model_dump(mode="json"),
             "freshness": freshness.model_dump(mode="json"),
         }
         self._persist_transition(
@@ -1666,9 +1696,21 @@ class MilestoneTwoWorkflow:
                 "Generated Gherkin is not bound to the current reviewed evidence."
             )
 
+        request = build_gherkin_request(
+            human_review=human_review,
+            testability_assessment=testability_assessment,
+            context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=evidence_envelope,
+        )
+        self._persist_model_stage_response(
+            envelope=evidence_envelope,
+            request=request,
+            response=response,
+        )
+
         payload = {
             "candidate": candidate.model_dump(mode="json"),
-            "response": response.model_dump(mode="json"),
             "freshness": freshness.model_dump(mode="json"),
         }
         self._persist_transition(
@@ -1681,6 +1723,57 @@ class MilestoneTwoWorkflow:
                 "evidence_envelope": evidence_envelope.envelope_sha256,
             },
             reason_code="gherkin_response_recorded",
+        )
+
+    def _persist_model_stage_response(
+        self,
+        *,
+        envelope: ModelEvidenceEnvelope,
+        request: ModelRequest,
+        response: ModelResponse,
+    ) -> None:
+        """Persist the common raw response shape used by strict recovery."""
+        if (
+            request.purpose != envelope.stage
+            or response.provider != self._gateway.provider
+            or response.model != self._gateway.model
+            or response.prompt_sha256 != prompt_sha256(request)
+        ):
+            raise MilestoneTwoTransitionError(
+                "Model response provenance is not bound to its exact request."
+            )
+        request_body_bytes = groq_request_body_bytes(
+            request=request,
+            model=self._settings.llm_model,
+        )
+        payload = {
+            "stage": envelope.stage,
+            "evidence_envelope_sha256": envelope.envelope_sha256,
+            "request_sha256": request_sha256(request),
+            "request_body_bytes": request_body_bytes,
+            "max_request_body_bytes": envelope.max_request_body_bytes,
+            "response": response.model_dump(mode="json"),
+        }
+        artifact_name = f"artifacts/model_responses/{envelope.stage}.json"
+        existing = self._load_durable_artifact(artifact_name)
+        if existing is not None:
+            if existing[0] != payload:
+                raise MilestoneTwoTransitionError(
+                    "A saved model response conflicts with the exact request."
+                )
+            return
+        self._persist_transition(
+            artifact_name=artifact_name,
+            event_type=f"model_stage_{envelope.stage}_response_recorded",
+            payload=payload,
+            input_hashes={
+                "snapshot": envelope.snapshot_key,
+                "context": envelope.context_sha256,
+                "evidence_envelope": envelope.envelope_sha256,
+                "request": request_sha256(request),
+                "response": response.response_sha256,
+            },
+            reason_code="model_stage_response_recorded",
         )
 
     def _persist_gherkin_evidence_envelope(
@@ -1954,6 +2047,116 @@ class MilestoneTwoWorkflow:
                 "A durable workflow artifact must contain a JSON object."
             )
         return payload, transformation
+
+    def _load_model_stage_response(
+        self,
+        *,
+        stage: str,
+        envelope: ModelEvidenceEnvelope,
+        request: ModelRequest,
+    ) -> ModelResponse | None:
+        """Load one raw response only when every request binding still matches."""
+        item = self._load_durable_artifact(f"artifacts/model_responses/{stage}.json")
+        if item is None:
+            return None
+        payload, _event = item
+        try:
+            saved_stage = payload["stage"]
+            saved_envelope_sha256 = payload["evidence_envelope_sha256"]
+            saved_request_sha256 = payload["request_sha256"]
+            saved_request_body_bytes = payload["request_body_bytes"]
+            saved_max_request_body_bytes = payload["max_request_body_bytes"]
+            saved_response = payload["response"]
+            if (
+                not isinstance(saved_stage, str)
+                or not isinstance(saved_envelope_sha256, str)
+                or not isinstance(saved_request_sha256, str)
+                or type(saved_request_body_bytes) is not int
+                or type(saved_max_request_body_bytes) is not int
+                or not isinstance(saved_response, dict)
+            ):
+                raise TypeError("model-stage response structure is invalid")
+            response = ModelResponse.model_validate(saved_response)
+        except (KeyError, TypeError, ValueError) as error:
+            raise MilestoneTwoTransitionError(
+                f"The saved {stage} model response is invalid."
+            ) from error
+
+        expected_request_sha256 = request_sha256(request)
+        expected_request_body_bytes = groq_request_body_bytes(
+            request=request,
+            model=self._settings.llm_model,
+        )
+        if (
+            saved_stage != stage
+            or saved_envelope_sha256 != envelope.envelope_sha256
+            or saved_request_sha256 != expected_request_sha256
+            or saved_request_body_bytes != expected_request_body_bytes
+            or saved_max_request_body_bytes != envelope.max_request_body_bytes
+            or response.provider != self._gateway.provider
+            or response.model != self._gateway.model
+            or response.prompt_sha256 != prompt_sha256(request)
+        ):
+            raise MilestoneTwoTransitionError(
+                f"The saved {stage} response is not bound to its exact request."
+            )
+        return response
+
+    def _load_model_stage_failure(
+        self,
+        *,
+        stage: str,
+        envelope: ModelEvidenceEnvelope,
+        request: ModelRequest,
+    ) -> ModelFailureProvenance | None:
+        """Load safe failure provenance only when it binds the exact request."""
+        item = self._load_durable_artifact(f"artifacts/model_failures/{stage}.json")
+        if item is None:
+            return None
+        payload, _event = item
+        try:
+            saved_stage = payload["stage"]
+            saved_envelope_sha256 = payload["evidence_envelope_sha256"]
+            saved_request_sha256 = payload["request_sha256"]
+            saved_request_body_bytes = payload["request_body_bytes"]
+            saved_max_request_body_bytes = payload["max_request_body_bytes"]
+            saved_failure = payload["failure"]
+            if (
+                not isinstance(saved_stage, str)
+                or not isinstance(saved_envelope_sha256, str)
+                or not isinstance(saved_request_sha256, str)
+                or type(saved_request_body_bytes) is not int
+                or type(saved_max_request_body_bytes) is not int
+                or not isinstance(saved_failure, dict)
+            ):
+                raise TypeError("model-stage failure structure is invalid")
+            failure = ModelFailureProvenance.model_validate(saved_failure)
+        except (KeyError, TypeError, ValueError) as error:
+            raise MilestoneTwoTransitionError(
+                f"The saved {stage} model failure is invalid."
+            ) from error
+
+        expected_request_sha256 = request_sha256(request)
+        expected_request_body_bytes = groq_request_body_bytes(
+            request=request,
+            model=self._settings.llm_model,
+        )
+        if (
+            saved_stage != stage
+            or saved_envelope_sha256 != envelope.envelope_sha256
+            or saved_request_sha256 != expected_request_sha256
+            or saved_request_body_bytes != expected_request_body_bytes
+            or saved_max_request_body_bytes != envelope.max_request_body_bytes
+            or failure.provider != self._gateway.provider
+            or failure.model != self._gateway.model
+            or failure.purpose != stage
+            or failure.prompt_sha256 != prompt_sha256(request)
+            or failure.request_sha256 != expected_request_sha256
+        ):
+            raise MilestoneTwoTransitionError(
+                f"The saved {stage} failure is not bound to its exact request."
+            )
+        return failure
 
     def _round_scoped_artifact_name(self, artifact_name: str) -> str:
         """Keep each post-refinement analysis round in immutable distinct paths."""
@@ -2360,7 +2563,7 @@ class MilestoneTwoWorkflow:
             "artifacts/model_responses/risk_hypothesis.json"
         )
         failure_item = self._load_durable_artifact(
-            "artifacts/workflow/risk_generation_failure.json"
+            "artifacts/model_failures/risk_hypothesis.json"
         )
         if envelope_item is None:
             if risk_item is not None or failure_item is not None:
@@ -2372,7 +2575,7 @@ class MilestoneTwoWorkflow:
         envelope_payload, _envelope_event = envelope_item
         try:
             evidence_envelope = ModelEvidenceEnvelope.model_validate(envelope_payload)
-            build_risk_request(
+            risk_request = build_risk_request(
                 snapshot=prepared.snapshot,
                 diffs=prepared.diffs,
                 context=prepared.context,
@@ -2397,14 +2600,18 @@ class MilestoneTwoWorkflow:
                 return
             failure_payload, _failure_event = failure_item
             try:
-                saved_snapshot_key = failure_payload["snapshot_key"]
-                saved_context_sha256 = failure_payload["context_sha256"]
+                saved_stage = failure_payload["stage"]
                 saved_envelope_sha256 = failure_payload["evidence_envelope_sha256"]
+                saved_request_sha256 = failure_payload["request_sha256"]
+                saved_request_body_bytes = failure_payload["request_body_bytes"]
+                saved_max_request_body_bytes = failure_payload["max_request_body_bytes"]
                 saved_failure = failure_payload["failure"]
                 if (
-                    not isinstance(saved_snapshot_key, str)
-                    or not isinstance(saved_context_sha256, str)
+                    not isinstance(saved_stage, str)
                     or not isinstance(saved_envelope_sha256, str)
+                    or not isinstance(saved_request_sha256, str)
+                    or type(saved_request_body_bytes) is not int
+                    or type(saved_max_request_body_bytes) is not int
                     or not isinstance(saved_failure, dict)
                 ):
                     raise TypeError("risk-failure payload structure is invalid")
@@ -2415,34 +2622,68 @@ class MilestoneTwoWorkflow:
                 ) from error
 
             if (
-                saved_snapshot_key != prepared.snapshot.snapshot_key
-                or saved_context_sha256 != prepared.context.context_sha256
+                saved_stage != "risk_hypothesis"
                 or saved_envelope_sha256 != evidence_envelope.envelope_sha256
+                or saved_request_sha256 != request_sha256(risk_request)
+                or saved_request_body_bytes
+                != groq_request_body_bytes(
+                    request=risk_request,
+                    model=self._settings.llm_model,
+                )
+                or saved_max_request_body_bytes
+                != evidence_envelope.max_request_body_bytes
                 or failure.purpose != "risk_hypothesis"
+                or failure.request_sha256 != saved_request_sha256
             ):
                 raise MilestoneTwoTransitionError(
                     "The saved risk-failure provenance is not bound to prepared evidence."
                 )
-            self._risk_failure = failure
+            self._model_failures["risk_hypothesis"] = failure
             return
 
         risk_payload, _risk_event = risk_item
         try:
-            draft_payload = risk_payload["draft"]
+            saved_stage = risk_payload["stage"]
+            saved_envelope_sha256 = risk_payload["evidence_envelope_sha256"]
+            saved_request_sha256 = risk_payload["request_sha256"]
+            saved_request_body_bytes = risk_payload["request_body_bytes"]
+            saved_max_request_body_bytes = risk_payload["max_request_body_bytes"]
             response_payload = risk_payload["response"]
-            if not isinstance(draft_payload, dict) or not isinstance(
-                response_payload, dict
+            if (
+                not isinstance(saved_stage, str)
+                or not isinstance(saved_envelope_sha256, str)
+                or not isinstance(saved_request_sha256, str)
+                or type(saved_request_body_bytes) is not int
+                or type(saved_max_request_body_bytes) is not int
+                or not isinstance(response_payload, dict)
             ):
                 raise TypeError("risk payload structure is invalid")
-            draft = RiskAssessmentDraft.model_validate(draft_payload)
             response = ModelResponse.model_validate(response_payload)
+            draft, _ = interpret_risk_response(
+                snapshot=prepared.snapshot,
+                context=prepared.context,
+                evidence_envelope=evidence_envelope,
+                request=risk_request,
+                response=response,
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise MilestoneTwoTransitionError(
                 "The saved risk response is invalid."
             ) from error
 
         if (
-            draft.snapshot_key != prepared.snapshot.snapshot_key
+            saved_stage != "risk_hypothesis"
+            or saved_envelope_sha256 != evidence_envelope.envelope_sha256
+            or saved_request_sha256 != request_sha256(risk_request)
+            or saved_request_body_bytes
+            != groq_request_body_bytes(
+                request=risk_request,
+                model=self._settings.llm_model,
+            )
+            or saved_max_request_body_bytes != evidence_envelope.max_request_body_bytes
+            or response.provider != self._gateway.provider
+            or response.model != self._gateway.model
+            or draft.snapshot_key != prepared.snapshot.snapshot_key
             or draft.context_sha256 != prepared.context.context_sha256
             or draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256
             or response.data != draft.model_dump(mode="json")
@@ -2536,13 +2777,21 @@ class MilestoneTwoWorkflow:
         testability_item = self._load_durable_artifact(
             "artifacts/workflow/testability_assessment.json"
         )
+        testability_response_item = self._load_durable_artifact(
+            "artifacts/model_responses/testability_assessment.json"
+        )
+        testability_failure_item = self._load_durable_artifact(
+            "artifacts/model_failures/testability_assessment.json"
+        )
         if testability_envelope_item is None:
-            if testability_item is not None:
+            if (
+                testability_item is not None
+                or testability_response_item is not None
+                or testability_failure_item is not None
+            ):
                 raise MilestoneTwoTransitionError(
                     "The saved testability stage is missing its evidence envelope."
                 )
-            return
-        if testability_item is None:
             return
 
         testability_envelope_payload, _testability_envelope_event = (
@@ -2552,7 +2801,7 @@ class MilestoneTwoWorkflow:
             testability_envelope = ModelEvidenceEnvelope.model_validate(
                 testability_envelope_payload
             )
-            build_testability_request(
+            testability_request = build_testability_request(
                 human_review=review,
                 context=prepared.context,
                 comparison_bindings=self._comparison_bindings(prepared),
@@ -2569,16 +2818,33 @@ class MilestoneTwoWorkflow:
             ) from error
         self._testability_evidence_envelope = testability_envelope
 
+        testability_response = self._load_model_stage_response(
+            stage="testability_assessment",
+            envelope=testability_envelope,
+            request=testability_request,
+        )
+        testability_failure = self._load_model_stage_failure(
+            stage="testability_assessment",
+            envelope=testability_envelope,
+            request=testability_request,
+        )
+        if testability_item is None:
+            if testability_response is None and testability_failure is not None:
+                self._model_failures["testability_assessment"] = testability_failure
+            return
+        if testability_response is None:
+            raise MilestoneTwoTransitionError(
+                "The saved testability assessment is missing its model response."
+            )
+
         testability_payload, _testability_event = testability_item
         try:
             saved_draft = testability_payload["draft"]
             saved_assessment = testability_payload["assessment"]
-            saved_response = testability_payload["response"]
             saved_freshness = testability_payload["freshness"]
             if (
                 not isinstance(saved_draft, dict)
                 or not isinstance(saved_assessment, dict)
-                or not isinstance(saved_response, dict)
                 or not isinstance(saved_freshness, dict)
             ):
                 raise TypeError("testability payload structure is invalid")
@@ -2586,7 +2852,6 @@ class MilestoneTwoWorkflow:
             testability_assessment = TestabilityAssessment.model_validate(
                 saved_assessment
             )
-            testability_response = ModelResponse.model_validate(saved_response)
             testability_freshness = SnapshotFreshness.model_validate(saved_freshness)
         except (KeyError, TypeError, ValueError) as error:
             raise MilestoneTwoTransitionError(
@@ -2633,13 +2898,21 @@ class MilestoneTwoWorkflow:
         gherkin_item = self._load_durable_artifact(
             "artifacts/workflow/gherkin_generation.json"
         )
+        gherkin_response_item = self._load_durable_artifact(
+            "artifacts/model_responses/gherkin_generation.json"
+        )
+        gherkin_failure_item = self._load_durable_artifact(
+            "artifacts/model_failures/gherkin_generation.json"
+        )
         if gherkin_envelope_item is None:
-            if gherkin_item is not None:
+            if (
+                gherkin_item is not None
+                or gherkin_response_item is not None
+                or gherkin_failure_item is not None
+            ):
                 raise MilestoneTwoTransitionError(
                     "The saved Gherkin stage is missing its evidence envelope."
                 )
-            return
-        if gherkin_item is None:
             return
 
         gherkin_envelope_payload, _gherkin_envelope_event = gherkin_envelope_item
@@ -2647,7 +2920,7 @@ class MilestoneTwoWorkflow:
             gherkin_envelope = ModelEvidenceEnvelope.model_validate(
                 gherkin_envelope_payload
             )
-            build_gherkin_request(
+            gherkin_request = build_gherkin_request(
                 human_review=review,
                 testability_assessment=testability_assessment,
                 context=prepared.context,
@@ -2665,19 +2938,34 @@ class MilestoneTwoWorkflow:
             ) from error
         self._gherkin_evidence_envelope = gherkin_envelope
 
+        gherkin_response = self._load_model_stage_response(
+            stage="gherkin_generation",
+            envelope=gherkin_envelope,
+            request=gherkin_request,
+        )
+        gherkin_failure = self._load_model_stage_failure(
+            stage="gherkin_generation",
+            envelope=gherkin_envelope,
+            request=gherkin_request,
+        )
+        if gherkin_item is None:
+            if gherkin_response is None and gherkin_failure is not None:
+                self._model_failures["gherkin_generation"] = gherkin_failure
+            return
+        if gherkin_response is None:
+            raise MilestoneTwoTransitionError(
+                "The saved Gherkin candidate is missing its model response."
+            )
+
         gherkin_payload, _gherkin_event = gherkin_item
         try:
             saved_candidate = gherkin_payload["candidate"]
-            saved_response = gherkin_payload["response"]
             saved_freshness = gherkin_payload["freshness"]
-            if (
-                not isinstance(saved_candidate, dict)
-                or not isinstance(saved_response, dict)
-                or not isinstance(saved_freshness, dict)
+            if not isinstance(saved_candidate, dict) or not isinstance(
+                saved_freshness, dict
             ):
                 raise TypeError("Gherkin payload structure is invalid")
             candidate = GherkinCandidate.from_persisted(saved_candidate)
-            gherkin_response = ModelResponse.model_validate(saved_response)
             gherkin_freshness = SnapshotFreshness.model_validate(saved_freshness)
         except (KeyError, TypeError, ValueError) as error:
             raise MilestoneTwoTransitionError(

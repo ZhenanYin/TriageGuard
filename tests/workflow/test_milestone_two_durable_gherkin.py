@@ -12,6 +12,7 @@ from triageguard.contracts import (
     GherkinValidationReport,
     apply_gherkin_text_edit,
     build_gherkin_evidence,
+    build_gherkin_request,
 )
 from triageguard.domain import (
     ClaimEvidenceBinding,
@@ -44,16 +45,24 @@ from triageguard.domain import (
 from triageguard.evidence import EvidenceArtifactBinding
 from triageguard.hypotheses import (
     build_risk_evidence,
+    build_risk_request,
     create_human_review,
 )
 from triageguard.hypotheses import (
     validate_risk_assessment as _validate_risk_assessment,
 )
-from triageguard.llm import ModelAttempt, ModelResponse, ReplayGateway
+from triageguard.llm import (
+    ModelGatewayError,
+    ModelResponse,
+    ReplayGateway,
+)
 from triageguard.llm.request_budget import ProviderRequestBudget
 from triageguard.provenance import canonical_sha256
 from triageguard.research import ArtifactRecorder
-from triageguard.testability import build_testability_evidence
+from triageguard.testability import (
+    build_testability_evidence,
+    build_testability_request,
+)
 from triageguard.workflow import milestone_two
 from triageguard.workflow.milestone_two import (
     MilestoneTwoDependencies,
@@ -507,33 +516,72 @@ def _candidate(
     return GherkinCandidate.from_draft(draft)
 
 
-def _response() -> ModelResponse:
-    """Build recorder-ready provenance for one completed replayed model call."""
-    moment = datetime(2026, 8, 15, tzinfo=UTC)
-    return ModelResponse(
-        data={},
-        provider="replay",
-        model="replay/openai-gpt-oss-120b",
-        latency_ms=0,
-        prompt_sha256="d" * 64,
-        response_sha256="e" * 64,
-        input_tokens=0,
-        output_tokens=0,
-        attempts=(
-            ModelAttempt(
-                number=1,
-                started_at=moment,
-                finished_at=moment,
-                latency_ms=0,
-                outcome="succeeded",
-            ),
-        ),
+def _risk_response(
+    snapshot: PullRequestSnapshot,
+    context: ContextBundle,
+    draft: RiskAssessmentDraft,
+) -> ModelResponse:
+    request = build_risk_request(
+        snapshot=snapshot,
+        diffs=_diffs(snapshot),
+        context=context,
+        evidence_envelope=_risk_envelope(snapshot, context),
     )
+    return ReplayGateway({request.purpose: draft.model_dump(mode="json")}).generate(
+        request
+    )
+
+
+def _testability_response(
+    review: HumanReviewedRisk,
+    context: ContextBundle,
+    draft: RawTestabilityAssessment,
+) -> ModelResponse:
+    envelope = _testability_envelope(review, context)
+    request = build_testability_request(
+        human_review=review,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        evidence_envelope=envelope,
+    )
+    return ReplayGateway({request.purpose: draft.model_dump(mode="json")}).generate(
+        request
+    )
+
+
+def _gherkin_response(
+    review: HumanReviewedRisk,
+    testability_assessment: ValidatedTestabilityAssessment,
+    context: ContextBundle,
+    candidate: GherkinCandidate,
+) -> ModelResponse:
+    envelope = build_gherkin_evidence(
+        human_review=review,
+        testability_assessment=testability_assessment,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        budget=ProviderRequestBudget(
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            max_body_bytes=7_000,
+        ),
+    ).envelope
+    request = build_gherkin_request(
+        human_review=review,
+        testability_assessment=testability_assessment,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        evidence_envelope=envelope,
+    )
+    data = candidate.model_dump(
+        mode="json",
+        exclude={"approved_risk", "candidate_id"},
+    )
+    return ReplayGateway({request.purpose: data}).generate(request)
 
 
 def test_generated_gherkin_and_its_model_response_are_saved_before_review(
     tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A restart after generation must have the exact candidate response to reload."""
     snapshot = _snapshot()
@@ -541,10 +589,63 @@ def test_generated_gherkin_and_its_model_response_are_saved_before_review(
     review = _human_review(snapshot)
     candidate = _candidate(review, context)
     _, testability_assessment = _testability_draft_and_assessment(review, context)
-    response = _response()
+    response_data = candidate.model_dump(
+        mode="json",
+        exclude={"approved_risk", "candidate_id"},
+    )
     recorder = ArtifactRecorder(tmp_path)
     workflow = MilestoneTwoWorkflow(
         run_id="m2-durable-gherkin-run",
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(),
+        diff_builder=_UnusedDiffBuilder(),
+        context_builder=_UnusedContextBuilder(),
+        store=object(),
+        gateway=ReplayGateway({"gherkin_generation": response_data}),
+    )
+    workflow._prepared = PreparedPullRequest(
+        snapshot=snapshot,
+        diffs=_diffs(snapshot),
+        context=context,
+    )
+    workflow._human_reviewed_risk = review
+    workflow._testability_assessment = testability_assessment
+    workflow._state = milestone_two._State.TESTABILITY_READY
+
+    assert workflow.generate_gherkin() == candidate
+
+    stored = json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/workflow/gherkin_generation.json",
+        )
+    )
+    assert stored["candidate"] == candidate.model_dump(mode="json")
+    assert stored["freshness"]["status"] == "current"
+    assert json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/model_evidence/gherkin_generation.json",
+        )
+    ) == workflow.gherkin_evidence_envelope.model_dump(mode="json")
+    stage_response = json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/model_responses/gherkin_generation.json",
+        )
+    )
+    assert stage_response["response"]["data"] == response_data
+
+
+def test_testability_provider_failure_is_durable_and_retriable(tmp_path) -> None:
+    """Losing testability failure provenance would make the middle gate opaque."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    review = _human_review(snapshot)
+    recorder = ArtifactRecorder(tmp_path)
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-testability-failure-run",
         settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
         recorder=recorder,
         snapshot_acquirer=_SnapshotAcquirer(),
@@ -559,32 +660,70 @@ def test_generated_gherkin_and_its_model_response_are_saved_before_review(
         context=context,
     )
     workflow._human_reviewed_risk = review
-    workflow._testability_assessment = testability_assessment
+    workflow._state = milestone_two._State.RISK_APPROVED
+
+    with pytest.raises(ModelGatewayError) as error:
+        workflow.assess_testability()
+
+    provenance = error.value.provenance
+    assert provenance is not None
+    assert workflow.model_failure("testability_assessment") == provenance
+    saved = json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/model_failures/testability_assessment.json",
+        )
+    )
+    assert saved["stage"] == "testability_assessment"
+    assert saved["failure"]["purpose"] == "testability_assessment"
+    assert saved["request_body_bytes"] > 0
+    assert saved["max_request_body_bytes"] == 7_000
+    assert workflow.testability_assessment is None
+
+
+def test_gherkin_provider_failure_is_durable_and_retriable(tmp_path) -> None:
+    """Losing Gherkin failure provenance would make scenario retry unauditable."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    review = _human_review(snapshot)
+    _, assessment = _testability_draft_and_assessment(review, context)
+    recorder = ArtifactRecorder(tmp_path)
+    workflow = MilestoneTwoWorkflow(
+        run_id="m2-gherkin-failure-run",
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(),
+        diff_builder=_UnusedDiffBuilder(),
+        context_builder=_UnusedContextBuilder(),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    workflow._prepared = PreparedPullRequest(
+        snapshot=snapshot,
+        diffs=_diffs(snapshot),
+        context=context,
+    )
+    workflow._human_reviewed_risk = review
+    workflow._testability_assessment = assessment
     workflow._state = milestone_two._State.TESTABILITY_READY
 
-    monkeypatch.setattr(
-        milestone_two,
-        "request_gherkin_candidate",
-        lambda **_kwargs: (candidate, response),
-    )
+    with pytest.raises(ModelGatewayError) as error:
+        workflow.generate_gherkin()
 
-    assert workflow.generate_gherkin() == candidate
-
-    stored = json.loads(
+    provenance = error.value.provenance
+    assert provenance is not None
+    assert workflow.model_failure("gherkin_generation") == provenance
+    saved = json.loads(
         recorder.read_artifact(
             workflow.run_handle,
-            "artifacts/workflow/gherkin_generation.json",
+            "artifacts/model_failures/gherkin_generation.json",
         )
     )
-    assert stored["candidate"] == candidate.model_dump(mode="json")
-    assert stored["response"] == response.model_dump(mode="json")
-    assert stored["freshness"]["status"] == "current"
-    assert json.loads(
-        recorder.read_artifact(
-            workflow.run_handle,
-            "artifacts/model_evidence/gherkin_generation.json",
-        )
-    ) == workflow.gherkin_evidence_envelope.model_dump(mode="json")
+    assert saved["stage"] == "gherkin_generation"
+    assert saved["failure"]["purpose"] == "gherkin_generation"
+    assert saved["request_body_bytes"] > 0
+    assert saved["max_request_body_bytes"] == 7_000
+    assert workflow.gherkin_candidate is None
 
 
 def test_validated_gherkin_edit_is_saved_before_final_approval(
@@ -702,6 +841,217 @@ def _assessment(
     return assessment
 
 
+def _persist_reviewable_risk(
+    workflow: MilestoneTwoWorkflow,
+    prepared: PreparedPullRequest,
+) -> tuple[object, HumanReviewedRisk, SnapshotFreshness]:
+    """Persist the exact upstream chain needed by later recovery tests."""
+    snapshot = prepared.snapshot
+    context = prepared.context
+    draft = RiskAssessmentDraft(
+        snapshot_key=snapshot.snapshot_key,
+        context_sha256=context.context_sha256,
+        evidence_envelope_sha256=_risk_envelope(snapshot, context).envelope_sha256,
+        outcome="risks_proposed",
+        hypotheses=(_human_review(snapshot).reviewed_risk,),
+        generated_at=datetime(2026, 8, 15, tzinfo=UTC),
+    )
+    assessment, report = validate_risk_assessment(
+        draft=draft,
+        snapshot=snapshot,
+        context=context,
+    )
+    assert assessment is not None
+    assert report.approved is True
+    selected = assessment.hypotheses[0]
+    review = create_human_review(
+        assessment=assessment,
+        hypothesis_id=selected.hypothesis_id,
+        edits={},
+        selected_anchor_ids=selected.citation_anchor_ids,
+        reviewed_at=datetime(2026, 8, 15, tzinfo=UTC),
+    )
+    freshness = _SnapshotAcquirer().recheck(snapshot)
+    workflow._persist_prepared(prepared)
+    workflow._persist_risk_generation(
+        prepared=prepared,
+        draft=draft,
+        response=_risk_response(snapshot, context, draft),
+    )
+    workflow._persist_human_review(
+        prepared=prepared,
+        assessment=assessment,
+        review=review,
+        freshness=freshness,
+    )
+    return assessment, review, freshness
+
+
+def test_resume_restores_testability_failure_without_partial_assessment(
+    tmp_path,
+) -> None:
+    """Restart must retain a retryable middle-stage failure and no assessment."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    prepared = PreparedPullRequest(
+        snapshot=snapshot,
+        diffs=_diffs(snapshot),
+        context=context,
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(),
+        diff_builder=_UnusedDiffBuilder(),
+        context_builder=_UnusedContextBuilder(),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    first = MilestoneTwoWorkflow(
+        run_id="m2-testability-failure-recovery-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    assessment, review, _freshness = _persist_reviewable_risk(first, prepared)
+    first._prepared = prepared
+    first._risk_assessment = assessment
+    first._human_reviewed_risk = review
+    first._state = milestone_two._State.RISK_APPROVED
+
+    with pytest.raises(ModelGatewayError) as error:
+        first.assess_testability()
+
+    resumed = resume_milestone_two_workflow(
+        run_handle=first.run_handle,
+        dependencies=dependencies,
+    )
+
+    assert resumed.model_failure("testability_assessment") == error.value.provenance
+    assert resumed.testability_assessment is None
+    assert resumed.human_reviewed_risk == review
+
+
+def test_resume_restores_gherkin_failure_without_partial_candidate(tmp_path) -> None:
+    """Restart must retain a retryable final-stage failure and no candidate."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    prepared = PreparedPullRequest(
+        snapshot=snapshot,
+        diffs=_diffs(snapshot),
+        context=context,
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(),
+        diff_builder=_UnusedDiffBuilder(),
+        context_builder=_UnusedContextBuilder(),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    first = MilestoneTwoWorkflow(
+        run_id="m2-gherkin-failure-recovery-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    assessment, review, freshness = _persist_reviewable_risk(first, prepared)
+    draft, testability = _testability_draft_and_assessment(review, context)
+    first._persist_testability_assessment(
+        prepared=prepared,
+        human_review=review,
+        draft=draft,
+        assessment=testability,
+        response=_testability_response(review, context, draft),
+        freshness=freshness,
+    )
+    first._prepared = prepared
+    first._risk_assessment = assessment
+    first._human_reviewed_risk = review
+    first._testability_assessment = testability
+    first._state = milestone_two._State.TESTABILITY_READY
+
+    with pytest.raises(ModelGatewayError) as error:
+        first.generate_gherkin()
+
+    resumed = resume_milestone_two_workflow(
+        run_handle=first.run_handle,
+        dependencies=dependencies,
+    )
+
+    assert resumed.model_failure("gherkin_generation") == error.value.provenance
+    assert resumed.gherkin_candidate is None
+    assert resumed.testability_assessment == testability
+
+
+def test_resume_rejects_testability_assessment_without_raw_response(tmp_path) -> None:
+    """An interpreted assessment cannot outlive its exact provider response."""
+    snapshot = _snapshot()
+    context = _context(snapshot)
+    prepared = PreparedPullRequest(
+        snapshot=snapshot,
+        diffs=_diffs(snapshot),
+        context=context,
+    )
+    recorder = ArtifactRecorder(tmp_path)
+    dependencies = MilestoneTwoDependencies(
+        settings=Settings(environment_kind=EnvironmentKind.REAL_PR_ANALYSIS),
+        recorder=recorder,
+        snapshot_acquirer=_SnapshotAcquirer(),
+        diff_builder=_UnusedDiffBuilder(),
+        context_builder=_UnusedContextBuilder(),
+        store=object(),
+        gateway=ReplayGateway({}),
+    )
+    first = MilestoneTwoWorkflow(
+        run_id="m2-testability-missing-response-run",
+        settings=dependencies.settings,
+        recorder=dependencies.recorder,
+        snapshot_acquirer=dependencies.snapshot_acquirer,
+        diff_builder=dependencies.diff_builder,
+        context_builder=dependencies.context_builder,
+        store=dependencies.store,
+        gateway=dependencies.gateway,
+    )
+    _assessment_value, review, freshness = _persist_reviewable_risk(first, prepared)
+    draft, testability = _testability_draft_and_assessment(review, context)
+    first._persist_testability_assessment(
+        prepared=prepared,
+        human_review=review,
+        draft=draft,
+        assessment=testability,
+        response=_testability_response(review, context, draft),
+        freshness=freshness,
+    )
+    response_path = (
+        recorder.locate_run(first.run_handle.run_id)
+        / "artifacts"
+        / "model_responses"
+        / "testability_assessment.json"
+    )
+    response_path.unlink()
+
+    with pytest.raises(
+        milestone_two.MilestoneTwoTransitionError,
+        match="missing its model response",
+    ):
+        resume_milestone_two_workflow(
+            run_handle=first.run_handle,
+            dependencies=dependencies,
+        )
+
+
 def test_human_review_is_saved_before_gherkin_generation(tmp_path) -> None:
     """A restart after review must retain the reviewer-selected exact risk."""
     snapshot = _snapshot()
@@ -780,18 +1130,17 @@ def test_resume_restores_review_and_gherkin_without_another_model_call(
     )
     candidate = _candidate(review, context)
     freshness = _SnapshotAcquirer().recheck(snapshot)
-    risk_response = _response().model_copy(
-        update={"data": risk_draft.model_dump(mode="json")}
-    )
+    risk_response = _risk_response(snapshot, context, risk_draft)
     testability_draft, testability_assessment = _testability_draft_and_assessment(
         review,
         context,
     )
-    testability_response = _response().model_copy(
-        update={"data": testability_draft.model_dump(mode="json")}
-    )
-    gherkin_response = _response().model_copy(
-        update={"data": candidate.model_dump(mode="json")}
+    testability_response = _testability_response(review, context, testability_draft)
+    gherkin_response = _gherkin_response(
+        review,
+        testability_assessment,
+        context,
+        candidate,
     )
 
     recorder = ArtifactRecorder(tmp_path)
@@ -943,14 +1292,13 @@ def test_resume_restores_a_durable_validated_gherkin_edit(tmp_path) -> None:
         reason_codes=(),
     )
     freshness = _SnapshotAcquirer().recheck(snapshot)
-    risk_response = _response().model_copy(
-        update={"data": risk_draft.model_dump(mode="json")}
-    )
-    testability_response = _response().model_copy(
-        update={"data": testability_draft.model_dump(mode="json")}
-    )
-    gherkin_response = _response().model_copy(
-        update={"data": source_candidate.model_dump(mode="json")}
+    risk_response = _risk_response(snapshot, context, risk_draft)
+    testability_response = _testability_response(review, context, testability_draft)
+    gherkin_response = _gherkin_response(
+        review,
+        testability_assessment,
+        context,
+        source_candidate,
     )
 
     recorder = ArtifactRecorder(tmp_path)
@@ -1033,7 +1381,7 @@ def test_testability_assessment_is_saved_before_gherkin_generation(
     context = _context(snapshot)
     review = _human_review(snapshot)
     draft, assessment = _testability_draft_and_assessment(review, context)
-    response = _response().model_copy(update={"data": draft.model_dump(mode="json")})
+    response_data = draft.model_dump(mode="json")
     recorder = ArtifactRecorder(tmp_path)
     workflow = MilestoneTwoWorkflow(
         run_id="m2-durable-testability-run",
@@ -1043,7 +1391,7 @@ def test_testability_assessment_is_saved_before_gherkin_generation(
         diff_builder=_UnusedDiffBuilder(),
         context_builder=_UnusedContextBuilder(),
         store=object(),
-        gateway=ReplayGateway({}),
+        gateway=ReplayGateway({"testability_assessment": response_data}),
     )
     workflow._prepared = PreparedPullRequest(
         snapshot=snapshot,
@@ -1053,11 +1401,6 @@ def test_testability_assessment_is_saved_before_gherkin_generation(
     workflow._human_reviewed_risk = review
     workflow._state = milestone_two._State.RISK_APPROVED
 
-    monkeypatch.setattr(
-        milestone_two,
-        "generate_testability_assessment",
-        lambda **_kwargs: (draft, response),
-    )
     monkeypatch.setattr(
         milestone_two,
         "validate_testability_assessment",
@@ -1074,7 +1417,6 @@ def test_testability_assessment_is_saved_before_gherkin_generation(
     )
     assert stored["draft"] == draft.model_dump(mode="json")
     assert stored["assessment"] == assessment.model_dump(mode="json")
-    assert stored["response"] == response.model_dump(mode="json")
     assert stored["freshness"]["status"] == "current"
     assert json.loads(
         recorder.read_artifact(
@@ -1082,6 +1424,13 @@ def test_testability_assessment_is_saved_before_gherkin_generation(
             "artifacts/model_evidence/testability_assessment.json",
         )
     ) == workflow.testability_evidence_envelope.model_dump(mode="json")
+    stage_response = json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/model_responses/testability_assessment.json",
+        )
+    )
+    assert stage_response["response"]["data"] == response_data
 
 
 def test_resume_restores_the_durable_testability_assessment(tmp_path) -> None:
@@ -1122,12 +1471,8 @@ def test_resume_restores_the_durable_testability_assessment(tmp_path) -> None:
         context,
     )
     freshness = _SnapshotAcquirer().recheck(snapshot)
-    risk_response = _response().model_copy(
-        update={"data": risk_draft.model_dump(mode="json")}
-    )
-    testability_response = _response().model_copy(
-        update={"data": testability_draft.model_dump(mode="json")}
-    )
+    risk_response = _risk_response(snapshot, context, risk_draft)
+    testability_response = _testability_response(review, context, testability_draft)
 
     recorder = ArtifactRecorder(tmp_path)
     dependencies = MilestoneTwoDependencies(
@@ -1255,9 +1600,7 @@ def test_resume_restores_an_exhausted_frozen_evidence_search(tmp_path) -> None:
     first._persist_risk_generation(
         prepared=prepared,
         draft=risk_draft,
-        response=_response().model_copy(
-            update={"data": risk_draft.model_dump(mode="json")}
-        ),
+        response=_risk_response(snapshot, context, risk_draft),
     )
     first._persist_human_review(
         prepared=prepared,
@@ -1270,9 +1613,7 @@ def test_resume_restores_an_exhausted_frozen_evidence_search(tmp_path) -> None:
         human_review=review,
         draft=testability_draft,
         assessment=testability_assessment,
-        response=_response().model_copy(
-            update={"data": testability_draft.model_dump(mode="json")}
-        ),
+        response=_testability_response(review, context, testability_draft),
         freshness=freshness,
     )
     first._persist_evidence_refinement(
@@ -1360,9 +1701,7 @@ def test_resume_restores_a_gherkin_edit_that_needs_frozen_evidence(
     first._persist_risk_generation(
         prepared=prepared,
         draft=risk_draft,
-        response=_response().model_copy(
-            update={"data": risk_draft.model_dump(mode="json")}
-        ),
+        response=_risk_response(snapshot, context, risk_draft),
     )
     first._persist_human_review(
         prepared=prepared,
@@ -1375,9 +1714,7 @@ def test_resume_restores_a_gherkin_edit_that_needs_frozen_evidence(
         human_review=review,
         draft=testability_draft,
         assessment=testability_assessment,
-        response=_response().model_copy(
-            update={"data": testability_draft.model_dump(mode="json")}
-        ),
+        response=_testability_response(review, context, testability_draft),
         freshness=freshness,
     )
     first._persist_gherkin_generation(
@@ -1385,8 +1722,11 @@ def test_resume_restores_a_gherkin_edit_that_needs_frozen_evidence(
         human_review=review,
         testability_assessment=testability_assessment,
         candidate=candidate,
-        response=_response().model_copy(
-            update={"data": candidate.model_dump(mode="json")}
+        response=_gherkin_response(
+            review,
+            testability_assessment,
+            context,
+            candidate,
         ),
         freshness=freshness,
     )

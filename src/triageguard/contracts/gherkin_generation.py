@@ -288,6 +288,29 @@ def generate_gherkin(
         evidence_envelope=evidence_envelope,
     )
     response = gateway.generate(request)
+    return interpret_gherkin_response(
+        human_review=reviewed,
+        testability_assessment=testability_assessment,
+        context=frozen_context,
+        evidence_envelope=evidence_envelope,
+        response=response,
+    )
+
+
+def interpret_gherkin_response(
+    *,
+    human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
+    context: ContextBundle,
+    evidence_envelope: ModelEvidenceEnvelope,
+    response: ModelResponse,
+) -> tuple[GherkinCandidate, ModelResponse]:
+    """Interpret one already durable response without invoking a provider."""
+    reviewed, _, frozen_context = _validate_gherkin_request_inputs(
+        human_review=human_review,
+        testability_assessment=testability_assessment,
+        context=context,
+    )
 
     try:
         draft = GherkinCandidateDraft.model_validate(

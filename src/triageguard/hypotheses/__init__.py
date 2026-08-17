@@ -6,6 +6,7 @@ from triageguard.hypotheses.generator import (
     build_risk_evidence,
     build_risk_request,
     generate_risk_assessment,
+    interpret_risk_response,
 )
 from triageguard.hypotheses.validator import (
     RiskGroundingReport,
@@ -21,5 +22,6 @@ __all__ = [
     "build_risk_request",
     "create_human_review",
     "generate_risk_assessment",
+    "interpret_risk_response",
     "validate_risk_assessment",
 ]

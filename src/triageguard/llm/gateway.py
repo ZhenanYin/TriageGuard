@@ -88,6 +88,12 @@ class ModelResponse(BaseModel):
 class StructuredModelGateway(Protocol):
     """Boundary implemented by explicit live and deterministic replay gateways."""
 
+    @property
+    def provider(self) -> str: ...
+
+    @property
+    def model(self) -> str: ...
+
     def generate(self, request: ModelRequest) -> ModelResponse: ...
 
 

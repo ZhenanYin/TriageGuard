@@ -4,6 +4,7 @@ from triageguard.testability.generator import (
     build_testability_evidence,
     build_testability_request,
     generate_testability_assessment,
+    interpret_testability_response,
 )
 from triageguard.testability.validator import (
     TestabilityValidationReport,
@@ -15,5 +16,6 @@ __all__ = [
     "build_testability_evidence",
     "build_testability_request",
     "generate_testability_assessment",
+    "interpret_testability_response",
     "validate_testability_assessment",
 ]

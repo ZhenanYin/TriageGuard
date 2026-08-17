@@ -212,6 +212,26 @@ def generate_testability_assessment(
         evidence_envelope=evidence_envelope,
     )
     response = gateway.generate(request)
+    return interpret_testability_response(
+        human_review=reviewed,
+        context=frozen_context,
+        evidence_envelope=evidence_envelope,
+        response=response,
+    )
+
+
+def interpret_testability_response(
+    *,
+    human_review: HumanReviewedRisk,
+    context: ContextBundle,
+    evidence_envelope: ModelEvidenceEnvelope,
+    response: ModelResponse,
+) -> tuple[TestabilityAssessmentDraft, ModelResponse]:
+    """Interpret one already durable response without invoking a provider."""
+    reviewed, frozen_context = _validate_inputs(
+        human_review=human_review,
+        context=context,
+    )
 
     try:
         assessment = TestabilityAssessmentDraft.model_validate(response.data)

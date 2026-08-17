@@ -266,6 +266,24 @@ def generate_risk_assessment(
         evidence_envelope=evidence_envelope,
     )
     response = gateway.generate(request)
+    return interpret_risk_response(
+        snapshot=snapshot,
+        context=context,
+        evidence_envelope=evidence_envelope,
+        request=request,
+        response=response,
+    )
+
+
+def interpret_risk_response(
+    *,
+    snapshot: PullRequestSnapshot,
+    context: ContextBundle,
+    evidence_envelope: ModelEvidenceEnvelope,
+    request: ModelRequest,
+    response: ModelResponse,
+) -> tuple[RiskAssessmentDraft, ModelResponse]:
+    """Interpret one already durable response without invoking a provider."""
 
     try:
         assessment = RiskAssessmentDraft.model_validate(response.data)
