@@ -18,27 +18,37 @@ from triageguard.domain.pr_analysis import (
     HumanReviewedRisk,
     TestabilityAssessment,
 )
+from triageguard.evidence import (
+    EnvelopeBuildResult,
+    EvidenceArtifactBinding,
+    EvidenceEnvelopeBuilder,
+    ModelEvidenceEnvelope,
+    validate_envelope_binding,
+)
 from triageguard.llm.gateway import (
     ModelOutputInvalid,
     ModelRequest,
     ModelResponse,
     StructuredModelGateway,
 )
+from triageguard.llm.request_budget import ProviderRequestBudget
 from triageguard.provenance import canonical_sha256
 
 GHERKIN_SYSTEM_PROMPT = (
-    "Convert the approved unconfirmed OpenMRS security-risk hypothesis into one "
-    "observable Gherkin scenario. Preserve the approved actor, preconditions, "
-    "action, expected secure behavior, possible failure oracle, observables, "
-    "evidence terms, risk hash, and snapshot key. Return no Python, "
-    "implementation code, CVSS score, or claim that a vulnerability exists."
+    "Write one evidence-bound Gherkin scenario for the supplied unconfirmed "
+    "OpenMRS risk. Preserve risk fields. No code, CVSS, vulnerability, or safety "
+    "claims."
 )
 
 
-def _strict_schema(value: object) -> object:
+def _strict_schema(value: object, *, property_map: bool = False) -> object:
     """Require every declared field and forbid extras in every schema object."""
     if isinstance(value, dict):
-        strict_value = {key: _strict_schema(item) for key, item in value.items()}
+        strict_value = {
+            key: _strict_schema(item, property_map=key == "properties")
+            for key, item in value.items()
+            if property_map or key not in {"description", "title"}
+        }
         properties = strict_value.get("properties")
         if strict_value.get("type") == "object" and isinstance(properties, dict):
             strict_value["additionalProperties"] = False
@@ -52,6 +62,19 @@ def _strict_schema(value: object) -> object:
 _raw_output_schema = _strict_schema(GherkinCandidateDraft.model_json_schema())
 if not isinstance(_raw_output_schema, dict):
     raise TypeError("Gherkin output schema must be a JSON object")
+_schema_properties = _raw_output_schema.get("properties")
+_schema_required = _raw_output_schema.get("required")
+_schema_defs = _raw_output_schema.get("$defs")
+if (
+    not isinstance(_schema_properties, dict)
+    or not isinstance(_schema_required, list)
+    or not isinstance(_schema_defs, dict)
+):
+    raise TypeError("Gherkin output schema has an invalid object structure")
+_schema_properties.pop("approved_risk", None)
+_schema_required[:] = [name for name in _schema_required if name != "approved_risk"]
+_schema_defs.pop("ClaimEvidenceBinding", None)
+_schema_defs.pop("RiskHypothesisDraft", None)
 
 GHERKIN_OUTPUT_SCHEMA: dict[str, Any] = _raw_output_schema
 
@@ -135,6 +158,8 @@ def build_gherkin_request(
     human_review: HumanReviewedRisk,
     testability_assessment: TestabilityAssessment,
     context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    evidence_envelope: ModelEvidenceEnvelope,
 ) -> ModelRequest:
     """Build one strict Gherkin request after local frozen-evidence approval."""
     reviewed, testability, frozen_context = _validate_gherkin_request_inputs(
@@ -143,40 +168,100 @@ def build_gherkin_request(
         context=context,
     )
 
-    approved_risk = reviewed.reviewed_risk.model_dump(mode="json")
+    normalized_envelope = validate_envelope_binding(
+        envelope=evidence_envelope,
+        stage="gherkin_generation",
+        context=frozen_context,
+        comparison_bindings=comparison_bindings,
+        input_bindings=_gherkin_input_bindings(reviewed, testability),
+        output_schema_sha256=canonical_sha256(GHERKIN_OUTPUT_SCHEMA),
+    )
+    return _gherkin_request(
+        human_review=reviewed,
+        testability_assessment=testability,
+        evidence_envelope=normalized_envelope,
+    )
 
+
+def _gherkin_input_bindings(
+    human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
+) -> tuple[EvidenceArtifactBinding, ...]:
+    return (
+        EvidenceArtifactBinding(
+            name="human_reviewed_risk",
+            sha256=human_review.reviewed_content_sha256,
+        ),
+        EvidenceArtifactBinding(
+            name="testability_assessment",
+            sha256=testability_assessment.assessment_sha256,
+        ),
+    )
+
+
+def _gherkin_request(
+    *,
+    human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
+    evidence_envelope: ModelEvidenceEnvelope,
+) -> ModelRequest:
     return ModelRequest(
         purpose="gherkin_generation",
         system_prompt=GHERKIN_SYSTEM_PROMPT,
         payload={
-            "snapshot_key": reviewed.snapshot_key,
-            "reviewed_risk_sha256": reviewed.reviewed_content_sha256,
-            "testability_assessment_sha256": testability.assessment_sha256,
-            "context_sha256": frozen_context.context_sha256,
-            "approved_risk": approved_risk,
-            "context_anchors": [
-                anchor.model_dump(mode="json") for anchor in frozen_context.anchors
-            ],
+            "snapshot_key": human_review.snapshot_key,
+            "reviewed_risk_sha256": human_review.reviewed_content_sha256,
+            "testability_assessment_sha256": (testability_assessment.assessment_sha256),
+            "approved_risk": human_review.reviewed_risk.model_dump(mode="json"),
+            "evidence_envelope": evidence_envelope.model_dump(mode="json"),
             "output_rules": {
-                "scenario_count": 1,
-                "feature_count": 1,
-                "citation_rule": (
-                    "Use only the approved-risk terms and the supplied frozen "
-                    "context anchors."
-                ),
-                "testability_rule": (
-                    "The scenario must remain within the locally approved setup, "
-                    "action, and observable evidence roles."
-                ),
-                "prohibited_content": [
-                    "Python or implementation code",
-                    "CVSS scores",
-                    "claims that a vulnerability exists",
-                ],
+                "rule": "Cite visible anchors only and echo the envelope hash.",
             },
         },
         output_schema=GHERKIN_OUTPUT_SCHEMA,
         max_output_tokens=2048,
+    )
+
+
+def build_gherkin_evidence(
+    *,
+    human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
+    context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    budget: ProviderRequestBudget,
+) -> EnvelopeBuildResult:
+    """Select every reviewed and testability-bound anchor as whole evidence."""
+    reviewed, testability, frozen_context = _validate_gherkin_request_inputs(
+        human_review=human_review,
+        testability_assessment=testability_assessment,
+        context=context,
+    )
+    required_anchor_ids = tuple(
+        dict.fromkeys(
+            (
+                *reviewed.reviewed_risk.citation_anchor_ids,
+                *(
+                    anchor_id
+                    for binding in testability.bindings
+                    for anchor_id in binding.anchor_ids
+                ),
+            )
+        )
+    )
+    return EvidenceEnvelopeBuilder().build(
+        stage="gherkin_generation",
+        context=frozen_context,
+        comparison_bindings=comparison_bindings,
+        input_bindings=_gherkin_input_bindings(reviewed, testability),
+        required_anchor_ids=required_anchor_ids,
+        priority_terms=reviewed.reviewed_risk.code_identifiers,
+        budget=budget,
+        request_factory=lambda envelope: _gherkin_request(
+            human_review=reviewed,
+            testability_assessment=testability,
+            evidence_envelope=envelope,
+        ),
     )
 
 
@@ -185,6 +270,8 @@ def generate_gherkin(
     human_review: HumanReviewedRisk,
     testability_assessment: TestabilityAssessment,
     context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    evidence_envelope: ModelEvidenceEnvelope,
     gateway: StructuredModelGateway,
 ) -> tuple[GherkinCandidate, ModelResponse]:
     """Generate one scenario only after local frozen-evidence testability approval."""
@@ -197,11 +284,18 @@ def generate_gherkin(
         human_review=reviewed,
         testability_assessment=testability_assessment,
         context=context,
+        comparison_bindings=comparison_bindings,
+        evidence_envelope=evidence_envelope,
     )
     response = gateway.generate(request)
 
     try:
-        draft = GherkinCandidateDraft.model_validate(response.data)
+        draft = GherkinCandidateDraft.model_validate(
+            {
+                **response.data,
+                "approved_risk": reviewed.reviewed_risk.model_dump(mode="json"),
+            }
+        )
     except ValidationError as error:
         raise ModelOutputInvalid(
             "model response does not form a coherent Gherkin candidate draft"
@@ -218,6 +312,10 @@ def generate_gherkin(
     if draft.reviewed_risk_sha256 != reviewed.reviewed_content_sha256:
         raise ModelOutputInvalid(
             "model response reviewed-risk hash does not match the human review"
+        )
+    if draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256:
+        raise ModelOutputInvalid(
+            "model response evidence envelope hash does not match the request"
         )
     if draft.approved_risk != reviewed.reviewed_risk:
         raise ModelOutputInvalid(
@@ -367,7 +465,10 @@ def validate_edited_gherkin(
     candidate: GherkinCandidate,
     text: str,
     human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
     context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    evidence_envelope: ModelEvidenceEnvelope,
 ) -> GherkinValidationReport:
     """Classify one edited scenario against its current frozen evidence context."""
     reason_codes: list[str] = []
@@ -385,8 +486,32 @@ def validate_edited_gherkin(
     ):
         _add_reason(reason_codes, "candidate_context_mismatch")
 
+    visible_envelope: ModelEvidenceEnvelope | None = None
     if frozen_context is not None:
-        anchors_by_id = {anchor.anchor_id: anchor for anchor in frozen_context.anchors}
+        try:
+            visible_envelope = validate_envelope_binding(
+                envelope=evidence_envelope,
+                stage="gherkin_generation",
+                context=frozen_context,
+                comparison_bindings=comparison_bindings,
+                input_bindings=_gherkin_input_bindings(
+                    human_review,
+                    testability_assessment,
+                ),
+                output_schema_sha256=canonical_sha256(GHERKIN_OUTPUT_SCHEMA),
+            )
+        except (TypeError, ValueError):
+            _add_reason(reason_codes, "invalid_gherkin_evidence_envelope")
+    if (
+        visible_envelope is not None
+        and candidate.evidence_envelope_sha256 != visible_envelope.envelope_sha256
+    ):
+        _add_reason(reason_codes, "candidate_evidence_envelope_mismatch")
+
+    if visible_envelope is not None:
+        anchors_by_id = {
+            anchor.anchor_id: anchor for anchor in visible_envelope.visible_anchors
+        }
         evidence_anchor_ids = tuple(
             anchor_id
             for binding in candidate.step_evidence_bindings
@@ -422,11 +547,11 @@ def validate_edited_gherkin(
     if _PROHIBITED_GHERKIN_CONTENT.search(text):
         _add_reason(reason_codes, "gherkin_text_contains_implementation_code")
 
-    if frozen_context is not None:
+    if visible_envelope is not None:
         known_identifiers = _code_shaped_identifiers(candidate.gherkin_text)
         known_identifiers.update(human_review.reviewed_risk.code_identifiers)
-        for anchor in frozen_context.anchors:
-            known_identifiers.update(_code_shaped_identifiers(anchor.text))
+        for anchor in visible_envelope.visible_anchors:
+            known_identifiers.update(_code_shaped_identifiers(anchor.visible_text))
 
         introduced_identifiers = _code_shaped_identifiers(text) - known_identifiers
         if introduced_identifiers:
@@ -448,14 +573,20 @@ def validate_gherkin_candidate(
     *,
     candidate: GherkinCandidate,
     human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
     context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    evidence_envelope: ModelEvidenceEnvelope,
 ) -> GherkinValidationReport:
     """Validate the candidate's current text against its frozen evidence."""
     return validate_edited_gherkin(
         candidate=candidate,
         text=candidate.gherkin_text,
         human_review=human_review,
+        testability_assessment=testability_assessment,
         context=context,
+        comparison_bindings=comparison_bindings,
+        evidence_envelope=evidence_envelope,
     )
 
 
@@ -464,14 +595,20 @@ def apply_gherkin_text_edit(
     candidate: GherkinCandidate,
     text: str,
     human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
     context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    evidence_envelope: ModelEvidenceEnvelope,
 ) -> GherkinCandidate:
     """Create a new candidate after a structure-preserving human text edit."""
     original_validation = validate_edited_gherkin(
         candidate=candidate,
         text=text,
         human_review=human_review,
+        testability_assessment=testability_assessment,
         context=context,
+        comparison_bindings=comparison_bindings,
+        evidence_envelope=evidence_envelope,
     )
     if not original_validation.approved:
         raise GherkinGenerationError(", ".join(original_validation.reason_codes))
@@ -524,7 +661,10 @@ def approve_gherkin(
     *,
     candidate: GherkinCandidate,
     human_review: HumanReviewedRisk,
+    testability_assessment: TestabilityAssessment,
     context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    evidence_envelope: ModelEvidenceEnvelope,
     approved_at: datetime,
 ) -> GherkinApproval:
     """Approve only a locally valid candidate tied to this human review."""
@@ -532,7 +672,10 @@ def approve_gherkin(
         candidate=candidate,
         text=candidate.gherkin_text,
         human_review=human_review,
+        testability_assessment=testability_assessment,
         context=context,
+        comparison_bindings=comparison_bindings,
+        evidence_envelope=evidence_envelope,
     )
     if not validation.approved:
         raise GherkinGenerationError(", ".join(validation.reason_codes))

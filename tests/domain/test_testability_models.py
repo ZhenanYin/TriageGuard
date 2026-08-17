@@ -30,6 +30,7 @@ def _testable_values() -> dict[str, object]:
         "snapshot_key": SNAPSHOT_KEY,
         "context_sha256": CONTEXT_SHA256,
         "reviewed_risk_sha256": REVIEWED_RISK_SHA256,
+        "evidence_envelope_sha256": "e" * 64,
         "decision": "testable_from_frozen_evidence",
         "bindings": (
             Binding(

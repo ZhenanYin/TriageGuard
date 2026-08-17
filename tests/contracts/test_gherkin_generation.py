@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from triageguard.contracts import gherkin_generation
 from triageguard.contracts.gherkin_generation import (
     GherkinGenerationError,
     apply_gherkin_text_edit,
@@ -30,6 +31,8 @@ from triageguard.domain.pr_analysis import (
 from triageguard.domain.pr_analysis import (
     TestabilityBinding as FrozenTestabilityBinding,
 )
+from triageguard.evidence import EvidenceArtifactBinding, ModelEvidenceBudgetError
+from triageguard.llm import ProviderRequestBudget
 from triageguard.llm.replay_gateway import ReplayGateway
 from triageguard.provenance import canonical_sha256
 
@@ -114,6 +117,14 @@ def _human_review() -> HumanReviewedRisk:
     )
 
 
+def _comparison_bindings() -> tuple[EvidenceArtifactBinding, ...]:
+    return (
+        EvidenceArtifactBinding(name="author_diff", sha256="1" * 64),
+        EvidenceArtifactBinding(name="integration_diff", sha256="2" * 64),
+        EvidenceArtifactBinding(name="base_drift_diff", sha256="3" * 64),
+    )
+
+
 def _context() -> ContextBundle:
     """Return saved integration-change evidence for the approved risk."""
     text = "void purgePatient(Patient patient) {\n    deletePatient(patient);\n}\n"
@@ -150,6 +161,44 @@ def _context() -> ContextBundle:
     )
 
 
+def _context_with_hidden_integration_anchor() -> ContextBundle:
+    """Return one required anchor and one oversized hidden integration anchor."""
+    context = _context()
+    text = "void hiddenAuthorizationPath() {}\n" * 300
+    hidden = context.anchors[0].model_copy(
+        update={
+            "anchor_id": "anchor-hidden-integration",
+            "blob_sha": "f" * 40,
+            "path": "api/HiddenAuthorizationPath.java",
+            "java_symbol": "hiddenAuthorizationPath",
+            "start_line": 10,
+            "end_line": 309,
+            "text": text,
+            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+    )
+    return ContextBundle.from_content(
+        **context.model_dump(
+            mode="python",
+            exclude={
+                "anchors",
+                "context_sha256",
+                "selected_anchor_count",
+                "selected_file_count",
+                "selected_bytes",
+                "max_anchor_lines",
+            },
+        ),
+        anchors=(*context.anchors, hidden),
+        selected_file_count=2,
+        selected_anchor_count=2,
+        selected_bytes=sum(
+            len(anchor.text.encode("utf-8")) for anchor in (*context.anchors, hidden)
+        ),
+        max_anchor_lines=400,
+    )
+
+
 def _testability_assessment(
     human_review: HumanReviewedRisk,
     context: ContextBundle,
@@ -159,6 +208,7 @@ def _testability_assessment(
         snapshot_key=human_review.snapshot_key,
         context_sha256=context.context_sha256,
         reviewed_risk_sha256=human_review.reviewed_content_sha256,
+        evidence_envelope_sha256="4" * 64,
         decision="testable_from_frozen_evidence",
         bindings=(
             FrozenTestabilityBinding(
@@ -184,16 +234,129 @@ def _testability_assessment(
     )
 
 
+def _gherkin_envelope(
+    human_review: HumanReviewedRisk,
+    context: ContextBundle,
+    assessment: ValidatedTestabilityAssessment,
+):
+    return gherkin_generation.build_gherkin_evidence(
+        human_review=human_review,
+        testability_assessment=assessment,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        budget=ProviderRequestBudget(
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            max_body_bytes=7_000,
+        ),
+    ).envelope
+
+
+def _gherkin_boundary(
+    human_review: HumanReviewedRisk,
+    context: ContextBundle | None = None,
+) -> dict[str, object]:
+    frozen_context = context or _context()
+    assessment = _testability_assessment(human_review, frozen_context)
+    return {
+        "testability_assessment": assessment,
+        "context": frozen_context,
+        "comparison_bindings": _comparison_bindings(),
+        "evidence_envelope": _gherkin_envelope(
+            human_review,
+            frozen_context,
+            assessment,
+        ),
+    }
+
+
+def test_gherkin_stage_uses_the_union_of_required_visible_evidence() -> None:
+    """Removing any reviewed or testability citation would weaken the scenario."""
+    human_review = _human_review()
+    context = _context()
+    assessment = _testability_assessment(human_review, context)
+
+    result = gherkin_generation.build_gherkin_evidence(
+        human_review=human_review,
+        testability_assessment=assessment,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        budget=ProviderRequestBudget(
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            max_body_bytes=7_000,
+        ),
+    )
+
+    assert result.request_body_bytes <= result.envelope.max_request_body_bytes
+    assert result.envelope.stage == "gherkin_generation"
+    assert {anchor.anchor_id for anchor in result.envelope.visible_anchors} == {
+        "anchor-integration"
+    }
+    assert result.request.payload["evidence_envelope"] == result.envelope.model_dump(
+        mode="json"
+    )
+
+
+def test_gherkin_stage_fails_locally_when_required_whole_evidence_cannot_fit() -> None:
+    """A required testability anchor may not be sliced or silently omitted."""
+    human_review = _human_review()
+    context = _context()
+    text = "void purgePatient() { deletePatient(); } " + ("x" * 5_000)
+    anchor = context.anchors[0].model_copy(
+        update={
+            "end_line": 1,
+            "text": text,
+            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+    )
+    large_context = ContextBundle.from_content(
+        **context.model_dump(
+            mode="python",
+            exclude={"anchors", "context_sha256", "selected_bytes"},
+        ),
+        anchors=(anchor,),
+        selected_bytes=len(text.encode("utf-8")),
+    )
+    assessment = _testability_assessment(human_review, large_context)
+
+    with pytest.raises(ModelEvidenceBudgetError, match="anchor-integration"):
+        gherkin_generation.build_gherkin_evidence(
+            human_review=human_review,
+            testability_assessment=assessment,
+            context=large_context,
+            comparison_bindings=_comparison_bindings(),
+            budget=ProviderRequestBudget(
+                provider="groq",
+                model="openai/gpt-oss-120b",
+                max_body_bytes=7_000,
+            ),
+        )
+
+
+def test_gherkin_draft_records_the_exact_visible_envelope_hash() -> None:
+    """A candidate must identify the frozen evidence visible during generation."""
+    payload = _candidate_response(_human_review())
+    payload["evidence_envelope_sha256"] = "5" * 64
+
+    draft = GherkinCandidateDraft.model_validate(payload)
+
+    assert draft.evidence_envelope_sha256 == "5" * 64
+
+
 def test_gherkin_request_is_bound_to_the_human_review() -> None:
     """The request uses one approved risk and locally testable frozen evidence."""
     human_review = _human_review()
     context = _context()
     assessment = _testability_assessment(human_review, context)
+    envelope = _gherkin_envelope(human_review, context, assessment)
 
     request = build_gherkin_request(
         human_review=human_review,
         testability_assessment=assessment,
         context=context,
+        comparison_bindings=_comparison_bindings(),
+        evidence_envelope=envelope,
     )
 
     assert request.purpose == "gherkin_generation"
@@ -204,17 +367,16 @@ def test_gherkin_request_is_bound_to_the_human_review() -> None:
     assert request.payload["testability_assessment_sha256"] == (
         assessment.assessment_sha256
     )
-    assert request.payload["context_sha256"] == context.context_sha256
-    assert request.payload["approved_risk"] == human_review.reviewed_risk.model_dump(
-        mode="json"
-    )
-    assert request.payload["context_anchors"] == [
-        anchor.model_dump(mode="json") for anchor in context.anchors
-    ]
+    assert request.payload["evidence_envelope"] == envelope.model_dump(mode="json")
     assert request.output_schema["additionalProperties"] is False
 
 
-def _candidate_response(human_review: HumanReviewedRisk) -> dict[str, object]:
+def _candidate_response(
+    human_review: HumanReviewedRisk,
+    evidence_envelope_sha256: str = "5" * 64,
+    *,
+    include_approved_risk: bool = True,
+) -> dict[str, object]:
     """Return one locally replayed structured Gherkin response."""
     approved_risk = human_review.reviewed_risk
     context = _context()
@@ -265,10 +427,11 @@ def _candidate_response(human_review: HumanReviewedRisk) -> dict[str, object]:
         ]
     )
 
-    return {
+    result = {
         "snapshot_key": human_review.snapshot_key,
         "context_sha256": context.context_sha256,
         "reviewed_risk_sha256": human_review.reviewed_content_sha256,
+        "evidence_envelope_sha256": evidence_envelope_sha256,
         "approved_risk": approved_risk.model_dump(mode="json"),
         "feature_title": feature_title,
         "scenario_title": scenario_title,
@@ -322,24 +485,33 @@ def _candidate_response(human_review: HumanReviewedRisk) -> dict[str, object]:
         "setup_gaps": [],
         "generated_at": "2026-08-12T00:00:00Z",
     }
+    if not include_approved_risk:
+        result.pop("approved_risk")
+    return result
 
 
 def test_generate_gherkin_returns_a_locally_identified_candidate() -> None:
     """A schema-valid replay response becomes a deterministic candidate."""
     human_review = _human_review()
-    gateway = ReplayGateway(
-        {
-            "gherkin_generation": _candidate_response(human_review),
-        }
-    )
-
     context = _context()
     assessment = _testability_assessment(human_review, context)
+    envelope = _gherkin_envelope(human_review, context, assessment)
+    gateway = ReplayGateway(
+        {
+            "gherkin_generation": _candidate_response(
+                human_review,
+                envelope.envelope_sha256,
+                include_approved_risk=False,
+            ),
+        }
+    )
 
     candidate, response = generate_gherkin(
         human_review=human_review,
         testability_assessment=assessment,
         context=context,
+        comparison_bindings=_comparison_bindings(),
+        evidence_envelope=envelope,
         gateway=gateway,
     )
 
@@ -354,13 +526,20 @@ def _candidate(human_review: HumanReviewedRisk):
     """Return one locally validated candidate from the replay fixture."""
     context = _context()
     assessment = _testability_assessment(human_review, context)
+    envelope = _gherkin_envelope(human_review, context, assessment)
     candidate, _ = generate_gherkin(
         human_review=human_review,
         testability_assessment=assessment,
         context=context,
+        comparison_bindings=_comparison_bindings(),
+        evidence_envelope=envelope,
         gateway=ReplayGateway(
             {
-                "gherkin_generation": _candidate_response(human_review),
+                "gherkin_generation": _candidate_response(
+                    human_review,
+                    envelope.envelope_sha256,
+                    include_approved_risk=False,
+                ),
             }
         ),
     )
@@ -384,7 +563,7 @@ def test_edit_cannot_remove_the_failure_oracle() -> None:
             candidate=candidate,
             text=edited_text,
             human_review=human_review,
-            context=_context(),
+            **_gherkin_boundary(human_review),
         )
 
 
@@ -396,7 +575,7 @@ def test_approve_gherkin_binds_exact_candidate_and_review_hashes() -> None:
     approval = approve_gherkin(
         candidate=candidate,
         human_review=human_review,
-        context=_context(),
+        **_gherkin_boundary(human_review),
         approved_at=datetime(2026, 8, 12, tzinfo=UTC),
     )
 
@@ -416,7 +595,7 @@ def test_candidate_validation_accepts_the_exact_reviewed_scenario() -> None:
     report = validate_gherkin_candidate(
         candidate=candidate,
         human_review=human_review,
-        context=_context(),
+        **_gherkin_boundary(human_review),
     )
 
     assert report.approved is True
@@ -442,7 +621,7 @@ def test_edit_rejects_step_insertion_and_reordering() -> None:
             candidate=candidate,
             text=inserted_step_text,
             human_review=human_review,
-            context=_context(),
+            **_gherkin_boundary(human_review),
         )
 
     reordered_step_text = candidate.gherkin_text.replace(
@@ -463,7 +642,7 @@ def test_edit_rejects_step_insertion_and_reordering() -> None:
             candidate=candidate,
             text=reordered_step_text,
             human_review=human_review,
-            context=_context(),
+            **_gherkin_boundary(human_review),
         )
 
 
@@ -481,6 +660,12 @@ def test_gherkin_request_rejects_a_tampered_human_review() -> None:
             human_review=tampered_review,
             testability_assessment=assessment,
             context=context,
+            comparison_bindings=_comparison_bindings(),
+            evidence_envelope=_gherkin_envelope(
+                human_review,
+                context,
+                assessment,
+            ),
         )
 
 
@@ -556,12 +741,45 @@ def test_edited_gherkin_classifies_evidence_bound_scenario_as_valid() -> None:
         candidate=candidate,
         text=candidate.gherkin_text,
         human_review=human_review,
-        context=context,
+        **_gherkin_boundary(human_review, context),
     )
 
     assert report.approved is True
     assert report.decision == "valid_evidence_bound_gherkin"
     assert report.reason_codes == ()
+
+
+def test_gherkin_validation_rejects_a_catalog_anchor_hidden_from_the_model() -> None:
+    """Step evidence must resolve inside the exact Gherkin visibility boundary."""
+    human_review = _human_review()
+    context = _context_with_hidden_integration_anchor()
+    assessment = _testability_assessment(human_review, context)
+    envelope = _gherkin_envelope(human_review, context, assessment)
+    candidate = GherkinCandidateDraft.model_validate(
+        {
+            **_candidate_response(human_review, envelope.envelope_sha256),
+            "context_sha256": context.context_sha256,
+            "step_evidence_bindings": [
+                {
+                    "step_number": number,
+                    "anchor_ids": ["anchor-hidden-integration"],
+                }
+                for number in range(1, 7)
+            ],
+        }
+    )
+
+    report = validate_gherkin_candidate(
+        candidate=gherkin_generation.GherkinCandidate.from_draft(candidate),
+        human_review=human_review,
+        testability_assessment=assessment,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        evidence_envelope=envelope,
+    )
+
+    assert report.approved is False
+    assert "unknown_step_evidence_anchor" in report.reason_codes
 
 
 def test_edited_gherkin_classifies_removed_failure_oracle_as_hypothesis_changed() -> (
@@ -580,7 +798,7 @@ def test_edited_gherkin_classifies_removed_failure_oracle_as_hypothesis_changed(
         candidate=candidate,
         text=edited_text,
         human_review=human_review,
-        context=context,
+        **_gherkin_boundary(human_review, context),
     )
 
     assert report.approved is False
@@ -605,7 +823,7 @@ def test_edited_gherkin_classifies_new_unbound_identifier_as_needing_evidence() 
         candidate=candidate,
         text=edited_text,
         human_review=human_review,
-        context=context,
+        **_gherkin_boundary(human_review, context),
     )
 
     assert report.approved is False
@@ -627,7 +845,7 @@ def test_edited_gherkin_classifies_executable_content_as_invalid() -> None:
         candidate=candidate,
         text=edited_text,
         human_review=human_review,
-        context=context,
+        **_gherkin_boundary(human_review, context),
     )
 
     assert report.approved is False

@@ -26,6 +26,11 @@ from triageguard.contracts import (
 from triageguard.contracts import (
     generate_gherkin as request_gherkin_candidate,
 )
+from triageguard.contracts.gherkin_generation import (
+    GHERKIN_OUTPUT_SCHEMA,
+    build_gherkin_evidence,
+    build_gherkin_request,
+)
 from triageguard.domain import (
     ContextBundle,
     ContextRefinement,
@@ -43,7 +48,11 @@ from triageguard.domain import (
     TestabilityAssessment,
     TestabilityAssessmentDraft,
 )
-from triageguard.evidence import ModelEvidenceEnvelope, validate_envelope_binding
+from triageguard.evidence import (
+    EvidenceArtifactBinding,
+    ModelEvidenceEnvelope,
+    validate_envelope_binding,
+)
 from triageguard.hypotheses import (
     RISK_OUTPUT_SCHEMA,
     RiskGroundingReport,
@@ -68,6 +77,9 @@ from triageguard.research.recorder import (
     TransformationEvent,
 )
 from triageguard.testability.generator import (
+    TESTABILITY_OUTPUT_SCHEMA,
+    build_testability_evidence,
+    build_testability_request,
     generate_testability_assessment,
 )
 from triageguard.testability.validator import (
@@ -236,6 +248,7 @@ def _gherkin_evidence_assessment(
         snapshot_key=human_review.snapshot_key,
         context_sha256=context.context_sha256,
         reviewed_risk_sha256=human_review.reviewed_content_sha256,
+        evidence_envelope_sha256=candidate.evidence_envelope_sha256,
         decision="needs_more_frozen_evidence",
         bindings=(),
         evidence_needs=(need,),
@@ -295,10 +308,12 @@ class MilestoneTwoWorkflow:
         self._freshness: SnapshotFreshness | None = None
         self._human_reviewed_risk: HumanReviewedRisk | None = None
         self._testability_draft: TestabilityAssessmentDraft | None = None
+        self._testability_evidence_envelope: ModelEvidenceEnvelope | None = None
         self._testability_response: ModelResponse | None = None
         self._testability_assessment: TestabilityAssessment | None = None
         self._context_refinements: list[ContextRefinement] = []
         self._gherkin_candidate: GherkinCandidate | None = None
+        self._gherkin_evidence_envelope: ModelEvidenceEnvelope | None = None
         self._gherkin_response: ModelResponse | None = None
         self._gherkin_validation_report: GherkinValidationReport | None = None
         self._validated_gherkin_text: str | None = None
@@ -341,6 +356,11 @@ class MilestoneTwoWorkflow:
         return self._testability_assessment
 
     @property
+    def testability_evidence_envelope(self) -> ModelEvidenceEnvelope | None:
+        """Return the exact frozen evidence visible to testability generation."""
+        return self._testability_evidence_envelope
+
+    @property
     def context_refinements(self) -> tuple[ContextRefinement, ...]:
         """Return the immutable frozen-evidence refinements in this run."""
         return tuple(self._context_refinements)
@@ -349,6 +369,11 @@ class MilestoneTwoWorkflow:
     def gherkin_candidate(self) -> GherkinCandidate | None:
         """Return the locally validated Gherkin candidate after generation."""
         return self._gherkin_candidate
+
+    @property
+    def gherkin_evidence_envelope(self) -> ModelEvidenceEnvelope | None:
+        """Return the exact frozen evidence visible to Gherkin generation."""
+        return self._gherkin_evidence_envelope
 
     @property
     def gherkin_validation_report(self) -> GherkinValidationReport | None:
@@ -538,15 +563,37 @@ class MilestoneTwoWorkflow:
                 "a current snapshot."
             )
 
+        comparison_bindings = self._comparison_bindings(prepared)
+        if self._is_typed_prepared(prepared):
+            envelope_result = build_testability_evidence(
+                human_review=self._human_reviewed_risk,
+                context=prepared.context,
+                comparison_bindings=comparison_bindings,
+                budget=ProviderRequestBudget.from_settings(self._settings),
+            )
+            evidence_envelope = envelope_result.envelope
+            self._persist_testability_evidence_envelope(
+                prepared=prepared,
+                human_review=self._human_reviewed_risk,
+                evidence_envelope=evidence_envelope,
+            )
+        else:
+            evidence_envelope = object()
+        self._testability_evidence_envelope = evidence_envelope
+
         draft, response = generate_testability_assessment(
             human_review=self._human_reviewed_risk,
             context=prepared.context,
+            comparison_bindings=comparison_bindings,
+            evidence_envelope=evidence_envelope,
             gateway=self._gateway,
         )
         assessment, _report = validate_testability_assessment(
             draft=draft,
             human_review=self._human_reviewed_risk,
             context=prepared.context,
+            comparison_bindings=comparison_bindings,
+            evidence_envelope=evidence_envelope,
         )
         if assessment is None:
             raise MilestoneTwoTransitionError(
@@ -641,9 +688,11 @@ class MilestoneTwoWorkflow:
         self._risk_grounding_report = None
         self._risk_failure = None
         self._human_reviewed_risk = None
+        self._testability_evidence_envelope = None
         self._testability_draft = None
         self._testability_response = None
         self._testability_assessment = None
+        self._gherkin_evidence_envelope = None
         self._gherkin_candidate = None
         self._gherkin_response = None
         self._gherkin_validation_report = None
@@ -734,16 +783,41 @@ class MilestoneTwoWorkflow:
                 "a current snapshot."
             )
 
+        comparison_bindings = self._comparison_bindings(prepared)
+        if self._is_typed_prepared(prepared):
+            envelope_result = build_gherkin_evidence(
+                human_review=self._human_reviewed_risk,
+                testability_assessment=self._testability_assessment,
+                context=prepared.context,
+                comparison_bindings=comparison_bindings,
+                budget=ProviderRequestBudget.from_settings(self._settings),
+            )
+            evidence_envelope = envelope_result.envelope
+            self._persist_gherkin_evidence_envelope(
+                prepared=prepared,
+                human_review=self._human_reviewed_risk,
+                testability_assessment=self._testability_assessment,
+                evidence_envelope=evidence_envelope,
+            )
+        else:
+            evidence_envelope = object()
+        self._gherkin_evidence_envelope = evidence_envelope
+
         candidate, response = request_gherkin_candidate(
             human_review=self._human_reviewed_risk,
             testability_assessment=self._testability_assessment,
             context=prepared.context,
+            comparison_bindings=comparison_bindings,
+            evidence_envelope=evidence_envelope,
             gateway=self._gateway,
         )
         generated_report = validate_gherkin_candidate(
             candidate=candidate,
             human_review=self._human_reviewed_risk,
+            testability_assessment=self._testability_assessment,
             context=prepared.context,
+            comparison_bindings=comparison_bindings,
+            evidence_envelope=evidence_envelope,
         )
         if not generated_report.approved:
             raise MilestoneTwoTransitionError(
@@ -755,6 +829,7 @@ class MilestoneTwoWorkflow:
             self._persist_gherkin_generation(
                 prepared=prepared,
                 human_review=self._human_reviewed_risk,
+                testability_assessment=self._testability_assessment,
                 candidate=candidate,
                 response=response,
                 freshness=freshness,
@@ -773,6 +848,8 @@ class MilestoneTwoWorkflow:
         if (
             self._state is not _State.GHERKIN_READY
             or self._human_reviewed_risk is None
+            or self._testability_assessment is None
+            or self._gherkin_evidence_envelope is None
             or self._gherkin_candidate is None
         ):
             raise MilestoneTwoTransitionError(
@@ -801,7 +878,10 @@ class MilestoneTwoWorkflow:
             candidate=self._gherkin_candidate,
             text=text,
             human_review=self._human_reviewed_risk,
+            testability_assessment=self._testability_assessment,
             context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=self._gherkin_evidence_envelope,
         )
         self._gherkin_validation_report = report
 
@@ -811,7 +891,10 @@ class MilestoneTwoWorkflow:
                 candidate=source_candidate,
                 text=text,
                 human_review=self._human_reviewed_risk,
+                testability_assessment=self._testability_assessment,
                 context=prepared.context,
+                comparison_bindings=self._comparison_bindings(prepared),
+                evidence_envelope=self._gherkin_evidence_envelope,
             )
             if self._is_typed_prepared(prepared):
                 self._persist_gherkin_validation(
@@ -848,9 +931,11 @@ class MilestoneTwoWorkflow:
             self._state = _State.EVIDENCE_REFINEMENT_REQUIRED
         elif report.decision == "hypothesis_changed":
             self._human_reviewed_risk = None
+            self._testability_evidence_envelope = None
             self._testability_draft = None
             self._testability_response = None
             self._testability_assessment = None
+            self._gherkin_evidence_envelope = None
             self._gherkin_candidate = None
             self._gherkin_response = None
             self._validated_gherkin_text = None
@@ -865,6 +950,8 @@ class MilestoneTwoWorkflow:
         if (
             self._state not in {_State.GHERKIN_READY, _State.GHERKIN_VALIDATED}
             or self._human_reviewed_risk is None
+            or self._testability_assessment is None
+            or self._gherkin_evidence_envelope is None
             or self._gherkin_candidate is None
             or self._gherkin_validation_report is None
             or not self._gherkin_validation_report.approved
@@ -890,7 +977,10 @@ class MilestoneTwoWorkflow:
         approval = approve_gherkin_candidate(
             candidate=self._gherkin_candidate,
             human_review=self._human_reviewed_risk,
+            testability_assessment=self._testability_assessment,
             context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=self._gherkin_evidence_envelope,
             approved_at=datetime.now(UTC),
         )
         record = MilestoneTwoRunRecord(
@@ -1116,6 +1206,18 @@ class MilestoneTwoWorkflow:
             and isinstance(prepared.context, ContextBundle)
         )
 
+    @staticmethod
+    def _comparison_bindings(
+        prepared: PreparedPullRequest,
+    ) -> tuple[EvidenceArtifactBinding, ...]:
+        """Bind later model stages to the same three frozen comparisons."""
+        if not MilestoneTwoWorkflow._is_typed_prepared(prepared):
+            return ()
+        return tuple(
+            EvidenceArtifactBinding(name=diff.kind, sha256=diff.artifact_sha256)
+            for diff in prepared.diffs
+        )
+
     def _persist_prepared(self, prepared: PreparedPullRequest) -> None:
         """Save the exact frozen evidence required to resume later model work."""
         payload = {
@@ -1312,13 +1414,34 @@ class MilestoneTwoWorkflow:
         freshness: SnapshotFreshness,
     ) -> None:
         """Save a locally validated testability decision before Gherkin work."""
+        evidence_envelope = self._testability_evidence_envelope
+        if evidence_envelope is None:
+            evidence_envelope = build_testability_evidence(
+                human_review=human_review,
+                context=prepared.context,
+                comparison_bindings=self._comparison_bindings(prepared),
+                budget=ProviderRequestBudget.from_settings(self._settings),
+            ).envelope
+            if draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256:
+                raise MilestoneTwoTransitionError(
+                    "Testability response does not bind the selected evidence envelope."
+                )
+            self._persist_testability_evidence_envelope(
+                prepared=prepared,
+                human_review=human_review,
+                evidence_envelope=evidence_envelope,
+            )
+            self._testability_evidence_envelope = evidence_envelope
         if (
-            draft.snapshot_key != prepared.snapshot.snapshot_key
+            not isinstance(evidence_envelope, ModelEvidenceEnvelope)
+            or draft.snapshot_key != prepared.snapshot.snapshot_key
             or draft.context_sha256 != prepared.context.context_sha256
             or draft.reviewed_risk_sha256 != human_review.reviewed_content_sha256
             or assessment.snapshot_key != prepared.snapshot.snapshot_key
             or assessment.context_sha256 != prepared.context.context_sha256
             or assessment.reviewed_risk_sha256 != human_review.reviewed_content_sha256
+            or draft.evidence_envelope_sha256 != evidence_envelope.envelope_sha256
+            or assessment.evidence_envelope_sha256 != evidence_envelope.envelope_sha256
             or freshness.snapshot_key != prepared.snapshot.snapshot_key
         ):
             raise MilestoneTwoTransitionError(
@@ -1341,8 +1464,36 @@ class MilestoneTwoWorkflow:
                 "context": prepared.context.context_sha256,
                 "reviewed_risk": human_review.reviewed_content_sha256,
                 "testability": assessment.assessment_sha256,
+                "evidence_envelope": evidence_envelope.envelope_sha256,
             },
             reason_code="testability_assessment_recorded",
+        )
+
+    def _persist_testability_evidence_envelope(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        human_review: HumanReviewedRisk,
+        evidence_envelope: ModelEvidenceEnvelope,
+    ) -> None:
+        """Save the exact visibility boundary before the testability model call."""
+        build_testability_request(
+            human_review=human_review,
+            context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=evidence_envelope,
+        )
+        self._persist_transition(
+            artifact_name="artifacts/model_evidence/testability_assessment.json",
+            event_type="workflow_testability_evidence_selected",
+            payload=evidence_envelope.model_dump(mode="json"),
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+                "reviewed_risk": human_review.reviewed_content_sha256,
+                "evidence_envelope": evidence_envelope.envelope_sha256,
+            },
+            reason_code="testability_evidence_envelope_recorded",
         )
 
     def _persist_exhausted_context_refinement(
@@ -1396,15 +1547,38 @@ class MilestoneTwoWorkflow:
         *,
         prepared: PreparedPullRequest,
         human_review: HumanReviewedRisk,
+        testability_assessment: TestabilityAssessment,
         candidate: GherkinCandidate,
         response: ModelResponse,
         freshness: SnapshotFreshness,
     ) -> None:
         """Save one validated Gherkin response before a reviewer can edit it."""
+        evidence_envelope = self._gherkin_evidence_envelope
+        if evidence_envelope is None:
+            evidence_envelope = build_gherkin_evidence(
+                human_review=human_review,
+                testability_assessment=testability_assessment,
+                context=prepared.context,
+                comparison_bindings=self._comparison_bindings(prepared),
+                budget=ProviderRequestBudget.from_settings(self._settings),
+            ).envelope
+            if candidate.evidence_envelope_sha256 != evidence_envelope.envelope_sha256:
+                raise MilestoneTwoTransitionError(
+                    "Gherkin response does not bind the selected evidence envelope."
+                )
+            self._persist_gherkin_evidence_envelope(
+                prepared=prepared,
+                human_review=human_review,
+                testability_assessment=testability_assessment,
+                evidence_envelope=evidence_envelope,
+            )
+            self._gherkin_evidence_envelope = evidence_envelope
         if (
-            candidate.snapshot_key != prepared.snapshot.snapshot_key
+            not isinstance(evidence_envelope, ModelEvidenceEnvelope)
+            or candidate.snapshot_key != prepared.snapshot.snapshot_key
             or candidate.reviewed_risk_sha256 != human_review.reviewed_content_sha256
             or candidate.approved_risk != human_review.reviewed_risk
+            or candidate.evidence_envelope_sha256 != evidence_envelope.envelope_sha256
             or freshness.snapshot_key != prepared.snapshot.snapshot_key
         ):
             raise MilestoneTwoTransitionError(
@@ -1423,8 +1597,39 @@ class MilestoneTwoWorkflow:
             input_hashes={
                 "snapshot": prepared.snapshot.snapshot_key,
                 "reviewed_risk": human_review.reviewed_content_sha256,
+                "evidence_envelope": evidence_envelope.envelope_sha256,
             },
             reason_code="gherkin_response_recorded",
+        )
+
+    def _persist_gherkin_evidence_envelope(
+        self,
+        *,
+        prepared: PreparedPullRequest,
+        human_review: HumanReviewedRisk,
+        testability_assessment: TestabilityAssessment,
+        evidence_envelope: ModelEvidenceEnvelope,
+    ) -> None:
+        """Save the exact visibility boundary before the Gherkin model call."""
+        build_gherkin_request(
+            human_review=human_review,
+            testability_assessment=testability_assessment,
+            context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=evidence_envelope,
+        )
+        self._persist_transition(
+            artifact_name="artifacts/model_evidence/gherkin_generation.json",
+            event_type="workflow_gherkin_evidence_selected",
+            payload=evidence_envelope.model_dump(mode="json"),
+            input_hashes={
+                "snapshot": prepared.snapshot.snapshot_key,
+                "context": prepared.context.context_sha256,
+                "reviewed_risk": human_review.reviewed_content_sha256,
+                "testability": testability_assessment.assessment_sha256,
+                "evidence_envelope": evidence_envelope.envelope_sha256,
+            },
+            reason_code="gherkin_evidence_envelope_recorded",
         )
 
     def _persist_gherkin_validation(
@@ -1755,6 +1960,100 @@ class MilestoneTwoWorkflow:
                         "The terminal risk evidence envelope is invalid."
                     ) from error
                 self._risk_evidence_envelope = evidence_envelope
+            terminal_review = terminal_record.human_reviewed_risk
+            terminal_testability = terminal_record.testability_assessment
+            if terminal_testability is not None:
+                if terminal_assessment is None or terminal_review is None:
+                    raise MilestoneTwoTransitionError(
+                        "The terminal testability assessment lacks its dependencies."
+                    )
+                item = self._load_durable_artifact(
+                    "artifacts/model_evidence/testability_assessment.json"
+                )
+                if item is None:
+                    raise MilestoneTwoTransitionError(
+                        "The terminal testability assessment is missing its evidence envelope."
+                    )
+                payload, _event = item
+                try:
+                    envelope = ModelEvidenceEnvelope.model_validate(payload)
+                    envelope = validate_envelope_binding(
+                        envelope=envelope,
+                        stage="testability_assessment",
+                        context=terminal_assessment.context_bundle,
+                        comparison_bindings=envelope.comparison_bindings,
+                        input_bindings=(
+                            EvidenceArtifactBinding(
+                                name="human_reviewed_risk",
+                                sha256=terminal_review.reviewed_content_sha256,
+                            ),
+                        ),
+                        output_schema_sha256=canonical_sha256(
+                            TESTABILITY_OUTPUT_SCHEMA
+                        ),
+                        max_request_body_bytes=self._settings.max_model_request_bytes,
+                    )
+                    if (
+                        terminal_testability.evidence_envelope_sha256
+                        != envelope.envelope_sha256
+                    ):
+                        raise ValueError(
+                            "terminal testability does not bind its envelope"
+                        )
+                except (TypeError, ValueError) as error:
+                    raise MilestoneTwoTransitionError(
+                        "The terminal testability evidence envelope is invalid."
+                    ) from error
+                self._testability_evidence_envelope = envelope
+
+            terminal_candidate = terminal_record.gherkin_candidate
+            if terminal_candidate is not None:
+                if (
+                    terminal_assessment is None
+                    or terminal_review is None
+                    or terminal_testability is None
+                ):
+                    raise MilestoneTwoTransitionError(
+                        "The terminal Gherkin candidate lacks its dependencies."
+                    )
+                item = self._load_durable_artifact(
+                    "artifacts/model_evidence/gherkin_generation.json"
+                )
+                if item is None:
+                    raise MilestoneTwoTransitionError(
+                        "The terminal Gherkin candidate is missing its evidence envelope."
+                    )
+                payload, _event = item
+                try:
+                    envelope = ModelEvidenceEnvelope.model_validate(payload)
+                    envelope = validate_envelope_binding(
+                        envelope=envelope,
+                        stage="gherkin_generation",
+                        context=terminal_assessment.context_bundle,
+                        comparison_bindings=envelope.comparison_bindings,
+                        input_bindings=(
+                            EvidenceArtifactBinding(
+                                name="human_reviewed_risk",
+                                sha256=terminal_review.reviewed_content_sha256,
+                            ),
+                            EvidenceArtifactBinding(
+                                name="testability_assessment",
+                                sha256=terminal_testability.assessment_sha256,
+                            ),
+                        ),
+                        output_schema_sha256=canonical_sha256(GHERKIN_OUTPUT_SCHEMA),
+                        max_request_body_bytes=self._settings.max_model_request_bytes,
+                    )
+                    if (
+                        terminal_candidate.evidence_envelope_sha256
+                        != envelope.envelope_sha256
+                    ):
+                        raise ValueError("terminal Gherkin does not bind its envelope")
+                except (TypeError, ValueError) as error:
+                    raise MilestoneTwoTransitionError(
+                        "The terminal Gherkin evidence envelope is invalid."
+                    ) from error
+                self._gherkin_evidence_envelope = envelope
             self._started_at = terminal_record.started_at
             self._terminal_record = terminal_record
             self._freshness = terminal_record.freshness
@@ -1985,11 +2284,44 @@ class MilestoneTwoWorkflow:
         self._freshness = review_freshness
         self._state = _State.RISK_APPROVED
 
+        testability_envelope_item = self._load_durable_artifact(
+            "artifacts/model_evidence/testability_assessment.json"
+        )
         testability_item = self._load_durable_artifact(
             "artifacts/workflow/testability_assessment.json"
         )
+        if testability_envelope_item is None:
+            if testability_item is not None:
+                raise MilestoneTwoTransitionError(
+                    "The saved testability stage is missing its evidence envelope."
+                )
+            return
         if testability_item is None:
             return
+
+        testability_envelope_payload, _testability_envelope_event = (
+            testability_envelope_item
+        )
+        try:
+            testability_envelope = ModelEvidenceEnvelope.model_validate(
+                testability_envelope_payload
+            )
+            build_testability_request(
+                human_review=review,
+                context=prepared.context,
+                comparison_bindings=self._comparison_bindings(prepared),
+                evidence_envelope=testability_envelope,
+            )
+            if (
+                testability_envelope.max_request_body_bytes
+                != self._settings.max_model_request_bytes
+            ):
+                raise ValueError("saved envelope uses a different request budget")
+        except (TypeError, ValueError) as error:
+            raise MilestoneTwoTransitionError(
+                "The saved testability evidence envelope is invalid."
+            ) from error
+        self._testability_evidence_envelope = testability_envelope
 
         testability_payload, _testability_event = testability_item
         try:
@@ -2019,12 +2351,18 @@ class MilestoneTwoWorkflow:
             draft=testability_draft,
             human_review=review,
             context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=testability_envelope,
         )
         if (
             revalidated_assessment is None
             or not testability_report.approved
             or revalidated_assessment != testability_assessment
             or testability_response.data != testability_draft.model_dump(mode="json")
+            or testability_draft.evidence_envelope_sha256
+            != testability_envelope.envelope_sha256
+            or testability_assessment.evidence_envelope_sha256
+            != testability_envelope.envelope_sha256
             or testability_freshness.snapshot_key != prepared.snapshot.snapshot_key
             or testability_freshness.status != "current"
         ):
@@ -2083,11 +2421,43 @@ class MilestoneTwoWorkflow:
             self._freshness = refinement_freshness
             return
 
+        gherkin_envelope_item = self._load_durable_artifact(
+            "artifacts/model_evidence/gherkin_generation.json"
+        )
         gherkin_item = self._load_durable_artifact(
             "artifacts/workflow/gherkin_generation.json"
         )
+        if gherkin_envelope_item is None:
+            if gherkin_item is not None:
+                raise MilestoneTwoTransitionError(
+                    "The saved Gherkin stage is missing its evidence envelope."
+                )
+            return
         if gherkin_item is None:
             return
+
+        gherkin_envelope_payload, _gherkin_envelope_event = gherkin_envelope_item
+        try:
+            gherkin_envelope = ModelEvidenceEnvelope.model_validate(
+                gherkin_envelope_payload
+            )
+            build_gherkin_request(
+                human_review=review,
+                testability_assessment=testability_assessment,
+                context=prepared.context,
+                comparison_bindings=self._comparison_bindings(prepared),
+                evidence_envelope=gherkin_envelope,
+            )
+            if (
+                gherkin_envelope.max_request_body_bytes
+                != self._settings.max_model_request_bytes
+            ):
+                raise ValueError("saved envelope uses a different request budget")
+        except (TypeError, ValueError) as error:
+            raise MilestoneTwoTransitionError(
+                "The saved Gherkin evidence envelope is invalid."
+            ) from error
+        self._gherkin_evidence_envelope = gherkin_envelope
 
         gherkin_payload, _gherkin_event = gherkin_item
         try:
@@ -2111,13 +2481,17 @@ class MilestoneTwoWorkflow:
         validation = validate_gherkin_candidate(
             candidate=candidate,
             human_review=review,
+            testability_assessment=testability_assessment,
             context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=gherkin_envelope,
         )
         if (
             not validation.approved
             or candidate.snapshot_key != prepared.snapshot.snapshot_key
             or candidate.reviewed_risk_sha256 != review.reviewed_content_sha256
             or candidate.approved_risk != review.reviewed_risk
+            or candidate.evidence_envelope_sha256 != gherkin_envelope.envelope_sha256
             or gherkin_freshness.snapshot_key != prepared.snapshot.snapshot_key
             or gherkin_freshness.status != "current"
         ):
@@ -2187,7 +2561,10 @@ class MilestoneTwoWorkflow:
                 candidate=candidate,
                 text=text,
                 human_review=review,
+                testability_assessment=testability_assessment,
                 context=prepared.context,
+                comparison_bindings=self._comparison_bindings(prepared),
+                evidence_envelope=gherkin_envelope,
             )
             expected_gap_assessment = _gherkin_evidence_assessment(
                 candidate=candidate,
@@ -2263,7 +2640,10 @@ class MilestoneTwoWorkflow:
         revalidated_edit = validate_gherkin_candidate(
             candidate=edited_candidate,
             human_review=review,
+            testability_assessment=testability_assessment,
             context=prepared.context,
+            comparison_bindings=self._comparison_bindings(prepared),
+            evidence_envelope=gherkin_envelope,
         )
         if (
             source_candidate_sha256

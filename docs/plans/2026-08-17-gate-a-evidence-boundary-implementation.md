@@ -49,7 +49,7 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 - [x] Task 3 — Centralize exact provider request sizing and policy
 - [x] Task 4 — Add the immutable model-evidence envelope
 - [x] Task 5 — Migrate risk generation and validation to visible evidence
-- [ ] Task 6 — Migrate testability and Gherkin to visible evidence
+- [x] Task 6 — Migrate testability and Gherkin to visible evidence
 - [ ] Task 7 — Add bounded frozen-evidence refinement at model boundaries
 - [ ] Task 8 — Unify model-stage execution, failure provenance, and recovery
 - [ ] Task 9 — Update replay and UI behavior without weakening gates
@@ -82,6 +82,16 @@ and failure-provenance regressions: 36 passed. The combined working tree passed
 all 805 collected regressions. The offline OpenMRS-shaped risk request retained
 both mandatory whole anchors while staying below the unchanged 7,000-byte
 policy; no excerpt slicing or stage-specific wire estimator remains.
+
+Task 6 completed on 2026-08-17. Testability and Gherkin requests now use
+stage-specific immutable envelopes, require every reviewed/testability citation
+as a whole visible anchor, reject hidden citations locally, and bind provider
+outputs to the exact envelope hash. Both envelopes persist before their model
+responses and hydrate in dependency order. Focused regressions: 47 passed. The
+complete non-UI suite passed 758 tests and the complete UI suite passed 54 tests
+(812 total). The combined one-process run reached the Streamlit teardown and
+exited without a pytest summary, so the two independently complete suites are
+the recorded regression evidence for this task.
 
 ---
 

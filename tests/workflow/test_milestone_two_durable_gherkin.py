@@ -11,6 +11,7 @@ from triageguard.config import Settings
 from triageguard.contracts import (
     GherkinValidationReport,
     apply_gherkin_text_edit,
+    build_gherkin_evidence,
 )
 from triageguard.domain import (
     ClaimEvidenceBinding,
@@ -40,6 +41,7 @@ from triageguard.domain import (
 from triageguard.domain import (
     TestabilityBinding as FrozenTestabilityBinding,
 )
+from triageguard.evidence import EvidenceArtifactBinding
 from triageguard.hypotheses import (
     build_risk_evidence,
     create_human_review,
@@ -51,6 +53,7 @@ from triageguard.llm import ModelAttempt, ModelResponse, ReplayGateway
 from triageguard.llm.request_budget import ProviderRequestBudget
 from triageguard.provenance import canonical_sha256
 from triageguard.research import ArtifactRecorder
+from triageguard.testability import build_testability_evidence
 from triageguard.workflow import milestone_two
 from triageguard.workflow.milestone_two import (
     MilestoneTwoDependencies,
@@ -208,6 +211,29 @@ def _risk_envelope(
     ).envelope
 
 
+def _comparison_bindings() -> tuple[EvidenceArtifactBinding, ...]:
+    return tuple(
+        EvidenceArtifactBinding(name=diff.kind, sha256=diff.artifact_sha256)
+        for diff in _diffs(_snapshot())
+    )
+
+
+def _testability_envelope(
+    review: HumanReviewedRisk,
+    context: ContextBundle,
+):
+    return build_testability_evidence(
+        human_review=review,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        budget=ProviderRequestBudget(
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            max_body_bytes=7_000,
+        ),
+    ).envelope
+
+
 def validate_risk_assessment(
     *,
     draft: RiskAssessmentDraft,
@@ -299,6 +325,10 @@ def _testability_draft_and_assessment(
         snapshot_key=review.snapshot_key,
         context_sha256=context.context_sha256,
         reviewed_risk_sha256=review.reviewed_content_sha256,
+        evidence_envelope_sha256=_testability_envelope(
+            review,
+            context,
+        ).envelope_sha256,
         decision="testable_from_frozen_evidence",
         bindings=(
             FrozenTestabilityBinding(
@@ -345,6 +375,10 @@ def _needs_evidence_draft_and_assessment(
         snapshot_key=review.snapshot_key,
         context_sha256=context.context_sha256,
         reviewed_risk_sha256=review.reviewed_content_sha256,
+        evidence_envelope_sha256=_testability_envelope(
+            review,
+            context,
+        ).envelope_sha256,
         decision="needs_more_frozen_evidence",
         bindings=(),
         evidence_needs=(need,),
@@ -364,6 +398,18 @@ def _candidate(
 ) -> GherkinCandidate:
     """Build one locally valid candidate bound to the human-reviewed risk."""
     risk = review.reviewed_risk
+    _, assessment = _testability_draft_and_assessment(review, context)
+    envelope = build_gherkin_evidence(
+        human_review=review,
+        testability_assessment=assessment,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        budget=ProviderRequestBudget(
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            max_body_bytes=7_000,
+        ),
+    ).envelope
     steps = (
         GherkinStep(
             number=1,
@@ -409,6 +455,7 @@ def _candidate(
         snapshot_key=review.snapshot_key,
         context_sha256=context.context_sha256,
         reviewed_risk_sha256=review.reviewed_content_sha256,
+        evidence_envelope_sha256=envelope.envelope_sha256,
         approved_risk=risk,
         feature_title=feature_title,
         scenario_title=scenario_title,
@@ -493,6 +540,7 @@ def test_generated_gherkin_and_its_model_response_are_saved_before_review(
     context = _context(snapshot)
     review = _human_review(snapshot)
     candidate = _candidate(review, context)
+    _, testability_assessment = _testability_draft_and_assessment(review, context)
     response = _response()
     recorder = ArtifactRecorder(tmp_path)
     workflow = MilestoneTwoWorkflow(
@@ -511,10 +559,7 @@ def test_generated_gherkin_and_its_model_response_are_saved_before_review(
         context=context,
     )
     workflow._human_reviewed_risk = review
-    workflow._testability_assessment = _testability_draft_and_assessment(
-        review,
-        context,
-    )[1]
+    workflow._testability_assessment = testability_assessment
     workflow._state = milestone_two._State.TESTABILITY_READY
 
     monkeypatch.setattr(
@@ -534,6 +579,12 @@ def test_generated_gherkin_and_its_model_response_are_saved_before_review(
     assert stored["candidate"] == candidate.model_dump(mode="json")
     assert stored["response"] == response.model_dump(mode="json")
     assert stored["freshness"]["status"] == "current"
+    assert json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/model_evidence/gherkin_generation.json",
+        )
+    ) == workflow.gherkin_evidence_envelope.model_dump(mode="json")
 
 
 def test_validated_gherkin_edit_is_saved_before_final_approval(
@@ -545,6 +596,18 @@ def test_validated_gherkin_edit_is_saved_before_final_approval(
     context = _context(snapshot)
     review = _human_review(snapshot)
     candidate = _candidate(review, context)
+    _, testability_assessment = _testability_draft_and_assessment(review, context)
+    gherkin_envelope = build_gherkin_evidence(
+        human_review=review,
+        testability_assessment=testability_assessment,
+        context=context,
+        comparison_bindings=_comparison_bindings(),
+        budget=ProviderRequestBudget(
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            max_body_bytes=7_000,
+        ),
+    ).envelope
     edited_text = candidate.gherkin_text.replace(
         "the user requests deletion",
         "the authenticated user requests deletion",
@@ -553,7 +616,10 @@ def test_validated_gherkin_edit_is_saved_before_final_approval(
         candidate=candidate,
         text=edited_text,
         human_review=review,
+        testability_assessment=testability_assessment,
         context=context,
+        comparison_bindings=_comparison_bindings(),
+        evidence_envelope=gherkin_envelope,
     )
     report = SimpleNamespace(
         decision="valid_evidence_bound_gherkin",
@@ -577,6 +643,8 @@ def test_validated_gherkin_edit_is_saved_before_final_approval(
         context=context,
     )
     workflow._human_reviewed_risk = review
+    workflow._testability_assessment = testability_assessment
+    workflow._gherkin_evidence_envelope = gherkin_envelope
     workflow._gherkin_candidate = candidate
     workflow._state = milestone_two._State.GHERKIN_READY
 
@@ -769,6 +837,7 @@ def test_resume_restores_review_and_gherkin_without_another_model_call(
     first._persist_gherkin_generation(
         prepared=prepared,
         human_review=review,
+        testability_assessment=testability_assessment,
         candidate=candidate,
         response=gherkin_response,
         freshness=freshness,
@@ -781,6 +850,24 @@ def test_resume_restores_review_and_gherkin_without_another_model_call(
 
     assert resumed.risk_assessment == assessment
     assert resumed.human_reviewed_risk == review
+    assert resumed.testability_evidence_envelope == _testability_envelope(
+        review,
+        context,
+    )
+    assert (
+        resumed.gherkin_evidence_envelope
+        == build_gherkin_evidence(
+            human_review=review,
+            testability_assessment=testability_assessment,
+            context=context,
+            comparison_bindings=_comparison_bindings(),
+            budget=ProviderRequestBudget(
+                provider="groq",
+                model="openai/gpt-oss-120b",
+                max_body_bytes=7_000,
+            ),
+        ).envelope
+    )
     assert resumed.gherkin_candidate == candidate
 
     terminal_record = resumed.approve_gherkin(candidate.gherkin_text)
@@ -835,7 +922,20 @@ def test_resume_restores_a_durable_validated_gherkin_edit(tmp_path) -> None:
         candidate=source_candidate,
         text=edited_text,
         human_review=review,
+        testability_assessment=testability_assessment,
         context=context,
+        comparison_bindings=_comparison_bindings(),
+        evidence_envelope=build_gherkin_evidence(
+            human_review=review,
+            testability_assessment=testability_assessment,
+            context=context,
+            comparison_bindings=_comparison_bindings(),
+            budget=ProviderRequestBudget(
+                provider="groq",
+                model="openai/gpt-oss-120b",
+                max_body_bytes=7_000,
+            ),
+        ).envelope,
     )
     validation = GherkinValidationReport(
         decision="valid_evidence_bound_gherkin",
@@ -896,6 +996,7 @@ def test_resume_restores_a_durable_validated_gherkin_edit(tmp_path) -> None:
     first._persist_gherkin_generation(
         prepared=prepared,
         human_review=review,
+        testability_assessment=testability_assessment,
         candidate=source_candidate,
         response=gherkin_response,
         freshness=freshness,
@@ -975,6 +1076,12 @@ def test_testability_assessment_is_saved_before_gherkin_generation(
     assert stored["assessment"] == assessment.model_dump(mode="json")
     assert stored["response"] == response.model_dump(mode="json")
     assert stored["freshness"]["status"] == "current"
+    assert json.loads(
+        recorder.read_artifact(
+            workflow.run_handle,
+            "artifacts/model_evidence/testability_assessment.json",
+        )
+    ) == workflow.testability_evidence_envelope.model_dump(mode="json")
 
 
 def test_resume_restores_the_durable_testability_assessment(tmp_path) -> None:
@@ -1070,6 +1177,10 @@ def test_resume_restores_the_durable_testability_assessment(tmp_path) -> None:
 
     assert resumed.human_reviewed_risk == review
     assert resumed.testability_assessment == testability_assessment
+    assert resumed.testability_evidence_envelope == _testability_envelope(
+        review,
+        context,
+    )
 
 
 def test_resume_restores_an_exhausted_frozen_evidence_search(tmp_path) -> None:
@@ -1270,6 +1381,7 @@ def test_resume_restores_a_gherkin_edit_that_needs_frozen_evidence(
     first._persist_gherkin_generation(
         prepared=prepared,
         human_review=review,
+        testability_assessment=testability_assessment,
         candidate=candidate,
         response=_response().model_copy(
             update={"data": candidate.model_dump(mode="json")}

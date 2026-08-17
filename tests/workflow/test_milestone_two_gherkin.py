@@ -131,10 +131,14 @@ def _assess_testability(
         *,
         human_review: object,
         context: object,
+        comparison_bindings: object,
+        evidence_envelope: object,
         gateway: object,
     ) -> tuple[object, object]:
         assert human_review is expected_human_review
         assert context is workflow._prepared.context
+        assert comparison_bindings == ()
+        assert evidence_envelope is workflow.testability_evidence_envelope
         assert gateway is workflow._gateway
         return draft, response
 
@@ -143,10 +147,14 @@ def _assess_testability(
         draft: object,
         human_review: object,
         context: object,
+        comparison_bindings: object,
+        evidence_envelope: object,
     ) -> tuple[object, object]:
         assert draft is expected_draft
         assert human_review is expected_human_review
         assert context is workflow._prepared.context
+        assert comparison_bindings == ()
+        assert evidence_envelope is workflow.testability_evidence_envelope
         return assessment, object()
 
     expected_human_review = human_review
@@ -191,11 +199,15 @@ def test_generate_gherkin_rechecks_freshness_and_uses_approved_risk(
         human_review: object,
         testability_assessment: object,
         context: object,
+        comparison_bindings: object,
+        evidence_envelope: object,
         gateway: object,
     ) -> tuple[object, object]:
         assert human_review is expected_human_review
         assert testability_assessment is expected_testability_assessment
         assert context is workflow._prepared.context
+        assert comparison_bindings == ()
+        assert evidence_envelope is workflow.gherkin_evidence_envelope
         assert gateway is workflow._gateway
         return candidate, response
 

@@ -130,6 +130,7 @@ def _gherkin_ready_workflow(
         candidate: object,
         human_review: object,
         context: object,
+        **_kwargs: object,
     ) -> object:
         assert candidate is expected_candidate
         assert human_review is expected_human_review
@@ -190,6 +191,7 @@ def test_approve_gherkin_applies_edit_then_seals_terminal_record(
         text: str,
         human_review: object,
         context: object,
+        **_kwargs: object,
     ) -> object:
         assert candidate is expected_candidate
         assert text == edited_text
@@ -203,6 +205,7 @@ def test_approve_gherkin_applies_edit_then_seals_terminal_record(
         human_review: object,
         context: object,
         approved_at: object,
+        **_kwargs: object,
     ) -> object:
         assert candidate is edited_candidate
         assert human_review is expected_human_review
@@ -524,6 +527,7 @@ def test_validate_edited_gherkin_saves_a_validated_successor_candidate(
         text: str,
         human_review: object,
         context: object,
+        **_kwargs: object,
     ) -> object:
         assert candidate is expected_candidate
         assert text == edited_text
@@ -537,6 +541,7 @@ def test_validate_edited_gherkin_saves_a_validated_successor_candidate(
         text: str,
         human_review: object,
         context: object,
+        **_kwargs: object,
     ) -> object:
         assert candidate is expected_candidate
         assert text == edited_text

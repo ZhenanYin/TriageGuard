@@ -324,6 +324,7 @@ def test_candidate_rejects_non_gherkin_or_incomplete_traceability() -> None:
             reviewed_risk_sha256=canonical_sha256(
                 approved_risk.model_dump(mode="json")
             ),
+            evidence_envelope_sha256="9" * 64,
             approved_risk=approved_risk,
             feature_title="Privilege enforcement",
             scenario_title="Unauthorized request is denied",
@@ -382,6 +383,7 @@ def _candidate(snapshot_key: str = "0" * 64) -> GherkinCandidate:
             snapshot_key=snapshot_key,
             context_sha256=_context_bundle(snapshot_key).context_sha256,
             reviewed_risk_sha256=canonical_sha256(risk.model_dump(mode="json")),
+            evidence_envelope_sha256="9" * 64,
             approved_risk=risk,
             feature_title="Privilege enforcement",
             scenario_title="Unauthorized request is denied",
@@ -694,6 +696,7 @@ def test_exhausted_frozen_evidence_terminal_preserves_its_testability_history() 
         snapshot_key=snapshot.snapshot_key,
         context_sha256=assessment.context_sha256,
         reviewed_risk_sha256=review.reviewed_content_sha256,
+        evidence_envelope_sha256="9" * 64,
         decision="needs_more_frozen_evidence",
         bindings=(),
         evidence_needs=(need,),

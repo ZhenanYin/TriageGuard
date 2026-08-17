@@ -230,7 +230,12 @@ class _TemplateReplayGateway:
     def _gherkin_response(self, request: ModelRequest) -> dict[str, object]:
         snapshot_key = _string_value(request.payload, "snapshot_key")
         reviewed_risk_sha256 = _string_value(request.payload, "reviewed_risk_sha256")
-        context_sha256 = _string_value(request.payload, "context_sha256")
+        evidence_envelope = _mapping_value(request.payload, "evidence_envelope")
+        context_sha256 = _string_value(evidence_envelope, "context_sha256")
+        evidence_envelope_sha256 = _string_value(
+            evidence_envelope,
+            "envelope_sha256",
+        )
         approved_risk = _mapping_value(request.payload, "approved_risk")
 
         result = _substitute(
@@ -238,6 +243,7 @@ class _TemplateReplayGateway:
             {
                 "__SNAPSHOT_KEY__": snapshot_key,
                 "__CONTEXT_SHA256__": context_sha256,
+                "__EVIDENCE_ENVELOPE_SHA256__": evidence_envelope_sha256,
                 "__REVIEWED_RISK_SHA256__": reviewed_risk_sha256,
                 "__APPROVED_RISK__": dict(approved_risk),
                 "__INTEGRATION_ANCHOR_ID__": _integration_anchor_id(
@@ -251,14 +257,18 @@ class _TemplateReplayGateway:
 
     def _testability_response(self, request: ModelRequest) -> dict[str, object]:
         """Bind the recorded testability decision to this exact review/context."""
-        context_limits = _mapping_value(request.payload, "context_limits")
+        evidence_envelope = _mapping_value(request.payload, "evidence_envelope")
         result = _substitute(
             self._testability_template,
             {
                 "__SNAPSHOT_KEY__": _string_value(request.payload, "snapshot_key"),
                 "__CONTEXT_SHA256__": _string_value(
-                    context_limits,
+                    evidence_envelope,
                     "context_sha256",
+                ),
+                "__EVIDENCE_ENVELOPE_SHA256__": _string_value(
+                    evidence_envelope,
+                    "envelope_sha256",
                 ),
                 "__REVIEWED_RISK_SHA256__": _string_value(
                     request.payload,

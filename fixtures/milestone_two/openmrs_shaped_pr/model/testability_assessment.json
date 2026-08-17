@@ -15,6 +15,7 @@
   ],
   "context_sha256": "__CONTEXT_SHA256__",
   "decision": "testable_from_frozen_evidence",
+  "evidence_envelope_sha256": "__EVIDENCE_ENVELOPE_SHA256__",
   "evidence_needs": [],
   "explanation": "The frozen integration evidence identifies the patient-deletion setup, the changed deletion action, and an observable authorization result.",
   "generated_at": "2026-08-15T00:00:00Z",

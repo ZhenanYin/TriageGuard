@@ -1,5 +1,4 @@
 {
-  "approved_risk": "__APPROVED_RISK__",
   "bindings": [
     {
       "claim_field": "actor",
@@ -45,6 +44,7 @@
     }
   ],
   "context_sha256": "__CONTEXT_SHA256__",
+  "evidence_envelope_sha256": "__EVIDENCE_ENVELOPE_SHA256__",
   "feature_title": "Patient deletion authorization",
   "generated_at": "2026-08-15T00:00:00Z",
   "gherkin_text": "Feature: Patient deletion authorization\n\nScenario: Unauthorized patient deletion is rejected\n\nGiven an authenticated OpenMRS user can reach the patient-deletion service path\nWhen the user requests deletion using purgePatient and deletePatient\nThen The deletion path enforces the required authorization before deleting a patient record.\nAnd The changed path may delete a patient record without the expected authorization enforcement.\nAnd The deletion attempt is rejected when authorization is absent.",

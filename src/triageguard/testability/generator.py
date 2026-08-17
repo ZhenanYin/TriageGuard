@@ -12,12 +12,21 @@ from triageguard.domain import (
     HumanReviewedRisk,
     TestabilityAssessmentDraft,
 )
+from triageguard.evidence import (
+    EnvelopeBuildResult,
+    EvidenceArtifactBinding,
+    EvidenceEnvelopeBuilder,
+    ModelEvidenceEnvelope,
+    validate_envelope_binding,
+)
 from triageguard.llm.gateway import (
     ModelOutputInvalid,
     ModelRequest,
     ModelResponse,
     StructuredModelGateway,
 )
+from triageguard.llm.request_budget import ProviderRequestBudget
+from triageguard.provenance import canonical_sha256
 
 TESTABILITY_SYSTEM_PROMPT = (
     "Assess whether one human-reviewed, unconfirmed security-risk hypothesis can "
@@ -30,10 +39,14 @@ TESTABILITY_SYSTEM_PROMPT = (
 )
 
 
-def _strict_schema(value: object) -> object:
+def _strict_schema(value: object, *, property_map: bool = False) -> object:
     """Require every declared field and forbid extra fields in every object."""
     if isinstance(value, dict):
-        strict_value = {key: _strict_schema(item) for key, item in value.items()}
+        strict_value = {
+            key: _strict_schema(item, property_map=key == "properties")
+            for key, item in value.items()
+            if property_map or key not in {"description", "title"}
+        }
         properties = strict_value.get("properties")
         if strict_value.get("type") == "object" and isinstance(properties, dict):
             strict_value["additionalProperties"] = False
@@ -86,64 +99,37 @@ def _validate_inputs(
     return reviewed, frozen_context
 
 
-def _context_limits(context: ContextBundle) -> dict[str, Any]:
-    """Return the exact evidence limits that shaped this model request."""
-    return {
-        "context_sha256": context.context_sha256,
-        "selected_file_count": context.selected_file_count,
-        "selected_anchor_count": context.selected_anchor_count,
-        "selected_bytes": context.selected_bytes,
-        "max_files": context.max_files,
-        "max_anchors": context.max_anchors,
-        "max_bytes": context.max_bytes,
-        "max_anchor_lines": context.max_anchor_lines,
-        "max_blob_bytes": context.max_blob_bytes,
-        "max_search_identifiers": context.max_search_identifiers,
-        "max_hits_per_identifier": context.max_hits_per_identifier,
-        "primary_change_represented": context.primary_change_represented,
-    }
-
-
-def build_testability_request(
-    *,
+def _input_bindings(
     human_review: HumanReviewedRisk,
-    context: ContextBundle,
-) -> ModelRequest:
-    """Build one bounded model request from saved review and frozen code only."""
-    reviewed, frozen_context = _validate_inputs(
-        human_review=human_review,
-        context=context,
+) -> tuple[EvidenceArtifactBinding, ...]:
+    return (
+        EvidenceArtifactBinding(
+            name="human_reviewed_risk",
+            sha256=human_review.reviewed_content_sha256,
+        ),
     )
 
+
+def _testability_request(
+    *,
+    human_review: HumanReviewedRisk,
+    evidence_envelope: ModelEvidenceEnvelope,
+) -> ModelRequest:
     return ModelRequest(
         purpose="testability_assessment",
         system_prompt=TESTABILITY_SYSTEM_PROMPT,
         payload={
-            "snapshot_key": reviewed.snapshot_key,
-            "reviewed_risk_sha256": reviewed.reviewed_content_sha256,
-            "reviewed_risk": reviewed.reviewed_risk.model_dump(mode="json"),
-            "context_anchors": [
-                anchor.model_dump(mode="json") for anchor in frozen_context.anchors
-            ],
-            "context_limits": _context_limits(frozen_context),
+            "snapshot_key": human_review.snapshot_key,
+            "reviewed_risk_sha256": human_review.reviewed_content_sha256,
+            "reviewed_risk": human_review.reviewed_risk.model_dump(mode="json"),
+            "evidence_envelope": evidence_envelope.model_dump(mode="json"),
             "output_rules": {
+                "citation_rule": "Cite only evidence_envelope.visible_anchors.",
+                "envelope_rule": "Echo evidence_envelope.envelope_sha256.",
                 "allowed_decisions": [
                     "testable_from_frozen_evidence",
                     "needs_more_frozen_evidence",
                     "not_grounded_in_frozen_evidence",
-                ],
-                "testable_rule": (
-                    "A testable decision requires setup, action, and observable "
-                    "bindings using only supplied anchor IDs."
-                ),
-                "evidence_need_rule": (
-                    "A needs-more-evidence decision must describe precise search "
-                    "terms and cite only supplied supporting anchor IDs."
-                ),
-                "prohibited_claims": [
-                    "Do not claim a vulnerability exists.",
-                    "Do not claim the change is safe.",
-                    "Do not assign or claim a CVSS score.",
                 ],
             },
         },
@@ -152,10 +138,66 @@ def build_testability_request(
     )
 
 
+def build_testability_request(
+    *,
+    human_review: HumanReviewedRisk,
+    context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    evidence_envelope: ModelEvidenceEnvelope,
+) -> ModelRequest:
+    """Build one bounded model request from saved review and frozen code only."""
+    reviewed, frozen_context = _validate_inputs(
+        human_review=human_review,
+        context=context,
+    )
+
+    normalized_envelope = validate_envelope_binding(
+        envelope=evidence_envelope,
+        stage="testability_assessment",
+        context=frozen_context,
+        comparison_bindings=comparison_bindings,
+        input_bindings=_input_bindings(reviewed),
+        output_schema_sha256=canonical_sha256(TESTABILITY_OUTPUT_SCHEMA),
+    )
+    return _testability_request(
+        human_review=reviewed,
+        evidence_envelope=normalized_envelope,
+    )
+
+
+def build_testability_evidence(
+    *,
+    human_review: HumanReviewedRisk,
+    context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    budget: ProviderRequestBudget,
+) -> EnvelopeBuildResult:
+    """Select whole reviewed-risk evidence under the provider request budget."""
+    reviewed, frozen_context = _validate_inputs(
+        human_review=human_review,
+        context=context,
+    )
+    return EvidenceEnvelopeBuilder().build(
+        stage="testability_assessment",
+        context=frozen_context,
+        comparison_bindings=comparison_bindings,
+        input_bindings=_input_bindings(reviewed),
+        required_anchor_ids=reviewed.reviewed_risk.citation_anchor_ids,
+        priority_terms=reviewed.reviewed_risk.code_identifiers,
+        budget=budget,
+        request_factory=lambda envelope: _testability_request(
+            human_review=reviewed,
+            evidence_envelope=envelope,
+        ),
+    )
+
+
 def generate_testability_assessment(
     *,
     human_review: HumanReviewedRisk,
     context: ContextBundle,
+    comparison_bindings: tuple[EvidenceArtifactBinding, ...],
+    evidence_envelope: ModelEvidenceEnvelope,
     gateway: StructuredModelGateway,
 ) -> tuple[TestabilityAssessmentDraft, ModelResponse]:
     """Request one raw testability assessment and bind it to frozen inputs."""
@@ -166,6 +208,8 @@ def generate_testability_assessment(
     request = build_testability_request(
         human_review=reviewed,
         context=frozen_context,
+        comparison_bindings=comparison_bindings,
+        evidence_envelope=evidence_envelope,
     )
     response = gateway.generate(request)
 
@@ -188,10 +232,14 @@ def generate_testability_assessment(
         raise ModelOutputInvalid(
             "model response reviewed-risk hash does not match the human review"
         )
+    if assessment.evidence_envelope_sha256 != evidence_envelope.envelope_sha256:
+        raise ModelOutputInvalid(
+            "model response evidence envelope hash does not match the request"
+        )
 
     _validate_referenced_anchors(
         assessment=assessment,
-        context=frozen_context,
+        evidence_envelope=evidence_envelope,
     )
     return assessment, response
 
@@ -199,10 +247,12 @@ def generate_testability_assessment(
 def _validate_referenced_anchors(
     *,
     assessment: TestabilityAssessmentDraft,
-    context: ContextBundle,
+    evidence_envelope: ModelEvidenceEnvelope,
 ) -> None:
-    """Ensure every model citation resolves to this frozen context catalog."""
-    known_anchor_ids = {anchor.anchor_id for anchor in context.anchors}
+    """Ensure every model citation resolves to evidence visible in this call."""
+    known_anchor_ids = {
+        anchor.anchor_id for anchor in evidence_envelope.visible_anchors
+    }
     referenced_anchor_ids = tuple(
         anchor_id for binding in assessment.bindings for anchor_id in binding.anchor_ids
     ) + tuple(
@@ -216,7 +266,7 @@ def _validate_referenced_anchors(
         for anchor_id in _unique_in_order(referenced_anchor_ids)
     ):
         raise ModelOutputInvalid(
-            "model response cited an anchor absent from the frozen context"
+            "model response cited an anchor absent from visible frozen evidence"
         )
 
 

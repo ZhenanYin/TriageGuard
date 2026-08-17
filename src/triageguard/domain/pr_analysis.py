@@ -459,6 +459,7 @@ class TestabilityAssessmentDraft(ResearchArtifact):
     snapshot_key: Sha256
     context_sha256: Sha256
     reviewed_risk_sha256: Sha256
+    evidence_envelope_sha256: Sha256
     decision: TestabilityDecision
     bindings: tuple[TestabilityBinding, ...] = Field(default_factory=tuple)
     evidence_needs: tuple[FrozenEvidenceNeed, ...] = Field(default_factory=tuple)
@@ -1169,6 +1170,7 @@ class GherkinCandidateDraft(ResearchArtifact):
     snapshot_key: Sha256
     context_sha256: Sha256
     reviewed_risk_sha256: Sha256
+    evidence_envelope_sha256: Sha256
     approved_risk: RiskHypothesisDraft
     feature_title: StrictStr = Field(min_length=1)
     scenario_title: StrictStr = Field(min_length=1)
