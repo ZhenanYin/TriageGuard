@@ -37,6 +37,20 @@ _POLICY_VERSION = {
 class ModelEvidenceBudgetError(RuntimeError):
     """The exact request cannot include every mandatory frozen anchor."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: ModelEvidenceStage,
+        request_body_bytes: int,
+        limit_bytes: int,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.request_body_bytes = request_body_bytes
+        self.limit_bytes = limit_bytes
+        self.reason_code = "model_request_too_large"
+
 
 @dataclass(frozen=True)
 class EnvelopeBuildResult:
@@ -131,7 +145,10 @@ class EvidenceEnvelopeBuilder:
                 continue
             if anchor.anchor_id in required:
                 raise ModelEvidenceBudgetError(
-                    f"required anchor {anchor.anchor_id} cannot fit the model request budget"
+                    f"required anchor {anchor.anchor_id} cannot fit the model request budget",
+                    stage=stage,
+                    request_body_bytes=candidate.request_body_bytes,
+                    limit_bytes=budget.max_body_bytes,
                 )
 
         result = self._materialize(
@@ -147,7 +164,10 @@ class EvidenceEnvelopeBuilder:
         )
         if result.request_body_bytes > budget.max_body_bytes:
             raise ModelEvidenceBudgetError(
-                "model request metadata cannot fit the declared provider budget"
+                "model request metadata cannot fit the declared provider budget",
+                stage=stage,
+                request_body_bytes=result.request_body_bytes,
+                limit_bytes=budget.max_body_bytes,
             )
         return result
 

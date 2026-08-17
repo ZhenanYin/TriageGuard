@@ -15,7 +15,8 @@ from triageguard.analysis import (
 )
 from triageguard.analysis.snapshot import SnapshotAcquisitionError
 from triageguard.config import PublicSettings, Settings
-from triageguard.llm import GroqStructuredGateway
+from triageguard.evidence import ModelEvidenceBudgetError
+from triageguard.llm import GroqStructuredGateway, ModelGatewayError
 from triageguard.research import ArtifactRecorder
 from triageguard.sources.git import GitObjectStore
 from triageguard.sources.github import GitHubClient
@@ -25,9 +26,11 @@ from triageguard.ui.milestone_two import (
 )
 from triageguard.ui.milestone_two_presentation import (
     COMMIT_ID_EXPLANATION,
+    abbreviated_commit_id,
     comparison_cards,
     freshness_label,
     guided_progress,
+    model_stage_outcome_message,
 )
 from triageguard.workflow import MilestoneTwoWorkflow
 from triageguard.workflow.milestone_two_replay import (
@@ -43,6 +46,124 @@ def _preparation_error_message(error: Exception) -> str:
     if isinstance(error, (ContextBuildError, DiffBuildError, SnapshotAcquisitionError)):
         return f"Preparation stopped ({error.reason_code}): {error.safe_message}"
     return "The pull request could not be prepared for review."
+
+
+def _risk_proposal_error_message(error: Exception) -> str:
+    """Explain a safe model failure without showing provider or request content."""
+    if not isinstance(error, ModelGatewayError) or error.provenance is None:
+        return "Risk proposals could not be created from this evidence."
+
+    failure = error.provenance
+    if failure.reason_code == "groq_transient_retries_exhausted":
+        attempt_word = "attempt" if len(failure.attempts) == 1 else "attempts"
+        return (
+            "Groq was temporarily unavailable after "
+            f"{len(failure.attempts)} {attempt_word}. Try again shortly."
+        )
+    if failure.reason_code == "groq_non_retryable_error":
+        status_code = failure.attempts[-1].status_code
+        if status_code == 401:
+            return (
+                "Groq rejected the configured API key (HTTP 401). Set a valid "
+                "GROQ_API_KEY in the terminal that starts Streamlit, then restart "
+                "the app."
+            )
+        if status_code == 403:
+            return (
+                "Groq accepted the API key but this project cannot use "
+                f"{failure.model} (HTTP 403). Enable model access in Groq, then "
+                "restart the app."
+            )
+        if status_code == 404:
+            return (
+                f"Groq could not find the configured model {failure.model} "
+                "(HTTP 404). Choose an available Groq model and restart the app."
+            )
+        if status_code == 413:
+            return (
+                "Groq rejected the risk-proposal request because it was too large "
+                "(HTTP 413). This is a TriageGuard request-size issue, not a "
+                "problem with the pull request."
+            )
+        if status_code in {400, 422}:
+            return (
+                "Groq rejected TriageGuard's structured risk-proposal request "
+                f"(HTTP {status_code}). This is not a problem with the pull "
+                "request's frozen code evidence."
+            )
+        return (
+            "Groq rejected the risk-proposal request. Check the live model "
+            "configuration and API access, then try again."
+        )
+    if failure.final_outcome == "invalid_output":
+        return (
+            "Groq returned a response, but it did not meet TriageGuard's "
+            "required evidence format. Try again."
+        )
+    return "Risk proposals could not be created from this evidence."
+
+
+def _model_stage_error_message(
+    stage: str,
+    error: Exception,
+    state: MilestoneTwoAppState,
+) -> str:
+    """Describe the exact stopped stage without exposing private model content."""
+    if isinstance(error, ModelEvidenceBudgetError):
+        return model_stage_outcome_message(
+            stage=stage,
+            reason_code=error.reason_code,
+            provider=state.provider_view()["provider"],
+            request_bytes=error.request_body_bytes,
+            limit_bytes=error.limit_bytes,
+        )
+    failure = state.model_failure_view(stage)
+    if failure is None:
+        return model_stage_outcome_message(
+            stage=stage,
+            reason_code="model_output_invalid",
+            provider=state.provider_view()["provider"],
+        )
+
+    reason_code = str(failure["reason_code"])
+    request_bytes = failure["last_request_body_bytes"]
+    limit_bytes = failure["declared_request_limit_bytes"]
+    if (
+        reason_code == "model_request_too_large"
+        and isinstance(request_bytes, int)
+        and isinstance(limit_bytes, int)
+    ):
+        return model_stage_outcome_message(
+            stage=stage,
+            reason_code=reason_code,
+            provider=str(failure["provider"]),
+            request_bytes=request_bytes,
+            limit_bytes=limit_bytes,
+        )
+    if stage == "risk_hypothesis" and isinstance(error, ModelGatewayError):
+        return _risk_proposal_error_message(error)
+    return model_stage_outcome_message(
+        stage=stage,
+        reason_code=reason_code,
+        provider=str(failure["provider"]),
+    )
+
+
+def _render_model_evidence_summary(
+    st: Any,
+    state: MilestoneTwoAppState,
+    stage: str,
+) -> None:
+    """Show exact model-visible coverage and every structured omission reason."""
+    view = state.model_evidence_view(stage)
+    if not view["available"]:
+        return
+    st.caption(str(view["coverage"]))
+    omitted = view["omitted_anchors"]
+    if omitted:
+        st.write("Frozen anchors not visible to this model call:")
+        for item in omitted:
+            st.write(f"• {item['anchor_id']}: {item['explanation']}")
 
 
 def _initial_pull_request_url(state: MilestoneTwoAppState) -> str:
@@ -275,22 +396,22 @@ def _render_understand_change(st: Any, state: MilestoneTwoAppState) -> None:
             {
                 "Photo": "M — shared starting point",
                 "Meaning": "Where the pull request and main branch last matched",
-                "Commit": snapshot.merge_base_sha[:12],
+                "Commit abbreviation": abbreviated_commit_id(snapshot.merge_base_sha),
             },
             {
                 "Photo": "B — current main",
                 "Meaning": "What OpenMRS Core looks like now",
-                "Commit": snapshot.base_sha[:12],
+                "Commit abbreviation": abbreviated_commit_id(snapshot.base_sha),
             },
             {
                 "Photo": "H — pull request",
                 "Meaning": "What the author proposes",
-                "Commit": snapshot.head_sha[:12],
+                "Commit abbreviation": abbreviated_commit_id(snapshot.head_sha),
             },
             {
                 "Photo": "C — merge preview",
                 "Meaning": "What main would look like if merged now",
-                "Commit": snapshot.candidate_sha[:12],
+                "Commit abbreviation": abbreviated_commit_id(snapshot.candidate_sha),
             },
         ],
         hide_index=True,
@@ -299,9 +420,8 @@ def _render_understand_change(st: Any, state: MilestoneTwoAppState) -> None:
 
     st.caption(COMMIT_ID_EXPLANATION)
     st.markdown("#### The three comparisons")
-    columns = st.columns(3)
-    for column, card in zip(columns, comparison_cards(), strict=True):
-        with column, st.container(border=True):
+    for card in comparison_cards():
+        with st.container(border=True):
             st.subheader(f"{card.title} — {card.comparison}")
             st.write(card.explanation)
 
@@ -313,10 +433,31 @@ def _render_understand_change(st: Any, state: MilestoneTwoAppState) -> None:
         try:
             with st.spinner("Generating and locally checking risk proposals..."):
                 state.propose_risks()
-        except Exception:  # noqa: BLE001 - safe boundary, never invent a fallback
-            st.error("Risk proposals could not be created from this evidence.")
+        except Exception as error:  # noqa: BLE001 - safe boundary, never invent a fallback
+            st.error(_model_stage_error_message("risk_hypothesis", error, state))
+            failure = state.risk_failure_view()
+            if failure is not None:
+                request_size = failure["last_request_body_bytes"]
+                request_size_text = (
+                    f" · {request_size:,} byte body" if request_size else ""
+                )
+                provider_limit = failure["provider_body_limit_bytes"]
+                provider_limit_text = (
+                    f" · provider cap {provider_limit:,} bytes"
+                    if provider_limit
+                    else ""
+                )
+                st.caption(
+                    "Safe diagnostic: "
+                    f"{failure['provider']} · {failure['model']} · "
+                    f"{failure['reason_code']} · "
+                    f"{failure['attempt_count']} attempt(s)"
+                    f"{request_size_text}{provider_limit_text}"
+                )
         else:
             st.success("Risk outcome is ready for your review.")
+
+    _render_model_evidence_summary(st, state, "risk_hypothesis")
 
     if state.risk_assessment is not None:
         outcome = state.risk_assessment.outcome
@@ -338,6 +479,7 @@ def _render_understand_change(st: Any, state: MilestoneTwoAppState) -> None:
                 "diffs": [diff.model_dump(mode="json") for diff in prepared.diffs],
                 "context": prepared.context.model_dump(mode="json"),
                 "provider": state.provider_view(),
+                "latest_risk_failure": state.risk_failure_view(),
             }
         )
 
@@ -385,10 +527,7 @@ def _render_review_risks(st: Any, state: MilestoneTwoAppState) -> None:
                     st.success("Risk selected. Continue to review and edit it.")
 
             with st.expander("Why this was suggested"):
-                st.write(
-                    "The proposal is grounded in saved comparison evidence and "
-                    "is not a confirmed vulnerability."
-                )
+                st.write(str(view["validation_note"]))
                 st.write("Relevant comparisons:")
                 for comparison_label in hypothesis["comparison_labels"]:
                     st.write(f"• {comparison_label}")
@@ -467,14 +606,21 @@ def _render_edit_risk(st: Any, state: MilestoneTwoAppState) -> None:
                     "Checking whether saved code can support a scenario..."
                 ):
                     state.assess_testability()
-            except Exception:  # noqa: BLE001 - safe boundary for model or evidence errors
-                st.error("Testability could not be assessed from the frozen evidence.")
+            except Exception as error:  # noqa: BLE001 - safe model boundary
+                st.error(
+                    _model_stage_error_message(
+                        "testability_assessment",
+                        error,
+                        state,
+                    )
+                )
             else:
                 st.success("Testability result is ready for review.")
         testability = state.testability_view()
 
     if testability["available"]:
         _render_testability_result(st, state, testability, freshness)
+        _render_model_evidence_summary(st, state, "testability_assessment")
 
     with st.expander("Frozen evidence references"):
         st.json(
@@ -543,7 +689,7 @@ def _render_testability_result(
                 )
         return
 
-    if st.button(
+    if state.can_refine_frozen_evidence() and st.button(
         "Find more frozen code evidence",
         disabled=freshness != "current",
         type="primary",
@@ -606,11 +752,19 @@ def _render_scenario(st: Any, state: MilestoneTwoAppState) -> None:
         try:
             with st.spinner("Generating and validating the Gherkin scenario..."):
                 state.generate_gherkin()
-        except Exception:  # noqa: BLE001 - no fallback scenario is permitted
-            st.error("A valid scenario could not be generated.")
+        except Exception as error:  # noqa: BLE001 - safe model boundary
+            st.error(
+                _model_stage_error_message(
+                    "gherkin_generation",
+                    error,
+                    state,
+                )
+            )
         else:
             st.success("Scenario generated. Review or edit the text below.")
         scenario = state.scenario_view()
+
+    _render_model_evidence_summary(st, state, "gherkin_generation")
 
     if scenario["available"]:
         edited = st.text_area(
@@ -742,7 +896,7 @@ def _render_nonrisk_outcome(
                 st.warning("Review finalized with insufficient frozen evidence.")
         return
 
-    if st.button(
+    if state.can_refine_frozen_evidence() and st.button(
         "Find more frozen code evidence",
         disabled=freshness != "current",
         type="primary",

@@ -15,6 +15,10 @@ from triageguard.domain import (
     RiskAssessment,
     TestabilityAssessment,
 )
+from triageguard.ui.milestone_two_presentation import (
+    evidence_coverage_text,
+    omitted_evidence_reason,
+)
 from triageguard.workflow import MilestoneTwoWorkflow, PreparedPullRequest
 
 _COMPARISON_LABELS = {
@@ -140,12 +144,73 @@ class MilestoneTwoAppState:
         return {
             "outcome": assessment.outcome,
             "hypotheses": hypotheses,
+            "validation_note": (
+                "Citation validation confirms that references resolve to frozen "
+                "code shown to the model. It does not prove that a vulnerability "
+                "exists."
+            ),
             "rationale": assessment.rationale,
             "coverage_limitations": list(assessment.coverage_limitations),
             "missing_evidence": list(assessment.missing_evidence),
             "needed_evidence": list(assessment.needed_evidence),
             "reason_code": assessment.reason_code,
         }
+
+    def model_evidence_view(self, stage: str) -> dict[str, object]:
+        """Return bounded model visibility without exposing prompt or response data."""
+        envelopes = {
+            "risk_hypothesis": self.workflow.risk_evidence_envelope,
+            "testability_assessment": self.workflow.testability_evidence_envelope,
+            "gherkin_generation": self.workflow.gherkin_evidence_envelope,
+        }
+        if stage not in envelopes:
+            raise ValueError("unknown Milestone 2 model stage")
+        envelope = envelopes[stage]
+        if envelope is None:
+            return {
+                "available": False,
+                "stage": stage,
+                "visible_anchor_count": 0,
+                "total_anchor_count": 0,
+                "coverage": None,
+                "omitted_anchors": [],
+                "max_request_body_bytes": None,
+                "selection_policy_version": None,
+            }
+
+        visible_count = len(envelope.visible_anchors)
+        total_count = len(envelope.catalog_anchor_ids)
+        return {
+            "available": True,
+            "stage": stage,
+            "visible_anchor_count": visible_count,
+            "total_anchor_count": total_count,
+            "coverage": evidence_coverage_text(visible_count, total_count),
+            "omitted_anchors": [
+                {
+                    "anchor_id": omitted.anchor_id,
+                    "reason_code": omitted.reason,
+                    "explanation": omitted_evidence_reason(omitted.reason),
+                }
+                for omitted in envelope.omitted_anchors
+            ],
+            "max_request_body_bytes": envelope.max_request_body_bytes,
+            "selection_policy_version": envelope.selection_policy_version,
+        }
+
+    def can_refine_frozen_evidence(self) -> bool:
+        """Allow retrieval only for a locally validated structured evidence need."""
+        if (
+            self.risk_assessment is not None
+            and self.risk_assessment.outcome == "insufficient_context_to_assess"
+            and self.risk_assessment.evidence_needs
+        ):
+            return True
+        return bool(
+            self.testability_assessment is not None
+            and self.testability_assessment.decision == "needs_more_frozen_evidence"
+            and self.testability_assessment.evidence_needs
+        )
 
     def select_risk(self, hypothesis_id: str) -> None:
         """Select one locally grounded hypothesis for human review."""
@@ -429,6 +494,32 @@ class MilestoneTwoAppState:
             "provider": self.settings.llm_provider,
             "model": self.settings.llm_model,
         }
+
+    def model_failure_view(self, stage: str) -> dict[str, object] | None:
+        """Expose compact, secret-free diagnostics for one retryable model stage."""
+        failure = self.workflow.model_failure(stage)
+        if failure is None:
+            return None
+        evidence = self.model_evidence_view(stage)
+        return {
+            "stage": stage,
+            "provider": failure.provider,
+            "model": failure.model,
+            "purpose": failure.purpose,
+            "reason_code": failure.reason_code,
+            "final_outcome": failure.final_outcome,
+            "attempt_count": len(failure.attempts),
+            "latency_ms": failure.latency_ms,
+            "last_http_status": failure.attempts[-1].status_code,
+            "last_error_type": failure.attempts[-1].error_type,
+            "last_request_body_bytes": failure.attempts[-1].request_body_bytes,
+            "provider_body_limit_bytes": failure.attempts[-1].provider_body_limit_bytes,
+            "declared_request_limit_bytes": evidence["max_request_body_bytes"],
+        }
+
+    def risk_failure_view(self) -> dict[str, object] | None:
+        """Retain the risk-stage compatibility view for existing UI callers."""
+        return self.model_failure_view("risk_hypothesis")
 
     def start_new_analysis(self) -> MilestoneTwoAppState:
         """Create a fresh workflow without reusing this run's frozen evidence."""

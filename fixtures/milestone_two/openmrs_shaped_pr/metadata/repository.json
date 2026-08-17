@@ -9,6 +9,10 @@
       "commit_sha": "8099f28cfc78d7a949d582f5f5e08161922116fe",
       "tree_sha": "d4cf5a02c699055b36ef3cd6ac4f3d6e7db014d6"
     },
+    "candidate_no_drift": {
+      "commit_sha": "09dc9a2cbe2f916e29425913b826e3b1d1d6f443",
+      "tree_sha": "524285dffa92d74aa8246a544b27b49c16cf08d4"
+    },
     "head": {
       "commit_sha": "cec265e70689078a8beb57d6e0ce0464d2bc265a",
       "tree_sha": "524285dffa92d74aa8246a544b27b49c16cf08d4"

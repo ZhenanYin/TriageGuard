@@ -52,7 +52,7 @@ Git CLI, tree-sitter Java, pytest, Ruff, Streamlit.
 - [x] Task 6 — Migrate testability and Gherkin to visible evidence
 - [x] Task 7 — Add bounded frozen-evidence refinement at model boundaries
 - [x] Task 8 — Unify model-stage execution, failure provenance, and recovery
-- [ ] Task 9 — Update replay and UI behavior without weakening gates
+- [x] Task 9 — Update replay and UI behavior without weakening gates
 - [ ] Task 10 — Complete Gate A verification and record measurements
 
 Task 1 completed on 2026-08-17. Focused snapshot, domain, and Git regressions:
@@ -103,6 +103,17 @@ collected tests.
 Task 7 files pass Ruff; compilation and `git diff --check` are clean. The
 repository-wide format check still reports 25 pre-existing files outside this
 task that use the earlier formatting style.
+
+Task 9 completed on 2026-08-17. Replay now exercises the same immutable
+evidence envelopes and local gates as live mode, including an explicit no-drift
+`M == B` case whose M→B comparison is a canonical `unchanged` artifact. The UI
+labels commit abbreviations, defines each M/B/H/C comparison separately, shows
+per-stage visible/total anchor coverage and omission reasons, distinguishes
+local size, provider, validation, and evidence-insufficiency stops, and exposes
+refinement only for structured frozen-evidence needs. The approved integration
+and UI suite passed 58 tests; the complete repository suite passed all 866
+tests. Ruff, compilation, `git diff --check`, and fixture bundle verification
+also passed.
 
 ---
 

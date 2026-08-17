@@ -37,6 +37,7 @@ FixtureOutcome = Literal[
     "no_meaningful_security_risk_found",
     "insufficient_context_to_assess",
 ]
+ReplaySnapshotVariant = Literal["drifted", "no_drift"]
 
 _SUPPORTED_OUTCOMES = frozenset(
     {
@@ -292,6 +293,7 @@ def build_milestone_two_replay_workflow(
     settings: Settings,
     *,
     outcome: FixtureOutcome = "risks_proposed",
+    snapshot_variant: ReplaySnapshotVariant = "drifted",
 ) -> MilestoneTwoWorkflow:
     """Build one entirely offline workflow for the synthetic OpenMRS-shaped PR."""
     if settings.llm_mode != "replay":
@@ -300,6 +302,8 @@ def build_milestone_two_replay_workflow(
         raise ValueError("The synthetic workflow requires a controlled fixture.")
     if outcome not in _SUPPORTED_OUTCOMES:
         raise ValueError("The requested synthetic outcome is not supported.")
+    if snapshot_variant not in {"drifted", "no_drift"}:
+        raise ValueError("The requested synthetic snapshot variant is not supported.")
 
     repository_metadata = _load_fixture_object(
         _FIXTURE_ROOT / "metadata" / "repository.json"
@@ -316,9 +320,18 @@ def build_milestone_two_replay_workflow(
     )
 
     fixture_commits = _mapping_value(repository_metadata, "fixture_commits")
-    base_sha = _fixture_commit_sha(fixture_commits, "base")
+    if snapshot_variant == "no_drift":
+        base_sha = _fixture_commit_sha(fixture_commits, "merge_base")
+        candidate_sha = _fixture_commit_sha(fixture_commits, "candidate_no_drift")
+    else:
+        base_sha = _fixture_commit_sha(fixture_commits, "base")
+        candidate_sha = _fixture_commit_sha(fixture_commits, "candidate")
     head_sha = _fixture_commit_sha(fixture_commits, "head")
-    candidate_sha = _fixture_commit_sha(fixture_commits, "candidate")
+    pull_metadata = {
+        **pull_metadata,
+        "base": {**_mapping_value(pull_metadata, "base"), "sha": base_sha},
+        "merge_commit_sha": candidate_sha,
+    }
 
     run_id = f"m2-replay-{uuid4().hex}"
     store = _FixtureGitObjectStore(

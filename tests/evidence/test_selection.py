@@ -190,7 +190,10 @@ def test_risk_selector_fails_when_a_reserved_author_anchor_cannot_fit() -> None:
     """The author comparison must not be silently dropped to satisfy the budget."""
     context = _context(large_author_anchor=True)
 
-    with pytest.raises(ModelEvidenceBudgetError, match="anchor-author"):
+    with pytest.raises(
+        ModelEvidenceBudgetError,
+        match="anchor-author",
+    ) as captured:
         EvidenceEnvelopeBuilder().build(
             stage="risk_hypothesis",
             context=context,
@@ -201,6 +204,11 @@ def test_risk_selector_fails_when_a_reserved_author_anchor_cannot_fit() -> None:
             budget=_budget(7_000),
             request_factory=_request_factory,
         )
+
+    assert captured.value.stage == "risk_hypothesis"
+    assert captured.value.request_body_bytes > 7_000
+    assert captured.value.limit_bytes == 7_000
+    assert captured.value.reason_code == "model_request_too_large"
 
 
 def test_required_citation_that_cannot_fit_fails_instead_of_being_omitted() -> None:
